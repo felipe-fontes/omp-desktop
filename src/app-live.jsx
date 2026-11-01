@@ -652,6 +652,25 @@ function App() {
   // `/command` draft.
   const [promptInsert, setPromptInsert] = React.useState(null);
   const handlePickHistoryPrompt = (text) => setPromptInsert({ text, nonce: Date.now() });
+  // Setup and a widget can finish the same open in one React batch. Keep
+  // both targeted inserts until the owning composer's draft acknowledges them.
+  const [targetedDraftInserts, setTargetedDraftInserts] = React.useState([]);
+  const draftInsertSeq = React.useRef(0);
+  const previousDraftTargets = React.useRef(sessionIds);
+  const enqueueDraftInsert = React.useCallback((sessionId, text) => {
+    const nonce = ++draftInsertSeq.current;
+    setTargetedDraftInserts(items => [...items, { sessionId, text, nonce }]);
+  }, []);
+  const acknowledgeDraftInserts = React.useCallback(nonces => {
+    const consumed = new Set(nonces);
+    setTargetedDraftInserts(items => items.filter(item => !consumed.has(item.nonce)));
+  }, []);
+  React.useEffect(() => {
+    const closed = new Set(previousDraftTargets.current.filter(id => !sessionIds.includes(id)));
+    previousDraftTargets.current = sessionIds;
+    if (closed.size) setTargetedDraftInserts(items => items.filter(item => !closed.has(item.sessionId)));
+  }, [sessionIds]);
+  const handleConversationStarted = ({ sessionId, task }) => enqueueDraftInsert(sessionId, task);
   // `action` (OMP_WIDGETS.insertAction, from widgets.json only): "new-tab"
   // always opens a fresh tab on the project and fills that tab's draft (never
   // sent); a failed open is reported by openSession and inserts nothing.
@@ -666,7 +685,7 @@ function App() {
       try {
         const id = await bridge.openSession(action.project);
         if (!id) return; // Setup was cancelled; never insert into another tab's draft.
-        setPromptInsert({ text, append: true, sessionId: id, nonce: Date.now() });
+        enqueueDraftInsert(id, text);
       } catch (err) {
         console.error("[widgets] failed to open insert target tab:", err);
       } finally {
@@ -675,7 +694,7 @@ function App() {
       return;
     }
     setPromptInsert({ text, append: true, nonce: Date.now() });
-  }, [bridge]);
+  }, [bridge, enqueueDraftInsert]);
 
   // Goal mode in the composer and the goal strip above it (omp's `goal`).
   const goalUi = useGoalMode({
@@ -1129,6 +1148,8 @@ function App() {
                     draftInsert={draftInsert}
                     promptHistory={promptHistory}
                     promptInsert={promptInsert}
+                    targetedDraftInserts={targetedDraftInserts}
+                    onAckDraftInserts={acknowledgeDraftInserts}
                     queue={queue}
                     queueSending={queueSending}
                     onRemoveQueued={handleRemoveQueued}
@@ -1294,11 +1315,12 @@ function App() {
       {gitOpen && (
         // Remounted per project, so no view state carries across; an
         // edit-card path preselects only in the project it came from. The
-        // branch and the finished-edit count drive its refetches
+        // Git revision and finished edits refresh the visible panes.
         // (app/use-git-browser.jsx).
         <GitBrowser key={gitProject ?? ""} bridge={bridge}
           initialPath={gitOpen.project === gitProject ? gitOpen.path : null}
-          onClose={closeGit} branch={activeProject.branch ?? null} edits={gitEdits} />
+          onClose={closeGit} branch={activeProject.branch ?? null}
+          gitRevision={activeProject.gitRevision ?? 0} edits={gitEdits} />
       )}
 
       {preview && preview.key === planKey && (
@@ -1345,7 +1367,8 @@ function App() {
       )}
 
       {conversationSetup && setupAvailable && !worktreeCloseConfirm && (
-        <NewConversationDialog key={conversationSetup.id} request={conversationSetup} bridge={bridge} suspended={!!closeConfirm} />
+        <NewConversationDialog key={conversationSetup.id} request={conversationSetup} bridge={bridge}
+          suspended={!!closeConfirm} onStarted={handleConversationStarted} />
       )}
     </_AL_MdLinkCtx.Provider>
   );

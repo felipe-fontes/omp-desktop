@@ -240,11 +240,25 @@
     });
   }
 
+  // Multiple producers can append to a new tab before its first render.
+  // Apply the queue in order, never to the tab that merely has focus now.
+  function appendDraftInserts(drafts, liveIds, items, appendText) {
+    const live = new Set(liveIds);
+    let next = drafts;
+    for (const item of items) {
+      if (!live.has(item.sessionId) || typeof item.text !== "string" || !item.text.trim()) continue;
+      next = updateEntry(next, item.sessionId, DRAFT_IDLE, draft => ({
+        ...draft, text: appendText(draft.text, item.text), historyNav: null,
+      }));
+    }
+    return next;
+  }
+
   window.OMP_SESSION_UI = {
     entryOf, updateEntry, pruneEntries, seedEntries,
     PLAN_IDLE, togglePlan, enterPlan, approvePlan, annotatePlan, markPlanSent,
     DRAFT_IDLE, recallInDraft,
-    appendDictation,
+    appendDictation, appendDraftInserts,
     PASTE_LINES_MIN, PASTE_LINES_MAX,
     normalizePaste, shouldCollapsePaste, collapsePaste, pastesIn, expandPastes, inlinePaste,
   };

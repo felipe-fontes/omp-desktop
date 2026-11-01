@@ -1,23 +1,24 @@
-//! Per-session `.git/HEAD` file watcher.
+//! Per-session Git metadata watcher.
 //!
-//! [`GitWatcherState`] is Tauri managed state that owns one
-//! [`notify::RecommendedWatcher`] per live session. Dropping the watcher
-//! (via [`GitWatcherState::stop`] or when the state is dropped) cancels
-//! the OS-level watch automatically.
+//! The worktree Git directory, common Git directory and common refs tree are
+//! watched separately, without watching objects or working-tree files.
 
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
+    thread::{self, JoinHandle},
 };
 
 use notify::{RecursiveMode, Watcher as _};
 use tauri::{AppHandle, Emitter as _};
 
-/// Holds one file watcher per session.  Thread-safe; suitable as Tauri
-/// managed state.
+/// Holds one metadata watcher per session.
 pub struct GitWatcherState {
-    watchers: Mutex<HashMap<String, notify::RecommendedWatcher>>,
+    watchers: Mutex<HashMap<String, MetadataWatcher>>,
 }
 
 impl GitWatcherState {
@@ -27,14 +28,10 @@ impl GitWatcherState {
         }
     }
 
-    /// Begin watching `head_path` (`.git/HEAD`) for `session_id`.
+    /// Watch HEAD, index, packed refs and loose refs for a session.
     ///
-    /// On every change to the HEAD file (see [`is_head_change`]), re-reads the
-    /// current branch via [`crate::git::probe`] and emits
-    /// `"git://branch/{session_id}"` on `app`, and tells the widget host
-    /// (which recomputes the session's context and runs `branch` plugins).
-    /// Errors starting the watcher are propagated; the caller treats them as
-    /// non-fatal so the branch chip simply won't update live.
+    /// Each relevant change emits the current branch, including `None` for
+    /// detached HEAD. Widget branch triggers run only for HEAD/ref changes.
     pub fn start(
         &self,
         session_id: &str,
@@ -42,35 +39,16 @@ impl GitWatcherState {
         head_path: PathBuf,
         app: AppHandle,
     ) -> Result<(), String> {
-        let repo_owned = repo_path.to_owned();
+        let paths = MetadataPaths::discover(repo_path, &head_path)?;
+        let repo = repo_path.to_owned();
         let sid = session_id.to_owned();
-
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            let Ok(event) = res else { return };
-            if !is_head_change(&event) {
-                return;
+        let watcher = MetadataWatcher::start(paths, move |change| {
+            let (branch, _) = crate::git::probe(&repo);
+            let _ = app.emit(&format!("git://branch/{sid}"), branch);
+            if change.branch {
+                crate::widgets::notify_branch(&app, &sid);
             }
-            let (branch, _) = crate::git::probe(&repo_owned);
-            if let Some(b) = branch {
-                let _ = app.emit(&format!("git://branch/{sid}"), b);
-            }
-            crate::widgets::notify_branch(&app, &sid);
-        })
-        .map_err(|e| e.to_string())?;
-
-        // Watch the *parent directory* non-recursively rather than the HEAD
-        // file itself.  On Linux, inotify attaches to the inode; git writes
-        // HEAD atomically via rename(HEAD.lock → HEAD), which replaces the
-        // inode and orphans a file-level watch after the first branch switch.
-        // Watching the parent avoids this and is also how notify's Windows
-        // and macOS backends already behave internally.  [`is_head_change`]
-        // in the callback above ensures only HEAD changes trigger a re-read.
-        let git_dir = head_path
-            .parent()
-            .ok_or_else(|| "HEAD path has no parent".to_owned())?;
-        watcher
-            .watch(git_dir, RecursiveMode::NonRecursive)
-            .map_err(|e| e.to_string())?;
+        })?;
 
         self.watchers.lock().map_or_else(
             |_| Err("git watcher state poisoned".to_owned()),
@@ -81,7 +59,7 @@ impl GitWatcherState {
         )
     }
 
-    /// Stop watching for `session_id`.  No-op if no watcher is registered.
+    /// Stop watching for `session_id`. No-op if no watcher is registered.
     pub fn stop(&self, session_id: &str) {
         if let Ok(mut map) = self.watchers.lock() {
             map.remove(session_id);
@@ -95,51 +73,388 @@ impl Default for GitWatcherState {
     }
 }
 
-/// Whether `event` is a change to a file named `HEAD`.
-///
-/// Name filter: notify watches the parent dir on Windows
-/// (`ReadDirectoryChangesW`), and `start` watches the parent everywhere, so
-/// events for sibling files (`index`, `HEAD.lock`, …) arrive too.
-///
-/// Access filter: since notify 7 inotify also reports `IN_OPEN` as
-/// `Access(Open)`. [`crate::git::probe`] opens HEAD itself, so reacting to
-/// opens would re-trigger the probe from its own read, forever. A branch
-/// switch (`rename(HEAD.lock → HEAD)`) arrives as `Modify(Name)` and a
-/// direct write as `Modify(Data)`, so no real change is lost.
-fn is_head_change(event: &notify::Event) -> bool {
-    !event.kind.is_access()
-        && event
-            .paths
-            .iter()
-            .any(|p| p.file_name().is_some_and(|n| n == "HEAD"))
+struct MetadataPaths {
+    git_dir: PathBuf,
+    common_dir: PathBuf,
+    refs: PathBuf,
+    head: PathBuf,
+    index: PathBuf,
+    packed_refs: PathBuf,
+}
+
+impl MetadataPaths {
+    fn discover(repo_path: &Path, head_path: &Path) -> Result<Self, String> {
+        let git_dir = head_path
+            .parent()
+            .ok_or("HEAD path has no parent")?
+            .canonicalize()
+            .map_err(|e| e.to_string())?;
+        // gix discovery can spawn git to locate its installation config.
+        let (_gate, repo) = crate::spawn_gate::discover(repo_path)?;
+        let common_dir = repo
+            .common_dir()
+            .canonicalize()
+            .map_err(|e| e.to_string())?;
+        let refs = common_dir.join("refs");
+        let head = git_dir.join("HEAD");
+        let index = git_dir.join("index");
+        let packed_refs = common_dir.join("packed-refs");
+        Ok(Self {
+            git_dir,
+            common_dir,
+            refs,
+            head,
+            index,
+            packed_refs,
+        })
+    }
+
+    fn classify(&self, event: &notify::Event) -> Change {
+        let mut change = Change::default();
+        // A probe opens HEAD and refs; reacting to access would loop forever.
+        if event.kind.is_access() {
+            return change;
+        }
+        for path in &event.paths {
+            if path == &self.head || path == &self.packed_refs {
+                change.branch = true;
+            } else if path == &self.index {
+                change.index = true;
+            } else if path.starts_with(&self.refs)
+                && !path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".lock"))
+            {
+                change.branch = true;
+                if path == &self.refs {
+                    change.refs_root = true;
+                }
+            }
+        }
+        change
+    }
+}
+
+#[derive(Clone, Copy, Default, Debug)]
+struct Change {
+    branch: bool,
+    index: bool,
+    refs_root: bool,
+}
+
+enum Message {
+    Event(Change),
+    Stop,
+}
+
+/// The worker owns the notify watcher, so it can re-arm the refs tree if its
+/// root is replaced. Dropping this handle stops and joins the worker.
+struct MetadataWatcher {
+    sender: mpsc::Sender<Message>,
+    worker: Option<JoinHandle<()>>,
+    stopping: Arc<AtomicBool>,
+}
+
+impl MetadataWatcher {
+    fn start(
+        paths: MetadataPaths,
+        on_change: impl Fn(Change) + Send + 'static,
+    ) -> Result<Self, String> {
+        let (sender, receiver) = mpsc::channel();
+        let paths = Arc::new(paths);
+        // The callback owns a channel handle while the returned watcher keeps
+        // another to stop the worker during teardown.
+        let event_sender = sender.clone();
+        let event_paths = Arc::clone(&paths);
+        let mut watcher = notify::RecommendedWatcher::new(
+            move |result: notify::Result<notify::Event>| {
+                if let Ok(event) = result {
+                    let change = event_paths.classify(&event);
+                    if change.branch || change.index {
+                        let _ = event_sender.send(Message::Event(change));
+                    }
+                }
+            },
+            notify::Config::default().with_follow_symlinks(false),
+        )
+        .map_err(|e| e.to_string())?;
+
+        // Directory watches survive atomic HEAD/index/packed-refs renames.
+        watcher
+            .watch(&paths.git_dir, RecursiveMode::NonRecursive)
+            .map_err(|e| e.to_string())?;
+        if paths.common_dir != paths.git_dir {
+            watcher
+                .watch(&paths.common_dir, RecursiveMode::NonRecursive)
+                .map_err(|e| e.to_string())?;
+        }
+        if paths
+            .refs
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.is_dir())
+        {
+            watcher
+                .watch(&paths.refs, RecursiveMode::Recursive)
+                .map_err(|e| e.to_string())?;
+        }
+
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = Arc::clone(&stopping);
+        let worker = thread::Builder::new()
+            .name("git-metadata-watch".into())
+            .spawn(move || {
+                while let Ok(message) = receiver.recv() {
+                    match message {
+                        Message::Stop => break,
+                        Message::Event(change) => {
+                            if worker_stopping.load(Ordering::Acquire) {
+                                break;
+                            }
+                            if change.refs_root {
+                                // A refs directory can itself be deleted/recreated.
+                                // This runs outside notify's callback thread.
+                                let _ = watcher.unwatch(&paths.refs);
+                                if paths
+                                    .refs
+                                    .symlink_metadata()
+                                    .is_ok_and(|meta| meta.is_dir())
+                                {
+                                    let _ = watcher.watch(&paths.refs, RecursiveMode::Recursive);
+                                }
+                            }
+                            on_change(change);
+                        }
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            sender,
+            worker: Some(worker),
+            stopping,
+        })
+    }
+}
+
+impl Drop for MetadataWatcher {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        let _ = self.sender.send(Message::Stop);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_head_change;
+    use super::{Change, MetadataPaths, MetadataWatcher};
+    use crate::git_browser::fixture;
     use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind, RenameMode};
     use notify::Event;
+    use std::{
+        path::{Path, PathBuf},
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
 
-    #[test]
-    fn opening_head_is_not_a_change() {
-        // The probe's own read of HEAD must not look like a branch switch,
-        // or every probe schedules the next one.
-        let open = Event::new(EventKind::Access(AccessKind::Open(AccessMode::Any)))
-            .add_path("/repo/.git/HEAD".into());
-        assert!(!is_head_change(&open));
+    fn paths() -> MetadataPaths {
+        let git_dir = PathBuf::from("/repo/.git");
+        MetadataPaths {
+            refs: git_dir.join("refs"),
+            head: git_dir.join("HEAD"),
+            index: git_dir.join("index"),
+            packed_refs: git_dir.join("packed-refs"),
+            // This fixture models a primary checkout whose two Git roots coincide.
+            common_dir: git_dir.clone(),
+            git_dir,
+        }
     }
 
     #[test]
-    fn renaming_onto_head_is_a_change() {
-        let switch = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To)))
-            .add_path("/repo/.git/HEAD".into());
-        assert!(is_head_change(&switch));
+    fn access_events_and_lock_files_do_not_trigger_probes() {
+        let paths = paths();
+        for path in [
+            "/repo/.git/HEAD",
+            "/repo/.git/index",
+            "/repo/.git/refs/heads/main",
+        ] {
+            let open = Event::new(EventKind::Access(AccessKind::Open(AccessMode::Any)))
+                .add_path(path.into());
+            let change = paths.classify(&open);
+            assert!(!change.branch && !change.index);
+        }
+        for path in [
+            "/repo/.git/HEAD.lock",
+            "/repo/.git/index.lock",
+            "/repo/.git/packed-refs.lock",
+            "/repo/.git/refs/heads/main.lock",
+            "/repo/.git/objects/anything",
+        ] {
+            let lock = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From)))
+                .add_path(path.into());
+            let change = paths.classify(&lock);
+            assert!(!change.branch && !change.index);
+        }
     }
 
     #[test]
-    fn sibling_files_are_ignored() {
-        let lock = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::From)))
-            .add_path("/repo/.git/HEAD.lock".into());
-        assert!(!is_head_change(&lock));
+    fn metadata_renames_are_classified_by_destination() {
+        let paths = paths();
+        for path in [
+            "/repo/.git/HEAD",
+            "/repo/.git/packed-refs",
+            "/repo/.git/refs/heads/main",
+        ] {
+            let rename = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To)))
+                .add_path(path.into());
+            let change = paths.classify(&rename);
+            assert!(change.branch && !change.index);
+        }
+        let index = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To)))
+            .add_path("/repo/.git/index".into());
+        let change = paths.classify(&index);
+        assert!(change.index && !change.branch);
+    }
+
+    type Observation = (Change, Option<String>);
+
+    fn watch(path: &Path) -> (MetadataWatcher, mpsc::Receiver<Observation>) {
+        let (_, head) = crate::git::probe(path);
+        let paths = MetadataPaths::discover(path, &head.expect("repository HEAD")).unwrap();
+        let repo = path.to_owned();
+        let (sender, receiver) = mpsc::channel();
+        let watcher = MetadataWatcher::start(paths, move |change| {
+            let branch = crate::git::probe(&repo).0;
+            let _ = sender.send((change, branch));
+        })
+        .unwrap();
+        (watcher, receiver)
+    }
+
+    fn wait_for(
+        receiver: &mpsc::Receiver<Observation>,
+        expected: Option<&str>,
+        branch_event: bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (change, branch) = receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("timed out waiting for Git metadata observation");
+            if branch.as_deref() == expected
+                && if branch_event {
+                    change.branch
+                } else {
+                    change.index && !change.branch
+                }
+            {
+                return;
+            }
+        }
+    }
+
+    fn settle(receiver: &mpsc::Receiver<Observation>) {
+        // Drain duplicate OS notifications before making the next change.
+        // A self-triggering probe would fail to become quiet.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "watcher did not become quiet");
+            if receiver.recv_timeout(Duration::from_millis(300)).is_err() {
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn real_git_switch_detach_commit_and_index_remain_live() {
+        let Some(repo) = fixture::init("watch-metadata") else {
+            return;
+        };
+        repo.commit("initial", 1_700_000_000);
+        let (watcher, observations) = watch(repo.path());
+
+        repo.git(&["checkout", "-q", "-b", "topic"]);
+        wait_for(&observations, Some("topic"), true);
+        settle(&observations);
+        repo.git(&["checkout", "-q", "--detach"]);
+        wait_for(&observations, None, true);
+        settle(&observations);
+        repo.git(&["checkout", "-q", "main"]);
+        wait_for(&observations, Some("main"), true);
+        settle(&observations);
+
+        repo.commit("same branch", 1_700_000_001);
+        wait_for(&observations, Some("main"), true);
+        settle(&observations);
+        repo.write("staged.txt", "staged\n");
+        assert!(
+            observations
+                .recv_timeout(Duration::from_millis(300))
+                .is_err(),
+            "working-tree writes must not trigger the metadata watcher"
+        );
+        repo.git(&["add", "staged.txt"]);
+        wait_for(&observations, Some("main"), false);
+        settle(&observations);
+
+        // Further atomic HEAD replacements must still be observed.
+        repo.git(&["checkout", "-q", "topic"]);
+        wait_for(&observations, Some("topic"), true);
+        settle(&observations);
+        drop(watcher);
+        assert!(observations.recv_timeout(Duration::from_secs(2)).is_err());
+    }
+
+    #[test]
+    fn linked_worktree_observes_common_loose_and_packed_refs() {
+        let Some(repo) = fixture::init("watch-linked") else {
+            return;
+        };
+        repo.commit("initial", 1_700_000_000);
+        repo.commit("second", 1_700_000_001);
+        let linked = repo.path().join("linked");
+        repo.git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "linked",
+            linked.to_str().unwrap(),
+        ]);
+        let (_watcher, observations) = watch(&linked);
+
+        repo.git(&["update-ref", "refs/heads/external", "HEAD^"]);
+        wait_for(&observations, Some("linked"), true);
+        settle(&observations);
+        repo.git(&["pack-refs", "--all"]);
+        wait_for(&observations, Some("linked"), true);
+        settle(&observations);
+        // The loose ref may have been removed by packing; creating it again
+        // still needs to reach the recursive common-refs watcher.
+        repo.git(&["update-ref", "refs/heads/external", "HEAD"]);
+        wait_for(&observations, Some("linked"), true);
+        settle(&observations);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_refs_watches_do_not_follow_directory_symlinks() {
+        let Some(repo) = fixture::init("watch-refs-symlink") else {
+            return;
+        };
+        repo.commit("initial", 1_700_000_000);
+        let outside = crate::test_support::TempDir::new("git-watcher", "outside-refs");
+        std::os::unix::fs::symlink(outside.path(), repo.path().join(".git/refs/unrelated"))
+            .unwrap();
+        let (_watcher, observations) = watch(repo.path());
+        repo.git(&["checkout", "-q", "-b", "topic"]);
+        wait_for(&observations, Some("topic"), true);
+        settle(&observations);
+        std::fs::write(outside.path().join("outside-data"), "not Git metadata").unwrap();
+        assert!(
+            observations.recv_timeout(Duration::from_secs(2)).is_err(),
+            "a refs symlink must not expand the metadata watch into unrelated directories"
+        );
     }
 }

@@ -1003,13 +1003,7 @@ impl Store {
         })?;
         let branch = (|| {
             git::import(&source, &snapshot_path)?;
-            let branch = git::add(
-                &source,
-                &dest,
-                &snapshot.head,
-                snapshot.branch.as_deref(),
-                id,
-            )?;
+            let branch = git::add(&source, &dest, &snapshot.head, snapshot.branch.as_deref())?;
             let (_gate, repo, root) = crate::git_browser::open(&dest)?;
             let common = crate::external_open::canonical_folder(repo.common_dir())?;
             if root != dest || common != self.record(id)?.common_dir {
@@ -1036,7 +1030,7 @@ impl Store {
             }
             record.root = dest_text;
             record.path = new_path_text;
-            record.branch = Some(branch);
+            record.branch = branch;
             record.commit = Some(snapshot.head);
             record.evicted = false;
             record.error = None;

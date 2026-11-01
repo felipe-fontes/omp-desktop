@@ -19,7 +19,11 @@ const flush = async () => {
   for (let i = 0; i < 30; i++) await Promise.resolve();
 };
 
-function harness({ savedSessions = [], workspaceInfo = null } = {}) {
+function harness({
+  savedSessions = [],
+  workspaceInfo = null,
+  watchChangeDuringStart,
+} = {}) {
   const window = { OMP_TWEAKS_STORE: { read: () => ({}) } };
   const timers = new Set();
   const scope = {
@@ -67,7 +71,8 @@ function harness({ savedSessions = [], workspaceInfo = null } = {}) {
   ])
     runInNewContext(source(`src/${file}`), scope, { filename: file });
   const listeners = new Map(),
-    bindings = new Map();
+    bindings = new Map(),
+    branches = new Map();
   const profileList = [
     { id: "default", name: "Local" },
     { id: "work", name: "Work account" },
@@ -110,13 +115,25 @@ function harness({ savedSessions = [], workspaceInfo = null } = {}) {
             starts++;
             if (hold) await hold;
             if (failure) throw new Error(failure);
-            if (!profileList.some((p) => p.id === (args.args.profile || "default")))
+            if (
+              !profileList.some(
+                (p) => p.id === (args.args.profile || "default"),
+              )
+            )
               throw new Error(`unknown profile: ${args.args.profile}`);
             const id = args.args.sessionId;
             const path = args.args.workspace?.worktree
               ? `/isolated/${id}`
               : args.args.cwd;
             bindings.set(id, path);
+            branches.set(
+              path,
+              args.args.workspace?.worktree
+                ? (args.args.workspace.branchName ?? null)
+                : path.startsWith("/isolated/")
+                  ? "feat/isolated"
+                  : "main",
+            );
             return {
               approvalMode: "write",
               path,
@@ -130,10 +147,16 @@ function harness({ savedSessions = [], workspaceInfo = null } = {}) {
                 : null,
             };
           }
-          case "start_git_watch":
-            return args.path.startsWith("/isolated/")
-              ? "feat/isolated"
-              : "main";
+          case "start_git_watch": {
+            const branch = branches.get(args.path) ?? null;
+            if (watchChangeDuringStart !== undefined) {
+              branches.set(args.path, watchChangeDuringStart);
+              listeners.get(`git://branch/${args.sessionId}`)?.({
+                payload: watchChangeDuringStart,
+              });
+            }
+            return branch;
+          }
           case "replay_events":
             return { dropped: false, events: [] };
           case "session_status":
@@ -163,9 +186,7 @@ function harness({ savedSessions = [], workspaceInfo = null } = {}) {
           case "git_browser_status":
             return {
               repo: {
-                branch: args.path.startsWith("/isolated/")
-                  ? "feat/isolated"
-                  : "main",
+                branch: branches.get(args.path) ?? null,
               },
             };
           case "list_project_files":
@@ -216,6 +237,10 @@ function harness({ savedSessions = [], workspaceInfo = null } = {}) {
     holdClose(promise) {
       closeHold = promise;
     },
+    gitChanged(sessionId, branch) {
+      branches.set(bindings.get(sessionId), branch);
+      listeners.get(`git://branch/${sessionId}`)?.({ payload: branch });
+    },
     close() {
       for (const timer of timers) clearTimeout(timer);
     },
@@ -251,7 +276,11 @@ test("an isolated conversation exposes its own branch and files instead of its s
     const opened = h.bridge.openSession("/source", "default");
     const result = await h.bridge.startConversationSetup(
       h.snapshot.conversationSetup.id,
-      options,
+      {
+        ...options,
+        task: "Isolate the requested feature",
+        branchName: "feat/isolated",
+      },
     );
     assert.equal(result.ok, true);
     const id = await opened;
@@ -276,6 +305,49 @@ test("an isolated conversation exposes its own branch and files instead of its s
       h.starts,
       1,
       "focus-existing must not start another conversation",
+    );
+  } finally {
+    h.close();
+  }
+});
+
+test("detached tabs follow branch creation, same-branch Git changes and detach without reopening", async () => {
+  const h = harness();
+  try {
+    const opened = h.bridge.openSession("/source", "default");
+    await h.bridge.startConversationSetup(
+      h.snapshot.conversationSetup.id,
+      options,
+    );
+    const id = await opened;
+    assert.equal(h.snapshot.sessions[0].branch, null);
+    h.gitChanged(id, "feat/semantic-task");
+    assert.equal(h.snapshot.sessions[0].branch, "feat/semantic-task");
+    const revision = h.snapshot.sessions[0].gitRevision;
+    h.gitChanged(id, "feat/semantic-task");
+    assert.equal(h.snapshot.sessions[0].branch, "feat/semantic-task");
+    assert.equal(h.snapshot.sessions[0].gitRevision, revision + 1);
+    h.gitChanged(id, null);
+    assert.equal(h.snapshot.sessions[0].branch, null);
+    assert.equal(h.snapshot.sessions[0].gitRevision, revision + 2);
+    assert.equal(h.starts, 1);
+  } finally {
+    h.close();
+  }
+});
+
+test("a branch event during initial inspection is not lost or overwritten by its stale result", async () => {
+  const h = harness({ watchChangeDuringStart: "feat/after-inspection" });
+  try {
+    const opened = h.bridge.openSession("/source", "default");
+    await h.bridge.startConversationSetup(
+      h.snapshot.conversationSetup.id,
+      options,
+    );
+    const id = await opened;
+    assert.equal(
+      h.snapshot.sessions.find((session) => session.id === id).branch,
+      "feat/after-inspection",
     );
   } finally {
     h.close();
@@ -533,12 +605,19 @@ test("project-default editing never starts an agent", async () => {
 });
 
 const storedWorkspace = {
-  id: "workspace-1", path: "/isolated/existing", projectPath: "/source",
-  profile: "default", pinned: false, state: "present", excludedCaches: ["node_modules"],
+  id: "workspace-1",
+  path: "/isolated/existing",
+  projectPath: "/source",
+  profile: "default",
+  pinned: false,
+  state: "present",
+  excludedCaches: ["node_modules"],
 };
 const storedConversation = {
-  path: "/saved/conversation.jsonl", cwd: storedWorkspace.path,
-  profile_id: "default", title: "Retained work",
+  path: "/saved/conversation.jsonl",
+  cwd: storedWorkspace.path,
+  profile_id: "default",
+  title: "Retained work",
 };
 
 test("cancelling the worktree close question leaves the conversation open", async () => {
@@ -548,13 +627,21 @@ test("cancelling the worktree close question leaves the conversation open", asyn
     const closing = h.bridge.closeSessionGuarded(id);
     await flush();
     assert.equal(h.snapshot.worktreeCloseConfirm.path, storedWorkspace.path);
-    assert.deepEqual(h.snapshot.sessions.map(session => session.id), [id]);
+    assert.deepEqual(
+      h.snapshot.sessions.map((session) => session.id),
+      [id],
+    );
     await h.bridge.resolveWorktreeClose("cancel");
     assert.equal(await closing, false);
     assert.equal(h.snapshot.worktreeCloseConfirm, null);
     assert.equal(h.snapshot.activeSessionId, id);
-    assert.deepEqual(h.snapshot.sessions.map(session => session.path), [storedWorkspace.path]);
-  } finally { h.close(); }
+    assert.deepEqual(
+      h.snapshot.sessions.map((session) => session.path),
+      [storedWorkspace.path],
+    );
+  } finally {
+    h.close();
+  }
 });
 
 test("a failed restore-point close keeps the tab and permits a safe Keep retry", async () => {
@@ -565,16 +652,24 @@ test("a failed restore-point close keeps the tab and permits a safe Keep retry",
     const closing = h.bridge.closeSessionGuarded(id);
     await flush();
     assert.equal(await h.bridge.resolveWorktreeClose("snapshotRemove"), false);
-    assert.match(h.snapshot.worktreeCloseConfirm.error, /verification failed: disk full/);
+    assert.match(
+      h.snapshot.worktreeCloseConfirm.error,
+      /verification failed: disk full/,
+    );
     assert.equal(h.snapshot.worktreeCloseConfirm.busy, false);
-    assert.deepEqual(h.snapshot.sessions.map(session => session.id), [id]);
+    assert.deepEqual(
+      h.snapshot.sessions.map((session) => session.id),
+      [id],
+    );
     assert.equal(h.snapshot.activeSessionId, id);
     h.failClose(null);
     assert.equal(await h.bridge.resolveWorktreeClose("keep"), true);
     assert.equal(await closing, true);
     assert.deepEqual(h.snapshot.sessions, []);
     assert.equal(h.snapshot.worktreeCloseConfirm, null);
-  } finally { h.close(); }
+  } finally {
+    h.close();
+  }
 });
 
 test("the tab stays visible until native close commits and busy close cannot be cancelled", async () => {
@@ -582,18 +677,28 @@ test("the tab stays visible until native close commits and busy close cannot be 
   let release;
   try {
     const id = await h.bridge.resumeSession(storedConversation);
-    h.holdClose(new Promise(resolve => { release = resolve; }));
+    h.holdClose(
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+    );
     const closing = h.bridge.closeSessionGuarded(id);
     await flush();
     const committing = h.bridge.resolveWorktreeClose("snapshotRemove");
     await flush();
     assert.equal(h.snapshot.worktreeCloseConfirm.busy, true);
-    assert.deepEqual(h.snapshot.sessions.map(session => session.id), [id]);
+    assert.deepEqual(
+      h.snapshot.sessions.map((session) => session.id),
+      [id],
+    );
     assert.equal(await h.bridge.resolveWorktreeClose("cancel"), false);
     assert.equal(h.snapshot.worktreeCloseConfirm.busy, true);
     release();
     assert.equal(await committing, true);
     assert.equal(await closing, true);
     assert.deepEqual(h.snapshot.sessions, []);
-  } finally { release?.(); h.close(); }
+  } finally {
+    release?.();
+    h.close();
+  }
 });

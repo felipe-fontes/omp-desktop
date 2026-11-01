@@ -42,9 +42,15 @@ const repo = (extra = {}) => ({
   ...extra,
 });
 
-function plan(info, ref = W.defaultRef(info), worktree = false, ack = false) {
+function plan(
+  info,
+  ref = W.defaultRef(info),
+  worktree = false,
+  ack = false,
+  intent = {},
+) {
   const status = info && { dirty: info.dirty, owners: info.owners };
-  return W.selection(info, ref, worktree, ack, status);
+  return W.selection(info, ref, worktree, ack, status, intent);
 }
 
 test("current local branch defaults to exact ref and full commit", () => {
@@ -57,7 +63,11 @@ test("current local branch defaults to exact ref and full commit", () => {
     acknowledgeShared: false,
   });
   assert.equal(plan(info).error, null);
-  assert.equal(plan(info, topic.refName).options.baseCommit, topic.commit);
+  assert.match(plan(info, topic.refName).error, /task/i);
+  const switched = plan(info, topic.refName, false, false, { task: "Fix bug" });
+  assert.equal(switched.error, null);
+  assert.equal(switched.options.baseCommit, topic.commit);
+  assert.equal(switched.options.task, "Fix bug");
 });
 
 test("remote branches need worktrees and never masquerade as local names", () => {
@@ -247,6 +257,25 @@ test("launch selection uses stored defaults without replacing missing refs", () 
     refName: main.refName,
     worktree: false,
   });
+  assert.deepEqual(
+    W.initialSelection(
+      repo({ defaults: { baseRef: topic.refName, worktree: false } }),
+    ),
+    { refName: main.refName, worktree: false },
+  );
+  assert.deepEqual(
+    W.initialSelection(
+      repo({ defaults: { baseRef: "refs/heads/gone", worktree: false } }),
+    ),
+    { refName: main.refName, worktree: false },
+  );
+  assert.deepEqual(
+    W.initialSelection({
+      repoRoot: null,
+      defaults: { baseRef: topic.refName, worktree: true },
+    }),
+    { refName: null, worktree: false },
+  );
   const gone = repo({
     defaults: { baseRef: "refs/heads/gone", worktree: true },
   });
@@ -318,4 +347,140 @@ test("detached HEAD is a one-conversation base, never a project default", () => 
   );
   assert.equal(W.defaultsDecision(info, "HEAD", true).options, null);
   assert.equal(W.selection(info, "HEAD", true, false, null).error, null);
+});
+
+test("branch creation requires explicit per-conversation consent, task and name", () => {
+  const info = repo({ defaults: { baseRef: topic.refName, worktree: true } });
+  const initial = W.initialSelection(info);
+  const detached = plan(info, initial.refName, initial.worktree);
+  assert.equal(detached.error, null);
+  assert.equal(Object.hasOwn(detached.options, "branchName"), false);
+  assert.equal(Object.hasOwn(detached.options, "task"), false);
+  const drafted = plan(info, initial.refName, true, false, {
+    task: "  Fix bug\n",
+  });
+  assert.equal(drafted.options.task, "  Fix bug\n");
+  assert.equal(Object.hasOwn(drafted.options, "branchName"), false);
+  const nullBranch = plan(info, initial.refName, true, false, {
+    branchName: null,
+  });
+  assert.equal(nullBranch.error, null);
+  assert.equal(Object.hasOwn(nullBranch.options, "branchName"), false);
+  assert.match(
+    plan(info, main.refName, true, false, { branchName: "feature/fix" }).error,
+    /task/i,
+  );
+  assert.match(
+    plan(info, main.refName, true, false, {
+      task: "  ",
+      branchName: "feature/fix",
+    }).error,
+    /task/i,
+  );
+  assert.match(
+    plan(info, main.refName, true, false, { task: "Fix", branchName: "" })
+      .error,
+    /branch name/i,
+  );
+  assert.match(
+    plan(info, main.refName, true, false, { task: "Fix", branchName: " " })
+      .error,
+    /branch name/i,
+  );
+  assert.match(
+    plan(info, main.refName, false, false, {
+      task: "Fix",
+      branchName: "feature/fix",
+    }).error,
+    /worktree/i,
+  );
+  assert.match(
+    plan({ repoRoot: null }, null, true, false, {
+      task: "Fix",
+      branchName: "feature/fix",
+    }).error,
+    /repository/i,
+  );
+  const named = plan(info, main.refName, true, false, {
+    task: "Fix bug",
+    branchName: "feature/fix",
+  });
+  assert.equal(named.error, null);
+  assert.equal(named.options.task, "Fix bug");
+  assert.equal(named.options.branchName, "feature/fix");
+});
+
+test("branch names reject invalid names and local namespace conflicts", () => {
+  const info = repo({
+    branches: [
+      main,
+      topic,
+      remote,
+      {
+        name: "feature/existing",
+        refName: "refs/heads/feature/existing",
+        commit: main.commit,
+        remote: false,
+      },
+    ],
+  });
+  for (const branchName of [
+    "-bad",
+    "bad name",
+    "bad..name",
+    "bad/.hidden",
+    "bad.lock",
+    "bad/",
+    "bad@{name",
+    "bad\\name",
+    "refs/heads/topic",
+    "@{-1}",
+  ]) {
+    assert.match(
+      plan(info, main.refName, true, false, { task: "Fix", branchName }).error,
+      /valid.*branch name/i,
+    );
+  }
+  for (const branchName of ["main", "topic/child", "feature"]) {
+    assert.match(
+      plan(info, main.refName, true, false, { task: "Fix", branchName }).error,
+      /conflict/i,
+    );
+  }
+  assert.equal(
+    plan(info, main.refName, true, false, {
+      task: "Fix",
+      branchName: "origin/topic",
+    }).error,
+    null,
+  );
+});
+
+test("in-place switching requires a task and retains checkout safety", () => {
+  const info = repo();
+  assert.match(
+    plan(info, topic.refName, false, false, { task: " \n" }).error,
+    /task/i,
+  );
+  assert.equal(
+    plan(info, topic.refName, false, false, { task: "Switch context" }).error,
+    null,
+  );
+  assert.match(
+    plan(repo({ dirty: true }), topic.refName, false, false, {
+      task: "Switch context",
+    }).error,
+    /cannot switch/i,
+  );
+  assert.equal(
+    plan(info, main.refName, false, false, { task: " " }).error,
+    null,
+  );
+  assert.equal(
+    Object.hasOwn(
+      plan(info, main.refName, false, false, { task: " " }).options,
+      "task",
+    ),
+    false,
+  );
 });

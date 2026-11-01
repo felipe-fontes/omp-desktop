@@ -27,9 +27,11 @@ It never sends a path, a command, a trigger or a context to Rust: only plugin id
 | `src-tauri/src/widgets/run.rs` | `run_plugin(entry, argv, ctx, on_spawn) -> Outcome`: spawn of the given argv, stdin context, timeout, stdout cap, process-tree kill |
 | `src-tauri/src/widgets/context.rs` | `session_ctx(project)` (branch, password-free default remote; one repo discovery) and the bounded `PluginContext` |
 | `src-tauri/src/widgets/redact.rs` | credential masking for error text, on top of the crate-level `redaction.rs` shared with `agent/reader.rs` |
-| `src/app/widgets.js` | pure: `parseOutput`, `insertText`, `safeUrl`, `tweakKey`, `relativeTime`, `appendToDraft`, `insertAction(cfg, altKey)` / `insertTitle(cfg)` / `consumePromptInsert(...)` (insert click target, tooltip and pending-session gate), `attentionStep`, `ackKey`, and the run bookkeeping `runKey`, `mergeRun`, `parsedLast`, `cardRun` (`test-widgets.mjs`) |
+| `src/app/widgets.js` | pure: `parseOutput`, `insertText`, `safeUrl`, `tweakKey`, `relativeTime`, `appendToDraft`, `insertAction(cfg, altKey)` / `insertTitle(cfg)` (insert click target and tooltip), `attentionStep`, `ackKey`, and the run bookkeeping `runKey`, `mergeRun`, `parsedLast`, `cardRun` (`test-widgets.mjs`) |
 | `src/app/use-widgets.jsx` | thin hook: snapshot + run map from events, sends view state, memoised parse per (key, `last.at`) |
 | `src/design/widgets/` | `WidgetCard`, `WidgetApprovalCard`, `WidgetErrorCard`, `WidgetBoundary`, block renderers |
+
+New-tab widget text and the setup task share an acknowledged, per-tab insertion queue. Inserts wait until their target tab joins the rendered session list, append in order through the session UI's `appendDraftInserts`, and are removed after consumption or target closure. Neither insert sends a prompt. The active-tab history/command insertion paths remain separate.
 
 ## Data flow
 
@@ -37,7 +39,7 @@ It never sends a path, a command, a trigger or a context to Rust: only plugin id
 widgets.json ──load (startup, widgets_reload)──▶ WidgetHost ──Event::Config──▶ Scheduler
 start_session / stop_session ──session_started/closed──▶ WidgetHost ──SessionOpened/Closed──▶
 reader.rs agent_end frame ──turn_ended──▶                   ──TurnEnd──▶
-git_watcher HEAD change ──branch_changed──▶ (ctx refresh)   ──SessionOpened + Branch──▶
+git_watcher HEAD/ref change ──branch_changed──▶ (ctx refresh) ──SessionOpened + Branch──▶
 frontend widgets_set_view / widgets_refresh ──────────────▶ ──View / Manual──▶
                                             Actions ◀───────┘
 Start → fingerprint check → worker thread → run_plugin → Event::Finished
@@ -48,7 +50,7 @@ Kill  → registry kill_tree      Changed/Removed → app.emit(widgets://run | w
   - `start_session` calls `session_started(sid, project)` after a successful start. The host computes the git context on its own thread, not the IPC thread.
   - `stop_session` calls `session_closed`.
   - `agent/reader.rs` calls `turn_ended` on an `agent_end` frame. It reuses the frame it already parsed, so there is no extra parse. This fires for background tabs too: the reader sees every session.
-  - The `git_watcher.rs` callback calls `branch_changed`. The host recomputes the context, then sends `SessionOpened` (ctx refresh) followed by `Branch`.
+  - The `git_watcher.rs` callback calls `branch_changed` for HEAD/ref changes, not index-only changes. The host recomputes the context, then sends `SessionOpened` (ctx refresh) followed by `Branch`.
 - **One scheduler thread**, created with a fallible `thread::Builder`. It owns the `Scheduler` and blocks on an `mpsc` inbox with `recv_timeout(next_deadline - now)`. A timeout feeds `Event::Tick`.
 - **`now_ms` is epoch ms** (`SystemTime`), so `at`/`lastOkAt` are directly renderable. All arithmetic saturates, so clock skew never panics.
 - **Start action.**
