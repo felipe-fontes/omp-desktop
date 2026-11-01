@@ -34,6 +34,7 @@ mod recent_projects;
 mod redaction;
 mod remote;
 mod saved_sessions;
+mod scratch;
 mod spawn_gate;
 mod stats;
 mod supervisor;
@@ -1521,6 +1522,18 @@ pub fn run() {
             stop_git_watch,
             open_url_external,
             list_saved_sessions,
+            scratch::scratch_create,
+            scratch::scratch_list,
+            scratch::scratch_for_profile,
+            scratch::scratch_restore_history,
+            scratch::scratch_update,
+            scratch::scratch_files,
+            scratch::scratch_usage,
+            scratch::scratch_export,
+            scratch::scratch_pick_project,
+            scratch::scratch_promote,
+            scratch::scratch_promote_session,
+            scratch::scratch_delete,
             conversation_tree,
             approval_rules_list,
             approval_approve_and_grant,

@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **New chat** starts a normal omp conversation without opening a repository. Chats have persistent private workspaces and appear separately from Projects in the sidebar. Each chat supports multiple profiles: files are shared without copying, while each profile keeps its own conversation and credentials. Manage a chat to inspect file usage, export files, or promote its workspace and conversation into a new project folder. Closing a tab retains its files; deletion is explicit, preserves shared files, and never deletes omp history. Promotion keeps the original chat for recovery, and new chats create no clone, worktree, or dependency installation.
 - The composer has separate one-click buttons for **Voice to text** and **Live conversation**. Live conversation (#68) connects to the native omp call with state, levels, captions, mute, pause, resume and end controls. Voice to text uses the profile's omp speech-to-text engine, previews dictation and appends the final text to the originating draft without sending a prompt or playing a reply. Switching tabs or opening Settings pauses live conversation and stops dictation; closing a tab ends capture. A failed stop keeps the active control visible for retry.
 
 ### Changed

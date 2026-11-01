@@ -51,6 +51,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_JobObjects",
     # WTS session flags: the screen-lock probe (`remote/lock.rs`).
     "Win32_System_RemoteDesktop",

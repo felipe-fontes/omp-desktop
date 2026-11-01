@@ -103,7 +103,7 @@ function tabClickProps(onSelect, onClose) {
 }
 
 function TabBar({
-  projects, activeId, onSelect, onClose, onRename, onNew, onHistory, onNewInProject, onReorder,
+  projects, activeId, onSelect, onClose, onRename, onNew, onNewChat, onHistory, onNewInProject, onReorder,
   sidebarOpen, onToggleSidebar,
   profiles = [], appVersion, updateVersion, onUpdate, onCheckUpdate,
   settings, onSelectSettings, onCloseSettings,
@@ -126,6 +126,10 @@ function TabBar({
         aria-pressed={!!sidebarOpen}
         onClick={onToggleSidebar}>
         <Icon name="sidebar" size={11} />
+      </button>
+      <button className="tab-add" title="new chat" aria-label="New chat" onClick={onNewChat}
+        style={{ width: "auto", flex: "none", padding: "0 10px", gap: 5, whiteSpace: "nowrap" }}>
+        <Icon name="conversation" size={11} />new chat
       </button>
       {/* Tabs on one folder + profile share a chip (#27); a project with a
           single tab renders as a plain tab. */}
@@ -155,7 +159,7 @@ function TabBar({
             // The first click of the pair already selected the tab.
             onDoubleClick={e => { if (onRename && !e.target.closest(".tab-close")) setRenaming(p.id); }}>
             <span className="tab-bar-mark" style={{ background: active ? p.color : "transparent" }} />
-            <Icon name="folder" size={11} color={active ? p.color : "var(--fg-4)"} />
+            <Icon name={p.scratchId ? "conversation" : "folder"} size={11} color={active ? p.color : "var(--fg-4)"} />
             <TabRunDot state={p.runState} />
             {renaming === p.id ? (
               <RenameField value={p.name}

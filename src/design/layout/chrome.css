@@ -275,6 +275,7 @@
 }
 .tab-add:hover { color: var(--accent); background: var(--bg-hover); }
 .tab-add.on { color: var(--accent); }
+.tab-add:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 
 /* ── Grouped tab chip (#27) ──────────────────────────────────────────── */
 .tab-count {

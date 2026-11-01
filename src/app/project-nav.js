@@ -39,6 +39,7 @@
   }
 
   function groupKey(tab) {
+    if (tab.scratchId) return `chat:${tab.scratchId}`;
     return tab.path ? `${tab.profile}|${normPath(tab.path)}` : `tab:${tab.id}`;
   }
 
@@ -54,7 +55,7 @@
           key,
           path: tab.path || null,
           profile: tab.profile,
-          name: tab.path ? basename(tab.path) : tab.name,
+          name: tab.scratchId ? tab.name : tab.path ? basename(tab.path) : tab.name,
           tabs: [],
         };
         groups.set(key, group);
@@ -151,7 +152,7 @@
    *  the tab's renameable name; `prefix` is its project folder, or `null`
    *  while the name is still that folder (a fresh tab) or there is none. */
   function tabLabel(tab) {
-    const folder = tab.path ? basename(tab.path) : "";
+    const folder = !tab.scratchId && tab.path ? basename(tab.path) : "";
     return { prefix: folder && folder !== tab.name ? folder : null, title: tab.name };
   }
 
@@ -221,6 +222,7 @@
         profile: t.profile ?? null,
         sessionFile: t.sessionFile || null,
         name: t.name || null,
+        ...(t.scratchId ? { scratchId: t.scratchId } : {}),
       })),
       active: active < 0 ? null : active,
     };
@@ -236,10 +238,11 @@
     return {
       cwd: tab.path || "",
       resume,
-      name: (resume && tab.name) || null,
+      name: ((resume || tab.scratchId) && tab.name) || null,
       // No saved profile is the built-in one: the tab must record the
       // profile its process actually runs under.
       profile: tab.profile || DEFAULT_PROFILE_ID,
+      ...(tab.scratchId ? { scratchId: tab.scratchId } : {}),
     };
   }
 

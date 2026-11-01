@@ -20,7 +20,7 @@
 const {
   Icon, ChatView, Composer, CommandBridge, WindowChrome, TabBar, SubagentPane, ProjectSidebar, EmptyWorkspace,
   StatusBar, AmbientRail, ConversationTree, PlanKanban, HistoryModal, GitBrowser, FilePreview, ApprovalRulesPanel, UsageStatsPanel, PromptHistoryModal, UpdateModal, useTweaks,
-  SettingsPage, ConfirmCloseDialog,
+  SettingsPage, ConfirmCloseDialog, ChatWorkspace,
   useWidgets, WidgetCard, WidgetErrorCard, WidgetApprovalCard, WidgetBoundary,
   TWEAK_DEFAULTS, NULL_MODEL, EMPTY_PROJECT, DEFAULT_PROFILE_ID,
   INTENT_FRAMING, APPROVAL_PROMPT,
@@ -66,6 +66,12 @@ function App() {
   const [stab, setStab] = React.useState(window.OMP_SETTINGS_TAB.initial);
   // live.js's pending "close a working tab / quit?" question, or null.
   const [closeConfirm, setCloseConfirm] = React.useState(null);
+  const [chats, setChats] = React.useState([]);
+  const [chatsLoading, setChatsLoading] = React.useState(false);
+  const [chatsError, setChatsError] = React.useState(null);
+  const [chatActionError, setChatActionError] = React.useState(null);
+  const [managedChat, setManagedChat] = React.useState(null);
+  const chatsRequest = React.useRef(0);
   const [planOpen,    setPlanOpen]    = React.useState(false);
   // The column beside the chat, per tab (`side` below): the ambient rail,
   // the conversation tree (prompt-cache navigator; design/conversation-tree.jsx,
@@ -285,6 +291,28 @@ function App() {
   // the prune effects run only when a tab opens or closes.
   const sessionIdsKey = sessions.map(s => s.id).join("\0");
   const sessionIds = React.useMemo(() => (sessionIdsKey ? sessionIdsKey.split("\0") : []), [sessionIdsKey]);
+  // Snapshots arrive on every streaming delta; only refresh when chat
+  // identity or its persisted metadata changes, not on every render.
+  const chatSessionsKey = JSON.stringify(sessions.filter(s => s.scratchId)
+    .map(s => [s.id, s.scratchId, s.name, s.profile, s.sessionFile]));
+  const refreshChats = React.useCallback(async () => {
+    if (!bridge) return;
+    const request = ++chatsRequest.current;
+    setChatsLoading(true);
+    try {
+      const rows = await bridge.listChats();
+      if (request === chatsRequest.current) { setChats(rows); setChatsError(null); }
+    } catch (err) {
+      if (request === chatsRequest.current) { setChats([]); setChatsError(String(err?.message ?? err)); }
+    } finally {
+      if (request === chatsRequest.current) setChatsLoading(false);
+    }
+  }, [bridge, activeProfileId]);
+  React.useEffect(() => {
+    setChats([]);
+    refreshChats();
+    return () => { chatsRequest.current++; };
+  }, [refreshChats, chatSessionsKey]);
   openVoiceTabs.current = sessionIds;
   // A tab seen for the first time starts with the `defaultSide` setting;
   // tabs already open keep theirs when the setting changes.
@@ -400,6 +428,7 @@ function App() {
   // One shell per tab, in a panel above the composer (app/use-terminal.jsx).
   const terminal = useTerminal({
     bridge, activeSessionId: planKey, sessionIds, tweaks: t, setTweak,
+    resetKey: activeProject.resourcesVersion || 0,
   });
 
   const subagentUi = useSubagentManager({
@@ -413,6 +442,7 @@ function App() {
   // widgets below, not `activeSessionId`, which keeps a closed tab's id.
   const browser = useBrowser({
     bridge, activeSessionId: activeProject.id, sessionIds, open: side === "browser", setOpen: setBrowserOpen, tweaks: t, setTweak,
+    resetKey: activeProject.resourcesVersion || 0,
   });
   // Clicks on links in the agent's markdown: a project file opens the
   // preview (Ctrl/⌘-click: the git browser); anything else goes on to the
@@ -724,6 +754,29 @@ function App() {
     }
   };
 
+  const handleNewChat = async () => {
+    if (!bridge) return;
+    setChatActionError(null);
+    try {
+      await bridge.openChat();
+      setStab(window.OMP_SETTINGS_TAB.selectProject);
+      refreshChats();
+    } catch (err) {
+      setChatActionError(String(err?.message ?? err));
+    }
+  };
+  const handleOpenChat = async row => {
+    if (!bridge) return;
+    setChatActionError(null);
+    try {
+      await bridge.openScratchChat(row);
+      setStab(window.OMP_SETTINGS_TAB.selectProject);
+      refreshChats();
+    } catch (err) {
+      setChatActionError(String(err?.message ?? err));
+    }
+  };
+
   // Close tab → kills that session's omp process; bridge updates tab list.
   // Guarded: with `confirmBusyClose` a working tab asks first (live.js).
   const handleCloseTab = id => { bridge?.closeSessionGuarded(id); };
@@ -948,6 +1001,7 @@ function App() {
             activeId={stab.active ? null : activeSessionId}
             onSelect={handleSelectTab}
             onNew={handleNewProject}
+            onNewChat={handleNewChat}
             onClose={handleCloseTab}
             onRename={handleRenameTab}
             onNewInProject={handleNewInProject}
@@ -963,6 +1017,12 @@ function App() {
             onSelectSettings={() => openSettings()}
             onCloseSettings={closeSettings}
           />
+          {chatActionError && (
+            <div role="alert" style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 12px", color: "var(--rose)", background: "var(--bg-surface)" }}>
+              <span style={{ flex: 1, overflowWrap: "anywhere" }}>{chatActionError}</span>
+              <button className="btn icon ghost" aria-label="Dismiss chat error" onClick={() => setChatActionError(null)}><Icon name="close" size={10} /></button>
+            </div>
+          )}
 
           <div ref={workspaceRef} className="workspace" style={panes.style}>
             {showSidebar && (
@@ -971,6 +1031,20 @@ function App() {
                 activeId={stab.active ? null : activeSessionId}
                 recents={recentRows(recentProjects, sessions, activeProfileId)}
                 profileLabel={profileLabel}
+                chats={chats}
+                chatsLoading={chatsLoading}
+                chatsError={chatsError}
+                onNewChat={handleNewChat}
+                onOpenChat={handleOpenChat}
+                onManageChat={async chat => {
+                  try {
+                    const owner = sessions.find(tab => tab.scratchId === chat.id);
+                    if (owner) await bridge.activateSession(owner.id);
+                    setManagedChat(chat);
+                  } catch (error) {
+                    setChatActionError(String(error?.message ?? error));
+                  }
+                }}
                 onSelectTab={handleSelectTab}
                 onCloseTab={handleCloseTab}
                 onRenameTab={handleRenameTab}
@@ -986,7 +1060,12 @@ function App() {
             <div ref={stageRef} className={`stage ${side === "browser" ? `with-browser${browserFull ? " browser-full" : ""}` : sideRail ? `with-${sideRail}` : ""}`}>
               <main className="session">
                 {noTab ? (
-                  <EmptyWorkspace notes={workspaceNotes} />
+                  <>
+                    <EmptyWorkspace notes={workspaceNotes} />
+                    <div style={{ position: "absolute", top: 24, left: "50%", transform: "translateX(-50%)", display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
+                      <button className="btn outlined accent" onClick={handleNewChat}>new chat</button>
+                    </div>
+                  </>
                 ) : (<>
                   <ChatView key={activeSessionId} messages={messages}
                     planMode={plan.mode}
@@ -1233,6 +1312,12 @@ function App() {
 
       {updater.open && (
         <UpdateModal updater={updater} busyTabs={window.OMP_UPDATER.busyTabCount(sessions)} />
+      )}
+
+      {managedChat && (
+        <ChatWorkspace key={managedChat.id} chat={managedChat} tabs={sessions} activeId={activeSessionId}
+          voiceActive={!!(liveVoice?.active || dictation?.active)} bridge={bridge}
+          onClose={() => setManagedChat(null)} onChanged={refreshChats} />
       )}
 
       {closeConfirm && (
