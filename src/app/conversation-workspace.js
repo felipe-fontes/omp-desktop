@@ -29,12 +29,15 @@
     return current?.refName || null;
   }
 
-  // Defaults store a ref, never a commit. Keep a missing saved ref selected
-  // so the user must choose another rather than silently launching elsewhere.
+  // Saved bases are used only for isolated worktrees, never to switch the
+  // existing checkout implicitly. Preserve missing worktree bases for review.
   function initialSelection(info) {
+    const worktree = !!info?.repoRoot && !!info?.defaults?.worktree;
     return {
-      refName: info?.defaults?.baseRef ?? defaultRef(info),
-      worktree: !!info?.defaults?.worktree,
+      refName: worktree
+        ? (info?.defaults?.baseRef ?? defaultRef(info))
+        : defaultRef(info),
+      worktree,
     };
   }
 
@@ -86,13 +89,72 @@
     };
   }
 
-  function selection(info, refName, worktree, acknowledgeShared, status) {
+  function selection(
+    info,
+    refName,
+    worktree,
+    acknowledgeShared,
+    status,
+    intent = {},
+  ) {
     if (!info)
       return {
         error: "Inspect the folder before starting.",
         options: null,
         needsAcknowledgement: false,
       };
+    const task = typeof intent.task === "string" ? intent.task : "";
+    const branchName = intent.branchName;
+    const creatingBranch = branchName != null;
+    const withIntent = (options) => ({
+      ...options,
+      ...(task.trim() ? { task } : {}),
+      ...(creatingBranch ? { branchName } : {}),
+    });
+    const refuse = (error) => ({
+      error,
+      options: null,
+      needsAcknowledgement: false,
+    });
+    if (creatingBranch) {
+      if (!info.repoRoot)
+        return refuse("Creating a branch requires a Git repository.");
+      if (!worktree) return refuse("Enable Worktree to create a branch.");
+      if (!task.trim()) return refuse("Enter a task before creating a branch.");
+      if (typeof branchName !== "string" || !branchName.trim())
+        return refuse("Enter a branch name to create a branch.");
+      if (
+        branchName.startsWith("-") ||
+        branchName.startsWith("/") ||
+        branchName.startsWith("refs/heads/") ||
+        branchName.endsWith("/") ||
+        branchName.endsWith(".") ||
+        branchName.includes("..") ||
+        branchName.includes("@{") ||
+        branchName === "@" ||
+        /[\x00-\x20\x7f~^:?*[\]\\]/.test(branchName) ||
+        branchName
+          .split("/")
+          .some(
+            (part) => !part || part.startsWith(".") || part.endsWith(".lock"),
+          )
+      )
+        return refuse(
+          "Enter a valid short Git branch name, such as feature/my-task.",
+        );
+      if (
+        choices(info).some(
+          (branch) =>
+            !branch.remote &&
+            (branch.name === branchName ||
+              branch.name.startsWith(`${branchName}/`) ||
+              branchName.startsWith(`${branch.name}/`)),
+        )
+      )
+        return refuse(
+          "That branch name conflicts with an existing local branch. Choose another name.",
+        );
+    }
     if ((!info.repoRoot || !worktree) && !statusKnown(status))
       return statusPending();
     if (!info.repoRoot && refName)
@@ -109,12 +171,12 @@
           needsAcknowledgement && !acknowledgeShared
             ? "Acknowledge the shared existing files before starting."
             : null,
-        options: {
+        options: withIntent({
           baseRef: null,
           baseCommit: null,
           worktree: false,
           acknowledgeShared: needsAcknowledgement && !!acknowledgeShared,
-        },
+        }),
         needsAcknowledgement,
       };
     }
@@ -131,12 +193,12 @@
             ? "Acknowledge the shared existing files before starting."
             : null,
         needsAcknowledgement,
-        options: {
+        options: withIntent({
           baseRef: null,
           baseCommit: null,
           worktree: !!worktree,
           acknowledgeShared: needsAcknowledgement && !!acknowledgeShared,
-        },
+        }),
       };
     }
     if (!branch?.commit)
@@ -158,18 +220,21 @@
     } else if (!worktree && !same && (status.dirty || status.owners > 0)) {
       error =
         "Cannot switch branches while this folder has uncommitted changes or is used by an open tab. Use a worktree instead.";
+    } else if (!worktree && !same && !task.trim()) {
+      error =
+        "Enter a task before switching the existing checkout to another branch.";
     } else if (needsAcknowledgement && !acknowledgeShared) {
       error = "Acknowledge the shared existing files before starting.";
     }
     return {
       error,
       needsAcknowledgement,
-      options: {
+      options: withIntent({
         baseRef: branch.refName,
         baseCommit: branch.commit,
         worktree: !!worktree,
         acknowledgeShared: needsAcknowledgement && !!acknowledgeShared,
-      },
+      }),
     };
   }
 

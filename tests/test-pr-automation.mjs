@@ -432,6 +432,184 @@ await test("refresh requests coalesce and native requests never overlap", async 
   assert.deepEqual(h.reads, ["a", "a", "b"]);
   assert.equal(h.view().snapshot.title, "Updated");
 });
+await test("same-branch Git revisions refresh PR and local changes without enabling auto-fix", async () => {
+  let calls = 0;
+  const h = harness({
+    getChanges: () =>
+      ++calls === 1
+        ? changes({
+            snapshot: snapshot(),
+            localChanges: { changed: 2, truncated: false },
+          })
+        : changes({
+            snapshot: snapshot({ head: "new-head" }),
+            localChanges: { changed: 0, truncated: false },
+          }),
+  });
+  await h.time.advance(0);
+  assert.equal(h.view().snapshot.head, "abc123");
+  h.replace("a", { gitRevision: 1 });
+  assert.equal(h.view().snapshot, null);
+  assert.equal(h.view().localChanges, null);
+  assert.equal(h.view().loading, true);
+  assert.equal(h.view().enabled, false);
+  await h.time.advance(0);
+  assert.deepEqual(h.reads, ["a", "a"]);
+  assert.equal(h.view().snapshot.head, "new-head");
+  assert.deepEqual(h.view().localChanges, { changed: 0, truncated: false });
+  assert.equal(h.view().enabled, false);
+  assert.deepEqual(h.sends, []);
+});
+await test("failed revision refresh cannot restore old data or authorize auto-fix", async () => {
+  let calls = 0;
+  const h = harness({
+    getChanges: () => {
+      calls++;
+      if (calls === 2)
+        return changes({
+          discoveryError: "offline",
+          localError: "unavailable",
+        });
+      return changes({
+        snapshot: snapshot({ head: calls === 1 ? "old" : "new" }),
+        localChanges: { changed: calls === 1 ? 2 : 0, truncated: false },
+      });
+    },
+  });
+  await h.time.advance(0);
+  h.replace("a", { gitRevision: 1 });
+  await h.time.advance(0);
+  assert.equal(h.view().snapshot, null);
+  assert.equal(h.view().localChanges, null);
+  assert.equal(h.view().canEnable, false);
+  h.toggle();
+  assert.equal(h.view().enabled, false);
+  assert.deepEqual(h.sends, []);
+  h.refresh();
+  await h.time.advance(0);
+  assert.equal(h.view().snapshot.head, "new");
+  assert.deepEqual(h.view().localChanges, { changed: 0, truncated: false });
+  assert.equal(h.view().enabled, false);
+});
+await test("revision changes coalesce in flight and only fresh feedback may use an existing grant", async () => {
+  const stale = deferred();
+  const fresh = deferred();
+  let calls = 0;
+  const h = harness({
+    getChanges: () => {
+      calls++;
+      if (calls === 1)
+        return changes({
+          snapshot: snapshot(),
+          localChanges: { changed: 2, truncated: false },
+        });
+      return calls === 2 ? stale.promise : fresh.promise;
+    },
+  });
+  await enable(h);
+  await h.time.advance(0);
+  h.replace("a", { gitRevision: 1 });
+  h.replace("a", { gitRevision: 2 });
+  assert.equal(h.view().enabled, true);
+  assert.equal(h.view().canEnable, false);
+  assert.equal(h.view().snapshot, null);
+  await h.time.advance(1000);
+  assert.deepEqual(h.reads, ["a", "a"]);
+  stale.resolve(
+    changes({
+      snapshot: snapshot({ threads: [thread("stale")] }),
+      localChanges: { changed: 9, truncated: true },
+    }),
+  );
+  await h.time.advance(0);
+  assert.deepEqual(h.reads, ["a", "a", "a"]);
+  assert.equal(h.view().snapshot, null);
+  assert.equal(h.view().localChanges, null);
+  assert.deepEqual(h.sends, []);
+  fresh.resolve(
+    changes({
+      snapshot: snapshot({ head: "new-head", threads: [thread("fresh")] }),
+      localChanges: { changed: 1, truncated: false },
+    }),
+  );
+  await h.time.advance(0);
+  assert.equal(h.view().enabled, true);
+  assert.equal(h.view().snapshot.head, "new-head");
+  assert.deepEqual(h.view().localChanges, { changed: 1, truncated: false });
+  assert.deepEqual(
+    payload(h.sends[0]).threads.map((t) => t.id),
+    ["fresh"],
+  );
+  assert.equal(h.sends.length, 1);
+});
+await test("a revision observed before synchronization invalidates a late read", async () => {
+  const stale = deferred();
+  const fresh = deferred();
+  let calls = 0;
+  const h = harness({
+    getChanges: () => {
+      calls++;
+      if (calls === 1) return changes({ snapshot: snapshot() });
+      return calls === 2 ? stale.promise : fresh.promise;
+    },
+  });
+  await enable(h);
+  await h.time.advance(0);
+  h.current.sessions = [tab("a", "/a", { gitRevision: 1 })];
+  assert.equal(h.view().enabled, true);
+  assert.equal(h.view().snapshot, null);
+  assert.equal(h.view().canEnable, false);
+  stale.resolve(
+    changes({ snapshot: snapshot({ threads: [thread("stale")] }) }),
+  );
+  await h.time.advance(0);
+  assert.deepEqual(h.reads, ["a", "a", "a"]);
+  assert.deepEqual(h.sends, []);
+  fresh.resolve(changes({ snapshot: snapshot({ head: "new-head" }) }));
+  await h.time.advance(0);
+  assert.equal(h.view().snapshot.head, "new-head");
+  assert.equal(h.view().enabled, true);
+  assert.deepEqual(h.sends, []);
+});
+await test("a shared checkout revision invalidates every owner's cached data", async () => {
+  let calls = 0;
+  const h = harness({
+    sessions: [tab("a"), tab("same", "/a")],
+    getChanges: () =>
+      changes({
+        snapshot: snapshot({ head: ++calls === 1 ? "old" : "new" }),
+        localChanges: { changed: calls, truncated: false },
+      }),
+  });
+  await h.time.advance(0);
+  assert.equal(h.view().statuses.same.snapshot.head, "old");
+  h.replace("same", { gitRevision: 1 });
+  assert.equal(h.view().snapshot, null);
+  assert.equal(h.view().statuses.same.snapshot, null);
+  assert.equal(h.view().statuses.same.localChanges, null);
+  await h.time.advance(0);
+  assert.deepEqual(h.reads, ["a", "a"]);
+  assert.equal(h.view().snapshot.head, "new");
+  assert.equal(h.view().statuses.same.snapshot.head, "new");
+  assert.deepEqual(h.view().statuses.same.localChanges, {
+    changed: 2,
+    truncated: false,
+  });
+  assert.deepEqual(h.sends, []);
+});
+await test("hidden revision changes wait for visibility when auto-fix is off", async () => {
+  const h = harness({ getSnapshot: () => snapshot() });
+  await h.time.advance(0);
+  h.update({ visible: false });
+  h.replace("a", { gitRevision: 1 });
+  await h.time.advance(90000);
+  assert.deepEqual(h.reads, ["a"]);
+  assert.equal(h.view().enabled, false);
+  h.update({ visible: true });
+  await h.time.advance(0);
+  assert.deepEqual(h.reads, ["a", "a"]);
+  assert.deepEqual(h.sends, []);
+});
 await test("branch changes immediately hide old status and reject its in-flight result", async () => {
   const pending = deferred();
   let calls = 0;
@@ -712,7 +890,10 @@ await test("a local error does not prevent dispatch from a verified open PR", as
   assert.equal(h.view().discoveryError, null);
   assert.equal(h.view().enabled, true);
   assert.equal(h.sends.length, 1);
-  assert.deepEqual(payload(h.sends[0]).threads.map((item) => item.id), ["T"]);
+  assert.deepEqual(
+    payload(h.sends[0]).threads.map((item) => item.id),
+    ["T"],
+  );
 });
 await test("an enabled grant waits through fetch failures and resumes only from fresh feedback", async () => {
   let result = changes({ snapshot: snapshot() });
@@ -912,6 +1093,39 @@ await test("refresh while the bridge revalidates revokes the send guard and stay
   await h.time.advance(0);
   assert.deepEqual(guards, [true, false]);
   assert.equal(delivered, 0);
+});
+await test("same-branch revision revokes a pending send guard before synchronization", async () => {
+  const pending = deferred();
+  let guard;
+  let attempts = 0;
+  let delivered = 0;
+  const h = harness({
+    getSnapshot: () => snapshot({ threads: [thread("T")] }),
+    send: async (_id, _text, _expected, canSend) => {
+      if (++attempts > 1) return null;
+      guard = canSend;
+      assert.equal(guard(), true);
+      await pending.promise;
+      if (guard()) {
+        delivered++;
+        return true;
+      }
+      return null;
+    },
+  });
+  await enable(h);
+  await h.time.advance(0);
+  const reads = h.reads.length;
+  h.current.sessions = [tab("a", "/a", { gitRevision: 1 })];
+  assert.ok(!guard(), "a changed checkout must not authorize the pending send");
+  h.sync();
+  await h.time.advance(1000);
+  assert.equal(h.reads.length, reads);
+  pending.resolve();
+  await h.time.advance(0);
+  assert.equal(delivered, 0);
+  assert.equal(h.view().enabled, true);
+  assert.equal(h.reads.length, reads + 1);
 });
 for (const change of [
   { tabId: "b" },

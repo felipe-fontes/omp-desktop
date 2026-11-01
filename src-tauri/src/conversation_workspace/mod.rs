@@ -21,6 +21,10 @@ pub struct WorkspaceOptions {
     pub base_commit: Option<String>,
     pub worktree: bool,
     pub acknowledge_shared: bool,
+    #[serde(default)]
+    pub task: String,
+    #[serde(default)]
+    pub branch_name: Option<String>,
 }
 
 /// The selected source and base, distinct from the tab's actual cwd.
@@ -265,6 +269,9 @@ impl Registry {
         data: Option<&Path>,
         runner: &impl runner::Runner,
     ) -> Result<Prepared, String> {
+        if options.branch_name.is_some() && (!options.worktree || options.task.trim().is_empty()) {
+            return Err("creating a branch requires a task and a worktree".to_string());
+        }
         let mut info = inspect::read(path)?;
         let identity = PathBuf::from(info.repo_root.as_deref().unwrap_or(&info.path));
         let project_path = std::mem::take(&mut info.project_path);
@@ -333,7 +340,17 @@ fn selected_repo(
     };
     if options.worktree {
         let commit = commit.ok_or_else(|| "a worktree requires a committed base".to_string())?;
-        return create_worktree(&info, root, data, commit, runner);
+        if let Some(name) = options.branch_name.as_deref() {
+            validate_new_branch(root, name)?;
+        }
+        return create_worktree(
+            &info,
+            root,
+            data,
+            commit,
+            options.branch_name.as_deref(),
+            runner,
+        );
     }
     let same = selected.is_none_or(|branch| {
         !branch.remote && info.current_branch.as_deref() == Some(branch.name.as_str())
@@ -347,6 +364,9 @@ fn selected_repo(
             return Err("acknowledge sharing the dirty or already owned workspace".to_string());
         }
     } else {
+        if options.task.trim().is_empty() {
+            return Err("switching branches requires a task".to_string());
+        }
         if dirty || owners > 0 {
             return Err("cannot switch a dirty or owned workspace; use a worktree".to_string());
         }
@@ -376,11 +396,39 @@ fn selected_repo(
     Ok(info.path)
 }
 
+fn validate_new_branch(root: &Path, name: &str) -> Result<(), String> {
+    runner::validate_branch(root, name)?;
+    let _gate = crate::spawn_gate::shared();
+    #[allow(clippy::disallowed_methods)] // gix subprocesses hold the spawn gate
+    let repo = gix::discover(root).map_err(|e| format!("cannot inspect repository: {e}"))?;
+    let platform = repo
+        .references()
+        .map_err(|e| format!("cannot read refs: {e}"))?;
+    let refs = platform
+        .all()
+        .map_err(|e| format!("cannot read refs: {e}"))?;
+    let full = format!("refs/heads/{name}");
+    for reference in refs {
+        let reference = reference.map_err(|e| format!("cannot read ref: {e}"))?;
+        let existing = reference.name().as_bstr();
+        let existing: &[u8] = existing.as_ref();
+        let wanted = full.as_bytes();
+        if existing == wanted
+            || (existing.starts_with(wanted) && existing.get(wanted.len()) == Some(&b'/'))
+            || (wanted.starts_with(existing) && wanted.get(existing.len()) == Some(&b'/'))
+        {
+            return Err("branch name conflicts with an existing local branch".to_string());
+        }
+    }
+    Ok(())
+}
+
 fn create_worktree(
     info: &WorkspaceInfo,
     root: &Path,
     data: Option<&Path>,
     commit: &str,
+    branch: Option<&str>,
     runner: &impl runner::Runner,
 ) -> Result<String, String> {
     let data = data
@@ -413,19 +461,18 @@ fn create_worktree(
         suffix.push(char::from(HEX[usize::from(byte >> 4)]));
         suffix.push(char::from(HEX[usize::from(byte & 15)]));
     }
-    let name = format!("omp/conversation-{suffix}");
     let dest = worktrees.join(format!("conversation-{suffix}"));
-    if dest.exists() || info.branches.iter().any(|b| b.name == name) {
-        return Err("generated worktree name already exists; try again".to_string());
+    if dest.exists() {
+        return Err("generated worktree folder already exists; try again".to_string());
     }
     let artifacts = |error: String| {
-        format!(
-            "{error}. Worktree artifacts, if created, were retained at {} and branch {name}",
-            dest.display()
+        branch.map_or_else(
+            || format!("{error}. Worktree artifacts, if created, were retained at {}", dest.display()),
+            |name| format!("{error}. Worktree artifacts, if created, were retained at {} and branch {name}", dest.display()),
         )
     };
     runner
-        .worktree(root, &name, &dest, commit)
+        .worktree(root, branch, &dest, commit)
         .map_err(artifacts)?;
     let dest_text = inspect::folder(
         dest.to_str()
@@ -439,9 +486,7 @@ fn create_worktree(
         ));
     }
     let actual = inspect::read(dest_text).map_err(artifacts)?;
-    if actual.head.as_deref() != Some(commit)
-        || actual.current_branch.as_deref() != Some(name.as_str())
-    {
+    if actual.head.as_deref() != Some(commit) || actual.current_branch.as_deref() != branch {
         return Err(artifacts(
             "native worktree has an unexpected branch or commit".to_string(),
         ));

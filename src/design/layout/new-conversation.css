@@ -53,6 +53,40 @@
   font-size: var(--d-text-xs);
   line-height: 1.5;
 }
+.nc-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 12px;
+  color: var(--fg);
+}
+.nc-field textarea,
+.nc-field input[type="text"] {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  border: 1px solid var(--line-bright);
+  border-radius: var(--r-1);
+  background: var(--bg-surface);
+  color: var(--fg);
+  font: inherit;
+}
+.nc-field textarea {
+  resize: vertical;
+}
+.nc-field textarea:focus-visible,
+.nc-field input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.nc-optional,
+.nc-field-help {
+  color: var(--fg-3);
+  font-size: var(--d-text-xs);
+}
+.nc-field-help {
+  line-height: 1.5;
+}
 .nc-row {
   display: flex;
   align-items: center;
@@ -87,6 +121,7 @@
   outline-offset: 1px;
 }
 .nc-worktree,
+.nc-create-branch,
 .nc-ack {
   display: flex;
   align-items: center;
@@ -96,6 +131,7 @@
   white-space: nowrap;
 }
 .nc-worktree input,
+.nc-create-branch input,
 .nc-ack input {
   flex: none;
   accent-color: var(--accent);
@@ -115,6 +151,10 @@
 }
 .nc-note {
   color: var(--fg-2);
+}
+.nc-create-branch {
+  margin-top: 10px;
+  color: var(--fg);
 }
 .nc-ack {
   align-items: flex-start;

@@ -89,6 +89,29 @@ check("dictation cannot recreate a closed tab and preserves whitespace-only draf
   assert.equal(next.B.text, " \nspoken");
 });
 
+check("task and widget inserts in the same batch preserve both texts in their owning tab", () => {
+  let drafts = S.updateEntry({}, "A", DRAFT_IDLE, d => ({ ...d, text: "typed", historyNav: 1 }));
+  drafts = S.updateEntry(drafts, "B", DRAFT_IDLE, d => ({ ...d, text: "other tab" }));
+  const other = drafts.B;
+  const next = S.appendDraftInserts(drafts, ["A", "B"], [
+    { sessionId: "A", text: "widget context" },
+    { sessionId: "A", text: "the requested task" },
+  ], win.OMP_WIDGETS.appendToDraft);
+  assert.equal(next.A.text, "typed widget context the requested task ");
+  assert.equal(next.A.historyNav, null);
+  assert.equal(next.B, other);
+  assert.equal(drafts.A.text, "typed");
+});
+
+check("queued inserts cannot recreate a closed tab or overwrite the focused tab", () => {
+  const drafts = S.updateEntry({}, "B", DRAFT_IDLE, d => ({ ...d, text: "keep this" }));
+  const items = [{ sessionId: "A", text: "pending task" }];
+  assert.equal(S.appendDraftInserts(drafts, ["B"], items, win.OMP_WIDGETS.appendToDraft), drafts);
+  const next = S.appendDraftInserts(drafts, ["A", "B"], items, win.OMP_WIDGETS.appendToDraft);
+  assert.equal(next.A.text, "pending task ");
+  assert.equal(next.B, drafts.B);
+});
+
 check("an update never touches another tab's entry", () => {
   const before = onPlan({}, "B", S.enterPlan);
   const after  = onPlan(before, "A", S.togglePlan);

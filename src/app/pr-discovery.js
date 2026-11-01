@@ -52,6 +52,15 @@
     };
     const sessions = (c) =>
       c.sessions.filter((s) => s.id && s.path && !s.preparing);
+    // A revision is checkout data, not a new conversation or automation
+    // grant. Check all surviving owners: their watchers can notify at
+    // different times for the same shared checkout.
+    const revisionChanged = (t, c) =>
+      sessions(c).some(
+        (s) =>
+          t.owners.get(s.id) === identity(s) &&
+          t.revisions.get(s.id) !== (s.gitRevision ?? 0),
+      );
 
     function reconcile() {
       const c = context();
@@ -65,12 +74,15 @@
       const grouped = new Map();
       for (const s of sessions(c)) {
         const key = checkoutKey(s);
-        if (!grouped.has(key)) grouped.set(key, new Map());
-        grouped.get(key).set(s.id, identity(s));
+        if (!grouped.has(key))
+          grouped.set(key, { owners: new Map(), revisions: new Map() });
+        const group = grouped.get(key);
+        group.owners.set(s.id, identity(s));
+        group.revisions.set(s.id, s.gitRevision ?? 0);
       }
       for (const key of targets.keys())
         if (!grouped.has(key)) targets.delete(key);
-      for (const [key, owners] of grouped) {
+      for (const [key, { owners, revisions }] of grouped) {
         let t = targets.get(key);
         // If no incarnation survived, no old conversation's in-flight result
         // or error is allowed to populate its replacement.
@@ -81,6 +93,7 @@
           t = {
             key,
             owners,
+            revisions,
             version: 0,
             requested: true,
             loading: false,
@@ -93,15 +106,32 @@
           };
           targets.set(key, t);
         } else {
+          if (revisionChanged(t, c)) {
+            // Hide both cached components for every owner until a read of the
+            // new checkout revision succeeds, without revoking tab grants.
+            for (const id of owners.keys())
+              t.pendingOwners.set(id, {
+                pr: true,
+                local: true,
+                attempted: false,
+              });
+            t.version++;
+            t.requested = true;
+          }
           for (const id of t.pendingOwners.keys())
             if (!owners.has(id)) t.pendingOwners.delete(id);
           for (const [id, stamp] of owners) {
             if (t.owners.get(id) === stamp) continue;
-            t.pendingOwners.set(id, { pr: true, local: true, attempted: false });
+            t.pendingOwners.set(id, {
+              pr: true,
+              local: true,
+              attempted: false,
+            });
             t.version++;
             t.requested = true;
           }
           t.owners = owners;
+          t.revisions = revisions;
         }
         if (changedScope) {
           t.requested = true;
@@ -163,6 +193,7 @@
           t.version === version &&
           latest.bridge === bridge &&
           readable(latest, t) &&
+          !revisionChanged(t, latest) &&
           owner &&
           identity(owner) === stamp &&
           checkoutKey(owner) === t.key
@@ -306,7 +337,8 @@
       if (!available(c)) return result;
       for (const s of sessions(c)) {
         const t = targets.get(checkoutKey(s));
-        if (t?.owners.get(s.id) !== identity(s)) continue;
+        if (t?.owners.get(s.id) !== identity(s) || revisionChanged(t, c))
+          continue;
         const pending = t.pendingOwners.get(s.id);
         result[s.id] = {
           snapshot: pending?.pr ? null : t.snapshot,

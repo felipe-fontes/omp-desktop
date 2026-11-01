@@ -28,6 +28,8 @@ fn options(info: &super::WorkspaceInfo, name: &str, worktree: bool, ack: bool) -
         base_commit: Some(branch.commit.clone()),
         worktree,
         acknowledge_shared: ack,
+        task: "Investigate the project".into(),
+        branch_name: None,
     }
 }
 
@@ -51,7 +53,13 @@ impl runner::Runner for GitWorktree {
         runner::Native::default().switch(root, branch)
     }
 
-    fn worktree(&self, root: &Path, branch: &str, dest: &Path, commit: &str) -> Result<(), String> {
+    fn worktree(
+        &self,
+        root: &Path,
+        branch: Option<&str>,
+        dest: &Path,
+        commit: &str,
+    ) -> Result<(), String> {
         // The assertion after the call needs the destination owned separately.
         *self.dest.lock().unwrap() = Some(dest.to_path_buf());
         runner::Native::default().worktree(root, branch, dest, commit)?;
@@ -85,6 +93,8 @@ fn non_git_and_unborn_folders_have_explicit_empty_base() {
         base_commit: None,
         worktree: false,
         acknowledge_shared: false,
+        task: String::new(),
+        branch_name: None,
     };
     assert!(registry
         .prepare("one", &path(&repo), Some(selection()), None)
@@ -339,7 +349,13 @@ impl runner::Runner for PausingWorktree<'_> {
         self.real.switch(root, branch)
     }
 
-    fn worktree(&self, root: &Path, branch: &str, dest: &Path, commit: &str) -> Result<(), String> {
+    fn worktree(
+        &self,
+        root: &Path,
+        branch: Option<&str>,
+        dest: &Path,
+        commit: &str,
+    ) -> Result<(), String> {
         self.entered.wait();
         self.resume.wait();
         self.real.worktree(root, branch, dest, commit)
@@ -421,15 +437,24 @@ fn isolated_checkout_uses_selected_commit_preserves_source_and_maps_subfolder() 
     repo.write("node_modules/package/index.js", "installed package\n");
     repo.write(".claude/worktrees/nested/local.txt", "nested work\n");
     let before = repo.git(&["status", "--porcelain=v1"]);
+    let refs_before = repo.git(&["for-each-ref", "--format=%(refname) %(objectname)"]);
+    let head_before = repo.git(&["rev-parse", "HEAD"]);
     let sub = crate::external_open::canonical_folder(&repo.path().join("sub")).unwrap();
     let mut registry = Registry::default();
-    let info = super::inspect(&sub).unwrap();
     let runner = GitWorktree::new(false);
     let prepared = registry
         .prepare_with(
             "isolated",
             &sub,
-            Some(options(&info, "other", true, false)),
+            Some(
+                serde_json::from_value(serde_json::json!({
+                    "baseRef": "refs/heads/other",
+                    "baseCommit": other_commit.as_str(),
+                    "worktree": true,
+                    "acknowledgeShared": false
+                }))
+                .unwrap(),
+            ),
             Some(data.path()),
             &runner,
         )
@@ -455,10 +480,15 @@ fn isolated_checkout_uses_selected_commit_preserves_source_and_maps_subfolder() 
             contents
         );
     }
+    let actual = inspect::read(prepared.path).unwrap();
+    assert_eq!(actual.head.as_deref(), Some(other_commit.as_str()));
+    assert!(actual.current_branch.is_none());
     assert_eq!(
-        inspect::read(prepared.path).unwrap().head.as_deref(),
-        Some(other_commit.as_str())
+        repo.git(&["for-each-ref", "--format=%(refname) %(objectname)"]),
+        refs_before
     );
+    assert_eq!(repo.git(&["rev-parse", "HEAD"]), head_before);
+    assert_eq!(repo.git(&["branch", "--show-current"]).trim(), "main");
     assert_eq!(repo.git(&["status", "--porcelain=v1"]), before);
     assert_eq!(
         std::fs::read_to_string(repo.path().join("sub/file.txt")).unwrap(),
@@ -476,6 +506,115 @@ fn isolated_checkout_uses_selected_commit_preserves_source_and_maps_subfolder() 
 }
 
 #[test]
+fn explicit_branch_is_created_exactly_at_selected_commit() {
+    let Some(repo) = populated("conversation-opt-in-branch") else {
+        return;
+    };
+    let data = TempDir::new("conversation-workspace", "opt-in-branch");
+    let root = path(&repo);
+    let info = super::inspect(&root).unwrap();
+    let mut selection = options(&info, "main", true, false);
+    selection.branch_name = Some("feature/user-chosen".into());
+    let mut registry = Registry::default();
+    let prepared = registry
+        .prepare("named", &root, Some(selection), Some(data.path()))
+        .unwrap();
+    let actual = super::inspect(&prepared.path).unwrap();
+    assert_eq!(
+        actual.current_branch.as_deref(),
+        Some("feature/user-chosen")
+    );
+    assert_eq!(actual.head, info.head);
+    assert_eq!(repo.git(&["branch", "--show-current"]).trim(), "main");
+    let refs = repo.git(&["for-each-ref", "--format=%(refname)", "refs/heads"]);
+    assert_eq!(
+        refs.lines().collect::<Vec<_>>(),
+        vec!["refs/heads/feature/user-chosen", "refs/heads/main"]
+    );
+}
+
+#[test]
+fn invalid_branch_requests_leave_checkout_and_data_unchanged() {
+    let Some(repo) = populated("conversation-invalid-branch") else {
+        return;
+    };
+    let data = TempDir::new("conversation-workspace", "invalid-branch");
+    repo.git(&["branch", "topic"]);
+    repo.git(&["branch", "long/leaf"]);
+    repo.git(&["symbolic-ref", "refs/heads/alias", "refs/heads/main"]);
+    repo.write("sub/file.txt", "source edit\n");
+    let root = path(&repo);
+    let info = super::inspect(&root).unwrap();
+    let refs_before = repo.git(&["for-each-ref", "--format=%(refname) %(objectname)"]);
+    let head_before = repo.git(&["rev-parse", "HEAD"]);
+    let status_before = repo.git(&["status", "--porcelain=v1"]);
+    for (name, task, worktree) in [
+        ("feature/new", "", true),
+        ("feature/new", "   ", true),
+        ("", "task", true),
+        ("bad name", "task", true),
+        ("-invalid", "task", true),
+        ("@{-1}", "task", true),
+        ("refs/heads/new", "task", true),
+        ("main", "task", true),
+        ("topic/child", "task", true),
+        ("long", "task", true),
+        ("alias", "task", true),
+        ("feature/new", "task", false),
+    ] {
+        let mut selection = options(&info, "main", worktree, false);
+        selection.task = task.into();
+        selection.branch_name = Some(name.into());
+        assert!(
+            Registry::default()
+                .prepare("refused", &root, Some(selection), Some(data.path()))
+                .is_err(),
+            "{name:?}"
+        );
+        assert!(!data.path().join("conversation-worktrees").exists());
+        assert_eq!(
+            repo.git(&["for-each-ref", "--format=%(refname) %(objectname)"]),
+            refs_before
+        );
+        assert_eq!(repo.git(&["rev-parse", "HEAD"]), head_before);
+        assert_eq!(repo.git(&["branch", "--show-current"]).trim(), "main");
+        assert_eq!(repo.git(&["status", "--porcelain=v1"]), status_before);
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("sub/file.txt")).unwrap(),
+            "source edit\n"
+        );
+    }
+}
+
+#[test]
+fn switching_existing_branch_requires_nonblank_task() {
+    let Some(repo) = populated("conversation-switch-task") else {
+        return;
+    };
+    repo.git(&["branch", "other"]);
+    let root = path(&repo);
+    let info = super::inspect(&root).unwrap();
+    for task in ["", " \n "] {
+        let mut selection = options(&info, "other", false, false);
+        selection.task = task.into();
+        assert!(Registry::default()
+            .prepare("refused", &root, Some(selection), None)
+            .is_err());
+        assert_eq!(repo.git(&["branch", "--show-current"]).trim(), "main");
+    }
+    let mut registry = Registry::default();
+    registry
+        .prepare(
+            "allowed",
+            &root,
+            Some(options(&info, "other", false, false)),
+            None,
+        )
+        .unwrap();
+    assert_eq!(repo.git(&["branch", "--show-current"]).trim(), "other");
+}
+
+#[test]
 fn native_failure_retains_created_artifacts_and_names_them() {
     let Some(repo) = populated("conversation-worktree-failure") else {
         return;
@@ -485,10 +624,12 @@ fn native_failure_retains_created_artifacts_and_names_them() {
     let mut registry = Registry::default();
     let info = super::inspect(&root).unwrap();
     let runner = GitWorktree::new(true);
+    let mut selection = options(&info, "main", true, false);
+    selection.branch_name = Some("feature/checkout-failure".into());
     let Err(error) = registry.prepare_with(
         "failure",
         &root,
-        Some(options(&info, "main", true, false)),
+        Some(selection),
         Some(data.path()),
         &runner,
     ) else {
@@ -498,7 +639,7 @@ fn native_failure_retains_created_artifacts_and_names_them() {
     assert!(destination.exists());
     assert!(error.contains("post-checkout hook failed"));
     assert!(error.contains(&destination.display().to_string()));
-    assert!(error.contains("branch omp/conversation-"));
+    assert!(error.contains("branch feature/checkout-failure"));
     assert_eq!(registry.status(&root).unwrap().owners, 0);
 }
 
@@ -525,6 +666,8 @@ fn refuses_invalid_ref_and_remote_in_place_and_supports_detached_head() {
         base_commit: Some(head),
         worktree: false,
         acknowledge_shared: true,
+        task: String::new(),
+        branch_name: None,
     };
     assert!(registry.prepare("bad", &root, Some(invalid), None).is_err());
     repo.git(&["switch", "-q", "--detach"]);
@@ -535,6 +678,8 @@ fn refuses_invalid_ref_and_remote_in_place_and_supports_detached_head() {
         base_commit: detached.head,
         worktree: false,
         acknowledge_shared: false,
+        task: String::new(),
+        branch_name: None,
     };
     assert!(registry
         .prepare("detached", &root, Some(selection), None)
@@ -730,7 +875,7 @@ impl runner::Runner for RejectingWorktree {
         panic!("isolation must not switch the source")
     }
 
-    fn worktree(&self, _: &Path, _: &str, _: &Path, _: &str) -> Result<(), String> {
+    fn worktree(&self, _: &Path, _: Option<&str>, _: &Path, _: &str) -> Result<(), String> {
         Err("worktree runner reached".into())
     }
 }
@@ -853,6 +998,8 @@ fn non_git_sharing_requires_acknowledgement() {
         base_commit: None,
         worktree: false,
         acknowledge_shared,
+        task: String::new(),
+        branch_name: None,
     };
     assert!(registry
         .prepare("no-ack", &root, Some(selection(false)), None)

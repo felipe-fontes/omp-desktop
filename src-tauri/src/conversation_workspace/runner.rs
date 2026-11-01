@@ -7,7 +7,13 @@ const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub(super) trait Runner {
     fn switch(&self, root: &Path, branch: &str) -> Result<(), String>;
-    fn worktree(&self, root: &Path, branch: &str, dest: &Path, commit: &str) -> Result<(), String>;
+    fn worktree(
+        &self,
+        root: &Path,
+        branch: Option<&str>,
+        dest: &Path,
+        commit: &str,
+    ) -> Result<(), String>;
 }
 
 #[derive(Default)]
@@ -57,16 +63,40 @@ impl Runner for Native<'_> {
         self.execute(&mut command, "git switch")
     }
 
-    fn worktree(&self, root: &Path, branch: &str, dest: &Path, commit: &str) -> Result<(), String> {
+    fn worktree(
+        &self,
+        root: &Path,
+        branch: Option<&str>,
+        dest: &Path,
+        commit: &str,
+    ) -> Result<(), String> {
         let mut command = git(root)?;
         // This is an explicit checkout mutation: Git's normal checkout filters
         // and post-checkout hook still run, just as with an in-place switch.
-        command
-            .args(["worktree", "add", "-b", branch, "--"])
-            .arg(dest)
-            .arg(commit);
+        command.args(["worktree", "add"]);
+        if let Some(branch) = branch {
+            command.args(["-b", branch]);
+        } else {
+            command.arg("--detach");
+        }
+        command.arg("--").arg(dest).arg(commit);
         self.execute(&mut command, "git worktree add")
     }
+}
+
+pub(super) fn validate_branch(root: &Path, name: &str) -> Result<(), String> {
+    // Git's --branch form accepts previous-checkout expressions. Those expand
+    // to another name and are not an explicit branch name.
+    if name.is_empty() || name.starts_with("@{-") || name.starts_with("refs/heads/") {
+        return Err("invalid branch name".to_string());
+    }
+    let mut command = git(root)?;
+    command.args(["check-ref-format", "--branch", name]);
+    let output = process::run(&mut command, || false, CHECKOUT_TIMEOUT)?;
+    if !output.status.success() {
+        return Err("invalid branch name".to_string());
+    }
+    Ok(())
 }
 
 fn git(root: &Path) -> Result<Command, String> {

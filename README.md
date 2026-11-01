@@ -34,7 +34,9 @@ Built on Tauri 2 (Rust + the system webview). It doesn't bundle Electron or load
 
 ### Disposable conversation worktrees
 
-Choose **Worktree** in new-conversation setup for an isolated branch and folder. New checkouts start from tracked Git state without inheriting ignored dependencies, build outputs or local environment files from the source; install dependencies and provide local setup separately.
+Choose **Worktree** in new-conversation setup for an isolated folder. It starts detached, without creating a Git branch. To create one, enter the task, enable **Create branch for this task**, and provide a semantic name such as `feat/defer-conversation-branching`. Names are never replaced with GUIDs; an existing name must be changed explicitly. Saved Worktree defaults are not branch consent. The task stays in the new conversation's draft until you send it.
+
+New checkouts start from tracked Git state without inheriting ignored dependencies, build outputs or local environment files from the source; install dependencies and provide local setup separately. Detached worktrees stay detached when restored. A moved, occupied or deleted saved branch also restores detached instead of generating another branch.
 
 Clicking **×** on an app-managed worktree offers:
 

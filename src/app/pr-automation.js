@@ -286,12 +286,15 @@
         c.bridge?.isConnected,
         c.featureEnabled,
         c.visible,
-        c.sessions.map((s) => [s.id, stamp(s), s.runState]),
+        c.sessions.map((s) => [s.id, stamp(s), s.runState, s.gitRevision ?? 0]),
       ]);
       const changed =
         !previous || previous.value !== next || previous.bridge !== c.bridge;
       const sessionStates = new Map(
-        c.sessions.map((s) => [s.id, JSON.stringify([stamp(s), s.runState])]),
+        c.sessions.map((s) => [
+          s.id,
+          JSON.stringify([stamp(s), s.runState, s.gitRevision ?? 0]),
+        ]),
       );
       const changedIds = [...sessionStates]
         .filter(([id, value]) => previous?.sessionStates.get(id) !== value)

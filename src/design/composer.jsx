@@ -37,7 +37,7 @@ function hintKeyFor(actionId, fallback) {
 // ── The composer (input + plan/steer modes + send) ────────────────────
 // `submitKey` ("enter" | "ctrl+enter") and `pasteCollapseLines` come from the
 // tweaks (Settings › Composer); the defaults match TWEAK_DEFAULTS.
-function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePlan, planBlocked = "", goalMode = false, goalTint = false, onToggleGoal, goalBlocked = "", goalStrip = null, onOpenCmd, onOpenModel, currentModel, thinking, onLoadThinkingLevels, onSetThinking, isStreaming, backgroundWork = false, conversationMoving = false, pendingRequests = [], onOpenPending, onAbort, onApprove, annotationCount = 0, microcopy, onFollowUp, draftInsert, promptHistory = [], promptInsert, queue, queueSending, onRemoveQueued, onPromoteQueued, onSendQueuedNow, browserChips = [], onRemoveBrowserChip, onBrowserChipClick, submitKey = "enter", pasteCollapseLines = 5, liveVoice, liveError, onLiveAction, dictation, dictationError, onDictationAction, dictationCompleted, onAckDictation }) {
+function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePlan, planBlocked = "", goalMode = false, goalTint = false, onToggleGoal, goalBlocked = "", goalStrip = null, onOpenCmd, onOpenModel, currentModel, thinking, onLoadThinkingLevels, onSetThinking, isStreaming, backgroundWork = false, conversationMoving = false, pendingRequests = [], onOpenPending, onAbort, onApprove, annotationCount = 0, microcopy, onFollowUp, draftInsert, promptHistory = [], promptInsert, targetedDraftInserts = [], onAckDraftInserts, queue, queueSending, onRemoveQueued, onPromoteQueued, onSendQueuedNow, browserChips = [], onRemoveBrowserChip, onBrowserChipClick, submitKey = "enter", pasteCollapseLines = 5, liveVoice, liveError, onLiveAction, dictation, dictationError, onDictationAction, dictationCompleted, onAckDictation }) {
   // Drafts are per tab (issue #28). The composer stays mounted across tab
   // switches and keeps one draft per session id (app/session-ui.js
   // DRAFT_IDLE): text, pending image attachments (sent alongside the next
@@ -269,15 +269,14 @@ function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePla
   // included (OMP_WIDGETS.appendToDraft). An insert from before this
   // composer mounted (it unmounts while no tab is open) is not replayed
   // into the next tab's draft.
-  const seenInsertRef = React.useRef(promptInsert?.sessionId ? null : promptInsert?.nonce);
+  const seenInsertRef = React.useRef(promptInsert?.nonce);
   React.useEffect(() => {
-    const step = window.OMP_WIDGETS.consumePromptInsert(promptInsert, seenInsertRef.current, sessionIds);
-    if (step.kind === "none") return;
-    seenInsertRef.current = step.nonce;
-    // Widget inserts append; rewind inserts replace text and attachments in
-    // their owning tab, including an image-only prompt and a hidden tab.
-    if (step.kind === "targeted") {
-      const target = step.sessionId;
+    if (!promptInsert || promptInsert.nonce === seenInsertRef.current || typeof promptInsert.text !== "string") return;
+    seenInsertRef.current = promptInsert.nonce;
+    // Rewinds restore text and attachments to their owning open tab.
+    if (promptInsert.sessionId) {
+      const target = promptInsert.sessionId;
+      if (!sessionIds.includes(target)) return;
       const previous = draftEntryOf(drafts, target, DRAFT_IDLE);
       const nextText = promptInsert.append ? window.OMP_WIDGETS.appendToDraft(previous.text, promptInsert.text) : promptInsert.text;
       const back = (promptInsert.images ?? []).slice(0, MAX_ATTACHMENTS)
@@ -296,7 +295,28 @@ function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePla
     if (images.length === 0) return;
     const back = images.map(image => ({ id: `att-${++attachCounterRef.current}`, name: "", image, src: toDataUrl(image) }));
     updateDraft(sessionId, d => ({ ...d, attachments: [...d.attachments, ...back].slice(0, MAX_ATTACHMENTS) }));
-  }, [promptInsert?.nonce, sessionIds]);
+  }, [promptInsert?.nonce]);
+
+  const consumedDraftInserts = React.useRef(new Set());
+  React.useEffect(() => {
+    const seen = consumedDraftInserts.current;
+    consumedDraftInserts.current = new Set(targetedDraftInserts.filter(item => seen.has(item.nonce)).map(item => item.nonce));
+    const ready = targetedDraftInserts.filter(item => sessionIds.includes(item.sessionId) && !seen.has(item.nonce));
+    if (!ready.length) return;
+    for (const item of ready) consumedDraftInserts.current.add(item.nonce);
+    setDrafts(map => window.OMP_SESSION_UI.appendDraftInserts(map, sessionIdsRef.current ?? [], ready, window.OMP_WIDGETS.appendToDraft));
+    onAckDraftInserts(ready.map(item => item.nonce));
+    const target = sessionIdRef.current;
+    if (!ready.some(item => item.sessionId === target)) return;
+    requestAnimationFrame(() => {
+      if (sessionIdRef.current !== target) return;
+      const ta = focusTextarea();
+      if (ta) {
+        ta.selectionStart = ta.selectionEnd = ta.value.length;
+        setCaret(ta.value.length);
+      }
+    });
+  }, [targetedDraftInserts, sessionIds, onAckDraftInserts]);
 
   const execCmd = (cmd) => {
     // A mid-prompt skill pick replaces only its `/token` with

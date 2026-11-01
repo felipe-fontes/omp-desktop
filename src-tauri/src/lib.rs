@@ -139,13 +139,19 @@ fn start_session_blocking(
         saved_sessions::validate_resume(app, resume, profile)?;
     }
     let profile_id = profile.unwrap_or(profiles::DEFAULT_PROFILE_ID);
-    let recovery = worktree_lifecycle::prepare_resume(
-        app,
-        profile_id,
-        args.resume.as_deref(),
-        &args.cwd,
-        args.user_initiated,
-    )?;
+    // Explicit new-conversation choices must be validated on the selected
+    // folder, not restore an old checkout before that validation can refuse.
+    let recovery = if args.workspace.is_some() {
+        None
+    } else {
+        worktree_lifecycle::prepare_resume(
+            app,
+            profile_id,
+            args.resume.as_deref(),
+            &args.cwd,
+            args.user_initiated,
+        )?
+    };
     let requested_cwd = recovery
         .as_ref()
         .map_or(args.cwd.as_str(), |workspace| workspace.path.as_str());
@@ -1024,11 +1030,11 @@ async fn open_project(app: tauri::AppHandle) -> Result<Option<String>, String> {
     .await?
 }
 
-/// Start watching `.git/HEAD` for a session's project path.
+/// Watch a session's Git HEAD, index and refs for live UI updates.
 ///
 /// Returns the short branch name at call time, or `None` when `path` is
-/// not inside a git repo or HEAD is detached.  The watcher fires
-/// `"git://branch/{session_id}"` events on every subsequent HEAD change.
+/// not inside a git repo or HEAD is detached. The watcher emits the current
+/// optional branch on `git://branch/{session_id}` for Git metadata changes.
 /// Watcher errors are silently ignored — the branch chip simply won't
 /// update live.
 #[tauri::command]
@@ -1046,7 +1052,7 @@ fn start_git_watch(
     branch
 }
 
-/// Stop the HEAD watcher for a session.  No-op when none is active.
+/// Stop the Git metadata watcher for a session. No-op when none is active.
 #[tauri::command]
 fn stop_git_watch(session_id: String, watcher: State<'_, GitWatcherState>) {
     watcher.stop(&session_id);

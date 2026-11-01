@@ -1672,26 +1672,34 @@
         approvalMode: AMODE.isMode(started.approvalMode) ? started.approvalMode : null,
       });
     }
-    // Git: read initial branch and arm the HEAD watcher (fire-and-forget errors)
+    // Subscribe before arming the watcher: a newer event must not be lost
+    // or overwritten by the initial branch read while that IPC is pending.
     if (actualCwd) {
+      let observed = false;
+      const { listen } = window.__TAURI__.event;
+      const unlisten = await listen(`git://branch/${id}`, ev => {
+        const entry = sessionRegistry.get(id);
+        if (!entry) return;
+        observed = true;
+        sessionRegistry.set(id, { ...entry, branch: ev.payload ?? null, gitRevision: (entry.gitRevision ?? 0) + 1 });
+        notify();
+      });
+      if (!sessionRegistry.has(id)) {
+        unlisten();
+        return actualCwd;
+      }
+      // Replacing a racing respawn's handle must not orphan its listener.
+      _dropGitListener(id);
+      gitListeners.set(id, unlisten);
       const branch = await window.__TAURI__.core
         .invoke("start_git_watch", { sessionId: id, path: actualCwd })
         .catch(() => null);
       const entry = sessionRegistry.get(id);
-      if (entry) sessionRegistry.set(id, { ...entry, branch: branch ?? null });
-      // Live updates: re-emitted by Rust whenever .git/HEAD changes
-      const { listen } = window.__TAURI__.event;
-      const unlisten = await listen(`git://branch/${id}`, ev => {
-        const e = sessionRegistry.get(id);
-        if (e) sessionRegistry.set(id, { ...e, branch: ev.payload });
-        notify();
-      });
-      // A racing respawn of this same id (profile switch) may have resolved
-      // its own `listen` after `_killSessionProcess` ran `_dropGitListener`,
-      // re-inserting a handle. Overwriting it blind would orphan that
-      // listener beyond the reach of every teardown path.
-      _dropGitListener(id);
-      gitListeners.set(id, unlisten);
+      if (entry && !observed) sessionRegistry.set(id, { ...entry, branch: branch ?? null });
+      if (!entry) {
+        _dropGitListener(id);
+        await window.__TAURI__.core.invoke("stop_git_watch", { sessionId: id }).catch(() => {});
+      }
     }
     return actualCwd;
   }
@@ -2213,7 +2221,7 @@
     // Register in tab list before starting omp so the tab shows immediately.
     // Register with null branch — chip hidden until git resolves.
     sessionRegistry.set(id, {
-      id, name: tabName, path: cwd ?? "", color, branch: null, profile, scratchId,
+      id, name: tabName, path: cwd ?? "", color, branch: null, gitRevision: 0, profile, scratchId,
       preparing: true, workspace: workspaceBinding,
       // The approval mode `start_session` spawned this tab's current omp
       // with (set by `_spawnSession`); null while no process runs it.
@@ -5634,7 +5642,7 @@
         conversationSetups.shift();
         request.resolve(id);
         notify();
-        return { ok: true };
+        return { ok: true, sessionId: id };
       } catch (error) {
         request.busy = false;
         return { ok: false, error: String(error?.message ?? error) };

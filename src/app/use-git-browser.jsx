@@ -8,9 +8,10 @@
    variant by mode); a history click browses that commit (its touched files
    replace the tree, the first one is selected), the working-tree row
    returns. The working tree (status, its file) refetches on the refresh
-   button, after stage/discard, when the active tab's branch changes and
-   when an edit/write tool card finishes; the log on the refresh button and
-   a branch change; a commit and its files never (a commit cannot change).
+   button, after stage/discard, when Git metadata or the active tab's branch
+   changes and when an edit/write tool card finishes; the log on the refresh
+   button, a branch change or Git metadata change; a commit and its files never
+   (a commit cannot change).
    A project change remounts the browser (app-live.jsx keys it). Each fetch
    is tagged with what it was for, so only the newest lands and a previous
    file never shows under a new selection. */
@@ -31,10 +32,10 @@ function _ugbResult(res) {
 
 /** `edits`: the count of finished edit/write cards (OMP_GIT_BROWSER
  *  `finishedEdits`); a rise means a file on disk changed. */
-function useGitBrowser({ bridge, initialPath, branch, edits }) {
+function useGitBrowser({ bridge, initialPath, branch, edits, gitRevision = 0 }) {
   const [nonce, setNonce] = React.useState(0);
   // A change refetches the log; with `edits`, the working tree too.
-  const logTick = `${branch ?? ""}\0${nonce}`;
+  const logTick = `${branch ?? ""}\0${gitRevision}\0${nonce}`;
   const tick = `${logTick}\0${edits}`;
   const refresh = React.useCallback(() => setNonce(n => n + 1), []);
 

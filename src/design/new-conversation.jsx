@@ -2,11 +2,17 @@
 // Neither opening the dialog nor editing defaults starts a conversation.
 const { OMP_CONVERSATION_WORKSPACE: _NC_Workspace } = window;
 
-function NewConversationDialog({ request, bridge, suspended = false }) {
+function NewConversationDialog({
+  request,
+  bridge,
+  onStarted,
+  suspended = false,
+}) {
   const panelRef = React.useRef(null);
   const mountedRef = React.useRef(false);
   const inspectionRef = React.useRef(0);
   const busyRef = React.useRef(false);
+  const selectionInitializedRef = React.useRef(false);
   const [mode, setMode] = React.useState(
     request.configure ? "defaults" : "launch",
   );
@@ -15,6 +21,9 @@ function NewConversationDialog({ request, bridge, suspended = false }) {
   const [statusError, setStatusError] = React.useState(null);
   const [refName, setRefName] = React.useState(null);
   const [worktree, setWorktree] = React.useState(false);
+  const [task, setTask] = React.useState("");
+  const [createBranch, setCreateBranch] = React.useState(false);
+  const [branchName, setBranchName] = React.useState("");
   const [defaultRef, setDefaultRef] = React.useState(null);
   const [defaultWorktree, setDefaultWorktree] = React.useState(false);
   const [acknowledge, setAcknowledge] = React.useState(false);
@@ -49,8 +58,14 @@ function NewConversationDialog({ request, bridge, suspended = false }) {
       const initial = _NC_Workspace.initialSelection(preview);
       const defaults = _NC_Workspace.defaultSelection(preview);
       setInfo(preview);
-      setRefName(initial.refName);
-      setWorktree(!!preview.repoRoot && initial.worktree);
+      if (!selectionInitializedRef.current) {
+        setRefName(initial.refName);
+        setWorktree(!!preview.repoRoot && initial.worktree);
+        selectionInitializedRef.current = true;
+      } else if (!preview.repoRoot) {
+        setWorktree(false);
+        setCreateBranch(false);
+      }
       setDefaultRef(defaults.refName);
       setDefaultWorktree(defaults.worktree);
       // Metadata is enough to choose a branch or start an isolated worktree.
@@ -101,7 +116,7 @@ function NewConversationDialog({ request, bridge, suspended = false }) {
         e.preventDefault();
         const controls = [
           ...(panel?.querySelectorAll(
-            'button:not([disabled]), select:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])',
+            'button:not([disabled]), select:not([disabled]), input:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
           ) || []),
         ];
         if (!controls.length) {
@@ -123,13 +138,14 @@ function NewConversationDialog({ request, bridge, suspended = false }) {
         e.preventDefault();
         panel?.focus();
       } else if (
-        e.ctrlKey ||
-        e.metaKey ||
-        (e.altKey &&
-          !(
-            e.target.tagName === "SELECT" &&
-            (e.key === "ArrowDown" || e.key === "ArrowUp")
-          ))
+        !window.OMP_KEYMAP.isTypingTarget(e.target) &&
+        (e.ctrlKey ||
+          e.metaKey ||
+          (e.altKey &&
+            !(
+              e.target.tagName === "SELECT" &&
+              (e.key === "ArrowDown" || e.key === "ArrowUp")
+            )))
       ) {
         e.preventDefault();
       }
@@ -150,7 +166,10 @@ function NewConversationDialog({ request, bridge, suspended = false }) {
     shownRef && !branchChoices.some((branch) => branch.refName === shownRef);
   const decision = configuring
     ? _NC_Workspace.defaultsDecision(info, defaultRef, defaultWorktree)
-    : _NC_Workspace.selection(info, refName, worktree, acknowledge, status);
+    : _NC_Workspace.selection(info, refName, worktree, acknowledge, status, {
+        task,
+        branchName: createBranch ? branchName : undefined,
+      });
   const folder = info?.projectPath || info?.path || request.path;
   const cancel = () => {
     if (!busyRef.current) bridge.cancelConversationSetup(request.id);
@@ -166,8 +185,11 @@ function NewConversationDialog({ request, bridge, suspended = false }) {
         request.id,
         decision.options,
       );
-      if (mountedRef.current && !result?.ok)
+      if (result?.ok && task.trim()) {
+        onStarted?.({ sessionId: result.sessionId, task });
+      } else if (mountedRef.current && !result?.ok) {
         setError(String(result?.error || "Could not start the conversation."));
+      }
     } catch (err) {
       if (mountedRef.current) setError(String(err?.message || err));
     } finally {
@@ -258,6 +280,30 @@ function NewConversationDialog({ request, bridge, suspended = false }) {
               save project defaults.
             </div>
           )}
+          {!configuring && (
+            <label className="nc-field">
+              <span>
+                Task{" "}
+                <span className="nc-optional">
+                  {createBranch
+                    ? "(required for branch creation)"
+                    : "(optional)"}
+                </span>
+              </span>
+              <textarea
+                rows={3}
+                value={task}
+                disabled={busy}
+                onChange={(e) => setTask(e.target.value)}
+                aria-required={createBranch}
+                aria-describedby="nc-task-help"
+              />
+              <span className="nc-field-help" id="nc-task-help">
+                Added to the new conversation's draft for you to review; it will
+                not be sent automatically.
+              </span>
+            </label>
+          )}
           <div className="nc-row">
             <label className="nc-branch">
               {configuring ? "Default base:" : "Start from:"}
@@ -322,6 +368,11 @@ function NewConversationDialog({ request, bridge, suspended = false }) {
                   if (configuring) setDefaultWorktree(e.target.checked);
                   else {
                     setWorktree(e.target.checked);
+                    if (!e.target.checked) {
+                      setCreateBranch(false);
+                      setBranchName("");
+                      setRefName(_NC_Workspace.defaultRef(info));
+                    }
                     setAcknowledge(false);
                   }
                 }}
@@ -360,9 +411,39 @@ function NewConversationDialog({ request, bridge, suspended = false }) {
           )}
           {!configuring && info?.repoRoot && worktree && (
             <div className="nc-note">
-              A separate worktree will be created from the selected commit.
-              Uncommitted source changes are not copied.
+              A separate worktree will be created from the selected commit. It
+              starts detached, without a branch, unless you choose to create
+              one. Uncommitted source changes are not copied.
             </div>
+          )}
+          {!configuring && info?.repoRoot && worktree && (
+            <>
+              <label className="nc-create-branch">
+                <input
+                  type="checkbox"
+                  checked={createBranch}
+                  disabled={busy}
+                  onChange={(e) => setCreateBranch(e.target.checked)}
+                />
+                Create branch for this task
+              </label>
+              {createBranch && (
+                <label className="nc-field">
+                  <span>Branch name</span>
+                  <input
+                    type="text"
+                    value={branchName}
+                    disabled={busy}
+                    onChange={(e) => setBranchName(e.target.value)}
+                    aria-required="true"
+                    aria-describedby="nc-branch-help"
+                  />
+                  <span className="nc-field-help" id="nc-branch-help">
+                    Enter a task and an explicit new branch name.
+                  </span>
+                </label>
+              )}
+            </>
           )}
           {!configuring &&
             info?.repoRoot &&
@@ -401,7 +482,9 @@ function NewConversationDialog({ request, bridge, suspended = false }) {
             </div>
           )}
           {!loading && info && decision.error && (
-            <div className="nc-warning">{decision.error}</div>
+            <div className="nc-warning" role="status">
+              {decision.error}
+            </div>
           )}
           {error && (
             <div className="nc-error" role="alert">

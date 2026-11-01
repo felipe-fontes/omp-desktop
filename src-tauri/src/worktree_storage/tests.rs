@@ -208,13 +208,22 @@ fn full_recovery_keeps_index_and_working_tree_independent_of_moving_branch() {
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         marker
     };
+    let refs = fixture
+        .repo
+        .git(&["for-each-ref", "--format=%(refname)", "refs/heads"]);
     let restored = store.restore(&initial.id).unwrap();
     assert_eq!(restored.state, "present");
-    assert!(restored
-        .branch
-        .as_deref()
-        .unwrap()
-        .starts_with("omp/restore-"));
+    assert!(restored.branch.is_none());
+    assert_eq!(
+        fixture
+            .repo
+            .git(&["for-each-ref", "--format=%(refname)", "refs/heads"]),
+        refs
+    );
+    assert_eq!(
+        fixture.repo.git(&["rev-parse", &fixture.branch]),
+        fixture.repo.git(&["rev-parse", "main"])
+    );
     assert_eq!(
         run(&fixture.root, &["rev-parse", "HEAD"]).trim(),
         saved_head
@@ -249,6 +258,65 @@ fn full_recovery_keeps_index_and_working_tree_independent_of_moving_branch() {
         .unwrap()
         .unwrap();
     assert_eq!(rebound.id, initial.id);
+}
+
+#[test]
+fn detached_worktree_restores_detached_without_creating_refs() {
+    let Some(fixture) = Fixture::new("detached-restore") else {
+        return;
+    };
+    run(&fixture.root, &["switch", "--detach"]);
+    fixture.repo.git(&["branch", "-D", &fixture.branch]);
+    std::fs::write(fixture.root.join("detached-commit"), b"detached commit\n").unwrap();
+    run(&fixture.root, &["add", "detached-commit"]);
+    run(&fixture.root, &["commit", "-q", "-m", "detached commit"]);
+    std::fs::write(fixture.root.join("sub/file.txt"), b"staged\n").unwrap();
+    run(&fixture.root, &["add", "sub/file.txt"]);
+    std::fs::write(fixture.root.join("sub/file.txt"), b"unstaged\n").unwrap();
+    std::fs::write(fixture.root.join("untracked"), b"unsaved\n").unwrap();
+    let head = run(&fixture.root, &["rev-parse", "HEAD"]);
+    let refs = fixture
+        .repo
+        .git(&["for-each-ref", "--format=%(refname) %(objectname)"]);
+    let source_head = fixture.repo.git(&["rev-parse", "HEAD"]);
+    let mut store = fixture.store();
+    let view = fixture.register(&mut store);
+    assert!(view.branch.is_none());
+    store.remove(&view.id, 200).unwrap();
+    fixture
+        .repo
+        .git(&["reflog", "expire", "--expire=now", "--all"]);
+    fixture.repo.git(&["gc", "--prune=now"]);
+    drop(store);
+    let mut store = fixture.store();
+    let restored = store.restore(&view.id).unwrap();
+    assert!(restored.branch.is_none());
+    assert_eq!(run(&fixture.root, &["branch", "--show-current"]).trim(), "");
+    assert_eq!(run(&fixture.root, &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        std::fs::read(fixture.root.join("detached-commit")).unwrap(),
+        b"detached commit\n"
+    );
+    assert_eq!(run(&fixture.root, &["show", ":sub/file.txt"]), "staged\n");
+    assert_eq!(
+        std::fs::read(fixture.root.join("sub/file.txt")).unwrap(),
+        b"unstaged\n"
+    );
+    assert_eq!(
+        std::fs::read(fixture.root.join("untracked")).unwrap(),
+        b"unsaved\n"
+    );
+    assert_eq!(
+        fixture
+            .repo
+            .git(&["for-each-ref", "--format=%(refname) %(objectname)"]),
+        refs
+    );
+    assert_eq!(fixture.repo.git(&["rev-parse", "HEAD"]), source_head);
+    assert_eq!(
+        fixture.repo.git(&["branch", "--show-current"]).trim(),
+        "main"
+    );
 }
 
 #[test]
@@ -318,7 +386,17 @@ fn deleted_branch_and_destination_collision_restore_to_new_safe_location() {
     fixture.repo.git(&["branch", "-D", &fixture.branch]);
     std::fs::create_dir(&fixture.root).unwrap();
     std::fs::write(fixture.root.join("do-not-touch"), b"existing").unwrap();
+    let refs = fixture
+        .repo
+        .git(&["for-each-ref", "--format=%(refname)", "refs/heads"]);
     let restored = store.restore(&view.id).unwrap();
+    assert!(restored.branch.is_none());
+    assert_eq!(
+        fixture
+            .repo
+            .git(&["for-each-ref", "--format=%(refname)", "refs/heads"]),
+        refs
+    );
     assert_ne!(Path::new(&restored.path), fixture.root.join("sub"));
     assert_eq!(
         std::fs::read(fixture.root.join("do-not-touch")).unwrap(),

@@ -211,6 +211,88 @@ check("absolutePath: no project leaves the path as it is", () => {
   assert.equal(G.absolutePath("", "src/a.js"), "src/a.js");
 });
 
+// Exercise the real hook's effects and cleanup, not its prop forwarding.
+{
+  const slots = [];
+  let index = 0, pending = [];
+  const changed = (a, b) => !a || a.length !== b.length || a.some((v, i) => !Object.is(v, b[i]));
+  const React = {
+    useState(initial) {
+      const i = index++;
+      const slot = slots[i] ??= { value: typeof initial === "function" ? initial() : initial };
+      return [slot.value, (v) => { slot.value = typeof v === "function" ? v(slot.value) : v; }];
+    },
+    useRef(initial) { return slots[index++] ??= { current: initial }; },
+    useCallback(fn, deps) {
+      const i = index++;
+      if (!slots[i] || changed(slots[i].deps, deps)) slots[i] = { deps, value: fn };
+      return slots[i].value;
+    },
+    useEffect(fn, deps) {
+      const i = index++, prev = slots[i];
+      if (!prev || changed(prev.deps, deps))
+        pending.push(() => { prev?.cleanup?.(); slots[i] = { deps, cleanup: fn() }; });
+    },
+  };
+  new Function("window", "React", readFileSync(join(root, "src/app/use-git-browser.jsx"), "utf8"))(win, React);
+  const requests = { status: [], log: [], file: [] };
+  const request = (kind) => new Promise((resolve) => requests[kind].push(resolve));
+  let commits = 0, commitFiles = 0;
+  const bridge = {
+    gitBrowserStatus: () => request("status"),
+    gitBrowserLog: () => request("log"),
+    gitBrowserFile: () => request("file"),
+    gitBrowserCommit: () => { commits++; return Promise.resolve({ ok: true, value: { tree } }); },
+    gitBrowserCommitFile: (_sha, path) => {
+      commitFiles++;
+      return Promise.resolve({ ok: true, value: { path } });
+    },
+  };
+  const props = { bridge, initialPath: "src/app/a.js", branch: "feature", edits: 0 };
+  const render = () => {
+    index = 0;
+    pending = [];
+    const result = win.useGitBrowser(props);
+    for (const effect of pending) effect();
+    return result;
+  };
+  const flush = async () => { for (let i = 0; i < 10; i++) await Promise.resolve(); };
+  let view = render();
+  props.gitRevision = 1;
+  render();
+  assert.deepEqual(Object.values(requests).map((r) => r.length), [2, 2, 2]);
+  requests.status[0]({ ok: true, value: { tree: null, marker: "stale" } });
+  requests.log[0]({ ok: true, value: { marker: "stale" } });
+  requests.file[0]({ ok: true, value: { path: props.initialPath, marker: "stale" } });
+  await flush();
+  view = render();
+  assert.equal(view.status, null);
+  assert.equal(view.log, null);
+  assert.equal(view.file, null);
+  requests.status[1]({ ok: true, value: { tree: null, marker: "fresh" } });
+  requests.log[1]({ ok: true, value: { marker: "fresh" } });
+  requests.file[1]({ ok: true, value: { path: props.initialPath, marker: "fresh" } });
+  await flush();
+  view = render();
+  assert.equal(view.status.marker, "fresh");
+  assert.equal(view.log.marker, "fresh");
+  assert.equal(view.file.marker, "fresh");
+  view.browse("commit-sha");
+  render();
+  await flush();
+  render();
+  await flush();
+  view = render();
+  assert.equal(view.commitSha, "commit-sha");
+  assert.equal(view.file.path, "docs/readme.md");
+  props.gitRevision = 2;
+  render();
+  assert.deepEqual(Object.values(requests).map((r) => r.length), [3, 3, 2]);
+  assert.equal(commits, 1);
+  assert.equal(commitFiles, 1);
+  passed++;
+}
+
 // ── Done ──────────────────────────────────────────────────────────────────────
 
 console.log(`git-browser: ${passed} checks passed`);

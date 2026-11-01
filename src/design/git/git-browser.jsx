@@ -10,8 +10,8 @@ const { Icon: _GB_Icon, GitFileTree: _GB_Tree, GitFileView: _GB_View, GitHistory
 
 // Memoised: App re-renders on every streamed frame, and none of them touch
 // these props (`edits` is a count, not the transcript).
-const GitBrowser = React.memo(function GitBrowser({ bridge, onClose, initialPath, branch, edits }) {
-  const g = window.useGitBrowser({ bridge, initialPath, branch, edits });
+const GitBrowser = React.memo(function GitBrowser({ bridge, onClose, initialPath, branch, edits, gitRevision = 0 }) {
+  const g = window.useGitBrowser({ bridge, initialPath, branch, edits, gitRevision });
   const rootRef = React.useRef(null);
 
   // The dialog takes focus, so keystrokes never reach the hidden composer;

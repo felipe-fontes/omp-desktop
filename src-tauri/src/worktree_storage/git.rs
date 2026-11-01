@@ -520,16 +520,10 @@ pub(super) fn add(
     dest: &Path,
     head: &str,
     original_branch: Option<&str>,
-    id: &str,
-) -> Result<String, String> {
+) -> Result<Option<String>, String> {
     let commit = object_id(head)?;
-    if commit.is_null()
-        || !dest.is_absolute()
-        || id.is_empty()
-        || id.len() > 128
-        || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    {
-        return Err("invalid recovery worktree destination or identifier".to_string());
+    if commit.is_null() || !dest.is_absolute() {
+        return Err("invalid recovery worktree destination".to_string());
     }
     let original_available = {
         let (_gate, repo) = open_repo(source)?;
@@ -546,27 +540,19 @@ pub(super) fn add(
             None => false,
         }
     };
-    let branch = if original_available {
-        original_branch
-            .ok_or_else(|| "original branch is unavailable".to_string())?
-            .to_string()
-    } else {
-        format!("omp/restore-{id}-{}", random_hex()?)
-    };
+    // Reuse a still-matching branch, but never invent a fallback branch on
+    // restore: a moved, occupied or deleted branch restores detached.
+    let branch = original_branch.filter(|_| original_available);
     // Git accepts an existing empty directory. Create it exclusively so even an
     // empty pre-existing checkout is never adopted or overwritten.
     fs::create_dir(dest)
         .map_err(|e| format!("cannot exclusively create recovery destination: {e}"))?;
     let mut command = git(source)?;
     command.args(["worktree", "add", "--no-checkout"]);
-    if !original_available {
-        command.arg("-b").arg(&branch);
+    if branch.is_none() {
+        command.arg("--detach");
     }
-    command.arg("--").arg(dest).arg(if original_available {
-        branch.as_str()
-    } else {
-        head
-    });
+    command.arg("--").arg(dest).arg(branch.unwrap_or(head));
     run(&mut command, "Git recovery worktree creation", || Ok(()))?;
     let (_gate, restored) = open_repo(dest)?;
     let actual = restored
@@ -576,17 +562,18 @@ pub(super) fn add(
     let restored_head = restored
         .head()
         .map_err(|_| "cannot inspect restored branch".to_string())?;
-    let full = format!("refs/heads/{branch}");
+    let expected = branch.map(|name| format!("refs/heads/{name}"));
     if actual != commit
         || restored_head
             .referent_name()
-            .is_none_or(|name| name.as_bstr().as_bytes() != full.as_bytes())
+            .map(|name| name.as_bstr().as_bytes())
+            != expected.as_deref().map(str::as_bytes)
     {
         return Err(
             "recovery branch changed during worktree creation; checkout retained".to_string(),
         );
     }
-    Ok(branch)
+    Ok(branch.map(str::to_owned))
 }
 
 pub(super) fn remove(source: &Path, root: &Path) -> Result<(), String> {
