@@ -80,6 +80,19 @@
   margin-top: 2px;
 }
 
+/* Provider cache disclosure is shared by the rail and assistant replies. */
+.cache-usage { min-width: 0; color: var(--fg-3); font-size: var(--d-text-xs); }
+.cache-usage-summary { cursor: pointer; color: var(--fg-2); }
+.cache-usage-summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+.cache-usage-scope { margin-left: 8px; color: var(--fg-4); }
+.cache-usage-details { padding: 6px 0 2px; min-width: 0; overflow-wrap: anywhere; }
+.cache-usage-caption { color: var(--fg-3); }
+.cache-usage-values { margin: 6px 0; }
+.cache-usage-values > div { display: flex; justify-content: space-between; gap: 8px; }
+.cache-usage-values dt { min-width: 0; }
+.cache-usage-values dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
+.cache-usage-foot { margin: 6px 0 0; color: var(--fg-3); }
+
 /* radar */
 .radar { display: flex; flex-direction: column; gap: 4px; }
 .radar-row {

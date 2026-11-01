@@ -45,3 +45,5 @@ Script order **is** the dependency graph:
 10. `app-live.jsx` last.
 
 When adding a file, insert at the correct point — there is no resolver to catch ordering bugs.
+
+Cache usage: `app/cache-usage.js` is a dependency-free IIFE loaded with the plain app helpers, before `adapter.js` and `live.js` build request-scoped cache reports. `design/ui/cache-usage.jsx` loads after `ui/sparks.jsx` and before `chat/assistant-bubble.jsx` and `chrome.jsx`, which destructure its `CacheUsage` export. Its `formatTokens` lookup is late-bound, so the later adapter load is safe.

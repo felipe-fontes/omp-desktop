@@ -7,6 +7,7 @@
    ═════════════════════════════════════════════════════════════════════ */
 
 const { Icon, TokenGauge, ActivityRadar, Sparkline, TOOL_META, ProfileMenu, DEFAULT_PROFILE_ID, SubagentRailCard, TabGroupChip, TabRunDot, TabLabel, RenameField } = window;
+const { CacheUsage: _ChromeCacheUsage } = window;
 const { groupTabs } = window.OMP_PROJECT_NAV;
 
 // Thin wrappers around the shared `OMP_KEYMAP.hintFor`/`hintKeyFor` — same
@@ -422,6 +423,7 @@ function AmbientRail({
         <div className="rail-card glass">
           <TokenGauge used={ctx.used} total={ctx.total} pct={ctx.pct}
             label={ctx.label} sub={`cost ${ctx.cost} · ${ctx.tokensPerSec} t/s`} />
+          <_ChromeCacheUsage report={ctx.cacheUsage} scope="last request" />
           <div className="rail-spark">
             <Sparkline values={sparkVals} width={210} height={28} />
             <div className="rail-spark-foot mono">
