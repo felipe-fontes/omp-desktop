@@ -82,14 +82,19 @@ function App() {
   // Cross-component highlight: hovering a minimap cell lights up the
   // matching chat bubble; clicking scrolls to it.
   const [hoveredMsgIdx, setHoveredMsgIdx] = React.useState(null);
+  const [scrollRequest, setScrollRequest] = React.useState(null);
   const handleMinimapClick = (idx) => {
-    const el = document.querySelector(`[data-msg-idx="${idx}"]`);
-    el?.scrollIntoView({ block: "center", behavior: "smooth" });
+    const message = messages[idx];
+    if (message?._id == null) return;
+    setScrollRequest(previous => ({ id: message._id, sessionId: activeSessionId, nonce: (previous?.nonce ?? 0) + 1 }));
   };
 
   // ── Live data (all per-session — driven by OMP_BRIDGE.onUpdate) ───────────
   const [messages,      setMessages]      = React.useState([]);
   const [streaming,     setStreaming]     = React.useState(false);
+  const [historyError, setHistoryError] = React.useState(null);
+  const [conversationBusy, setConversationBusy] = React.useState(false);
+  const [conversationMoving, setConversationMoving] = React.useState(false);
   const [model,         setModelState]    = React.useState(NULL_MODEL);
   const [thinkingLevel, setThinkingLevel] = React.useState(null);
   const [ctx,           setCtx]           = React.useState(data.ctx);
@@ -155,6 +160,7 @@ function App() {
   // ── Cross-cutting effects ─────────────────────────────────────────────────
   useBridgeSnapshot(bridge, {
     setMessages, setStreaming, setCtx, setKanban, setPlanMeta,
+    setHistoryError, setConversationBusy, setConversationMoving,
     setModels, setActivity, setSparkline,
     setModelState, setThinkingLevel,
     setSessions, setActiveSessionId, setProfiles, setStartupProfileId, setRecentProjects,
@@ -163,6 +169,7 @@ function App() {
   });
   useRemote({ bridge });
   useThemeEffect(t);
+  React.useEffect(() => { setHoveredMsgIdx(null); }, [activeSessionId]);
   React.useEffect(() => {
     bridge?.setPromptHistoryLimit(t.promptHistoryLimit ?? window.OMP_PROMPT_HISTORY.DEFAULT_LIMIT);
   }, [bridge, t.promptHistoryLimit]);
@@ -404,6 +411,7 @@ function App() {
 
   const subagentUi = useSubagentManager({
     bridge, layout: t.layout, setTweak, activeSessionId, subagents, messages, setHoveredMsgIdx,
+    onNavigateMessage: handleMinimapClick,
   });
   const subagentList = React.useMemo(() => window.OMP_SUBAGENTS.listAgents(subagents), [subagents]);
 
@@ -650,7 +658,8 @@ function App() {
   const convTree = useConversationTree({
     bridge, open: side === "tree", sessionId: activeProject.id, sessionFile: activeProject.sessionFile ?? null,
     profileId: activeProfileId, processStartedAt: activeProject.processStartedAt ?? null,
-    streaming, onBranchText: text => setPromptInsert({ text, nonce: Date.now() }),
+    streaming: conversationBusy || streaming,
+    onBranchText: (text, sessionId, images) => setPromptInsert({ text, sessionId, images, nonce: Date.now() }),
   });
 
   // `args`: text typed after a desktop command in the composer (composer.jsx
@@ -999,6 +1008,10 @@ function App() {
                     onGrantApproval={handleGrantApproval}
                     onStopRetry={handleStopRetry}
                     hoveredMsgIdx={hoveredMsgIdx}
+                    scrollRequest={scrollRequest?.sessionId === activeSessionId ? scrollRequest : null}
+                    conversationKey={`${activeSessionId}\0${activeProject.sessionFile ?? ""}`}
+                    conversationBusy={conversationBusy || streaming}
+                    onRewind={convTree.branch} onFork={convTree.fork}
                     hasProjectPath={!!activeProject?.path}
                     onInspectSubagent={subagentUi.open}
                     onOpenFile={handleOpenFile}
@@ -1039,6 +1052,7 @@ function App() {
                     onLoadThinkingLevels={() => bridge.thinkingLevels()}
                     onSetThinking={level => bridge.setThinkingLevel(level)}
                     isStreaming={streaming}
+                    conversationMoving={conversationMoving}
                     backgroundWork={activeProject.runState === "background"}
                     onAbort={handleAbort}
                     onApprove={handleApprovePlan}
@@ -1087,7 +1101,7 @@ function App() {
                 <ConversationTree
                   model={convTree.model} currentFile={convTree.currentFile} error={convTree.error}
                   loading={convTree.loading} treeKey={convTree.key} now={convTree.now} since={convTree.since}
-                  streaming={streaming}
+                  streaming={conversationBusy || streaming}
                   onRefresh={convTree.refresh} onClose={() => setSide("rail")}
                   onBranch={convTree.branch} onFork={convTree.fork} onOpenFile={convTree.openFile}
                 />
@@ -1107,6 +1121,8 @@ function App() {
                   hoveredMsgIdx={hoveredMsgIdx}
                   onMinimapHover={setHoveredMsgIdx}
                   onMinimapClick={handleMinimapClick}
+                  conversationKey={`${activeSessionId}\0${activeProject.sessionFile ?? ""}`}
+                  historyError={historyError} onRefreshHistory={() => bridge?.refreshConversationHistory()}
                   show={{ context: t.showContext ?? true, radar: t.showRadar ?? true, subagents: t.showSubagents ?? true, minimap: t.showMinimap ?? true }}
                 >
                   {widgets.fatal && <WidgetErrorCard title="widgets.json" error={widgets.fatal} />}

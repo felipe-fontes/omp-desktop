@@ -127,6 +127,23 @@
     return result && { ...draft, text: result.text, historyNav: result.index };
   }
 
+  /** A targeted insert can append a widget's text or replace a rewound
+   *  prompt. An explicit images field replaces attachments on a rewind;
+   *  ordinary text picks leave existing attachments alone. In-flight image
+   *  preparation counters stay owned by their original tab. */
+  function insertPromptDraft(draft, insert, attachments, limit, appendText) {
+    const append = insert.append === true;
+    const replaceImages = !append && Object.hasOwn(insert, "images");
+    const images = replaceImages ? attachments : attachments.length ? [...draft.attachments, ...attachments] : draft.attachments;
+    return { ...draft,
+      text: append ? appendText(draft.text, insert.text) : insert.text,
+      attachments: images.length > limit ? images.slice(0, limit) : images,
+      pastes: append ? draft.pastes : DRAFT_IDLE.pastes,
+      pasteCounter: append ? draft.pasteCounter : 0,
+      historyNav: null,
+    };
+  }
+
   // ── Collapsed pastes (#31) ───────────────────────────────────────────
   // A long paste goes into the textarea as a `[paste #N +K lines]` token;
   // its text waits in `draft.pastes[N]` until the send expands it.
@@ -244,6 +261,7 @@
     entryOf, updateEntry, pruneEntries, seedEntries,
     PLAN_IDLE, togglePlan, enterPlan, approvePlan, annotatePlan, markPlanSent,
     DRAFT_IDLE, recallInDraft,
+    insertPromptDraft,
     appendDictation,
     PASTE_LINES_MIN, PASTE_LINES_MAX,
     normalizePaste, shouldCollapsePaste, collapsePaste, pastesIn, expandPastes, inlinePaste,

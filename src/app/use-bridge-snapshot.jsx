@@ -14,6 +14,9 @@ function useBridgeSnapshot(bridge, setters) {
     const unsub = bridge.onUpdate((snap) => {
       setters.setMessages(snap.messages);
       setters.setStreaming(snap.isStreaming);
+      setters.setHistoryError(snap.historyError ?? null);
+      setters.setConversationBusy(snap.conversationBusy ?? snap.isStreaming);
+      setters.setConversationMoving(snap.conversationMoving ?? false);
       setters.setCtx(snap.ctx);
       setters.setKanban(snap.kanban);
       setters.setPlanMeta(snap.planMeta);

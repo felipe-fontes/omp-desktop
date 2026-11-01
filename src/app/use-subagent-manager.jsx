@@ -4,7 +4,7 @@
    layout choice. Owns: which agent is inspected, the list filter, the RPC
    subscription level that follows inspection, and jump-to-task-call. */
 
-function useSubagentManager({ bridge, layout, setTweak, activeSessionId, subagents, messages, setHoveredMsgIdx }) {
+function useSubagentManager({ bridge, layout, setTweak, activeSessionId, subagents, messages, setHoveredMsgIdx, onNavigateMessage }) {
   const paneOpen = layout === "split";
   const [selectedId, setSelectedId] = React.useState(null);
   const [filter, setFilter] = React.useState("all");
@@ -34,15 +34,13 @@ function useSubagentManager({ bridge, layout, setTweak, activeSessionId, subagen
   const closePane = () => { setTweak("layout", "rail"); setSelectedId(null); };
   const togglePane = () => (paneOpen ? closePane() : setTweak("layout", "split"));
 
-  // Scroll the chat to the task call that spawned an agent and flash it via
-  // the same highlight the minimap hover uses. A call already trimmed out of
-  // the live window (live.js MINIMAP_MAX) has nothing to scroll to.
+  // Use the chat's paged navigation for old task calls too.
   const flashRef = React.useRef(null);
   React.useEffect(() => () => clearTimeout(flashRef.current), []);
   const jumpToCall = callId => {
     const idx = messages.findIndex(m => m.kind === "tool" && m._toolCallId === callId);
     if (idx < 0) return;
-    document.querySelector(`[data-msg-idx="${idx}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" });
+    onNavigateMessage(idx);
     setHoveredMsgIdx(idx);
     clearTimeout(flashRef.current);
     flashRef.current = setTimeout(() => setHoveredMsgIdx(h => (h === idx ? null : h)), 1600);

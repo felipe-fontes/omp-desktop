@@ -9,6 +9,7 @@
 const { UserBubble: _CV_UserBubble, ToolCard: _CV_ToolCard, AssistantBubble: _CV_AssistantBubble, AskBubble: _CV_AskBubble, RetryRow: _CV_RetryRow, GoalRow: _CV_GoalRow, ApprovalRow: _CV_ApprovalRow, Icon: _CV_Icon, TOOL_META: _CV_TOOL_META } = window;
 const { nextPinned: _CV_nextPinned, shouldRepin: _CV_shouldRepin, afterOutput: _CV_afterOutput } = window.OMP_SCROLL_PIN;
 const { collapseStates: _CV_collapseStates, PREVIEW_LINES: _CV_PREVIEW_LINES } = window.OMP_COLLAPSE;
+const { pageRange: _CV_pageRange, anchorFor: _CV_anchorFor, adjacentPageAnchor: _CV_adjacentAnchor, lastUserIndex: _CV_lastUserIndex, PAGE_SIZE: _CV_PAGE_SIZE } = window.OMP_CONVERSATION_NAV;
 // Lines a collapsed block keeps in view, for chat.css; one object, so a
 // streaming frame does not diff a fresh style.
 const _CV_PAD_STYLE = { "--collapse-lines": _CV_PREVIEW_LINES };
@@ -22,7 +23,7 @@ const _CV_ToolCard_M        = React.memo(_CV_ToolCard);
 const _CV_AssistantBubble_M = React.memo(_CV_AssistantBubble);
 const _CV_AskBubble_M       = React.memo(_CV_AskBubble);
 
-const CompactRow = React.memo(function CompactRow({ msg }) {
+const CompactRow = React.memo(function CompactRow({ msg, idx, highlighted }) {
   const [open, setOpen] = React.useState(false);
   const pending  = msg.status === "pending";
   const error    = msg.status === "error";
@@ -35,7 +36,7 @@ const CompactRow = React.memo(function CompactRow({ msg }) {
   const hasBody  = !!msg.summary && !pending && !error;
 
   return (
-    <div className="row tool fade-up">
+    <div className={`row tool fade-up${highlighted ? " mm-hot" : ""}`} data-msg-idx={idx}>
       <div className="ass-rail">
         <div className="tool-glyph" style={{ borderColor: COLOR, color: COLOR }}>
           <_CV_Icon name={error ? "warn" : "context"} size={11} color={COLOR} />
@@ -54,7 +55,7 @@ const CompactRow = React.memo(function CompactRow({ msg }) {
           }}>compact</span>
           <span className="tool-title">
             {pending ? "compacting context\u2026"
-              : error   ? "compaction failed"
+              : error   ? (msg.shortSummary || "compaction failed")
               : (msg.shortSummary || "context compacted")}
           </span>
           <div className="tool-card-spacer" />
@@ -119,7 +120,7 @@ const JobRow = React.memo(function JobRow({ msg, idx, highlighted }) {
 // (app/chat-collapse.js). `followOutput` and `submitKey` are tweaks too: the
 // first lets new output move a view at the bottom, the second is the ask
 // editor's send chord.
-function ChatView({ messages, planMode, annotations, onAnnotate, hoveredMsgIdx, onAskAnswer, onAskDialogAnswer, onConfirmAsk, onCancelAsk, onGrantApproval, onStopRetry, hasProjectPath, onInspectSubagent, onOpenFile, onPreviewFile, projectRoot, foldModes, collapseAfter, collapseOverrides, onToggleCollapse, followOutput = true, submitKey = "enter" }) {
+function ChatView({ messages, planMode, annotations, onAnnotate, hoveredMsgIdx, scrollRequest, conversationKey, conversationBusy, onRewind, onFork, onAskAnswer, onAskDialogAnswer, onConfirmAsk, onCancelAsk, onGrantApproval, onStopRetry, hasProjectPath, onInspectSubagent, onOpenFile, onPreviewFile, projectRoot, foldModes, collapseAfter, collapseOverrides, onToggleCollapse, followOutput = true, submitKey = "enter" }) {
   const scrollRef   = React.useRef(null);
   const pinnedRef   = React.useRef(true);   // assume start pinned to bottom
   const prevTopRef  = React.useRef(0);
@@ -134,9 +135,14 @@ function ChatView({ messages, planMode, annotations, onAnnotate, hoveredMsgIdx, 
   // bottom. Newer blocks don't auto-collapse older ones meanwhile, so the
   // text being read doesn't fold away under the reader.
   const [collapseHorizon, setCollapseHorizon] = React.useState(null);
+  const [pageAnchor, setPageAnchor] = React.useState(null);
+  const [scrollTarget, setScrollTarget] = React.useState(null);
+  const page = _CV_pageRange(messages, pageAnchor);
+  const lastUser = _CV_lastUserIndex(messages);
 
   const setPinned = (val) => {
     pinnedRef.current = val;
+    if (!val && pageAnchor == null) setPageAnchor(messages[page.start]?._id ?? null);
     setShowJump(!val);
     setCollapseHorizon(val ? null : lastIdRef.current);
   };
@@ -153,17 +159,46 @@ function ChatView({ messages, planMode, annotations, onAnnotate, hoveredMsgIdx, 
   const onScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
+    if (page.end < messages.length) { prevTopRef.current = el.scrollTop; return; }
     const pinned = _CV_nextPinned(pinnedRef.current, prevTopRef.current, el);
     prevTopRef.current = el.scrollTop;
     if (pinned !== pinnedRef.current) setPinned(pinned);
+    if (pinned && pageAnchor != null) setPageAnchor(null);
   };
 
   const jumpToLatest = () => {
-    const el = scrollRef.current;
-    if (!el) return;
-    stickToBottom(el);
-    setPinned(true);
+    setPageAnchor(null);
+    setScrollTarget(previous => ({ latest: true, nonce: (previous?.nonce ?? 0) + 1 }));
   };
+  const scrollToMessage = id => {
+    if (id == null || !messages.some(message => message._id === id)) return;
+    setPinned(false);
+    setPageAnchor(_CV_anchorFor(messages, id));
+    setScrollTarget(previous => ({ id, nonce: (previous?.nonce ?? 0) + 1 }));
+  };
+  const showPage = direction => {
+    const id = _CV_adjacentAnchor(messages, page, direction);
+    if (id == null) return;
+    setPinned(false);
+    setPageAnchor(id);
+    setScrollTarget(previous => ({ id, block: "start", nonce: (previous?.nonce ?? 0) + 1 }));
+  };
+  React.useEffect(() => {
+    if (scrollRequest?.id != null) scrollToMessage(scrollRequest.id);
+  }, [scrollRequest]);
+  React.useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !scrollTarget) return;
+    if (scrollTarget.latest) {
+      stickToBottom(el);
+      setPinned(true);
+    } else {
+      const index = messages.findIndex(message => message._id === scrollTarget.id);
+      const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+      el.querySelector(`[data-msg-idx="${index}"]`)?.scrollIntoView({ block: scrollTarget.block ?? "center", behavior: reduced ? "instant" : "smooth" });
+      prevTopRef.current = el.scrollTop;
+    }
+  }, [scrollTarget]);
 
   // Auto-scroll only while pinned and following output. A new message
   // block (tool card, new assistant turn, …) during a run must NOT itself
@@ -182,6 +217,7 @@ function ChatView({ messages, planMode, annotations, onAnnotate, hoveredMsgIdx, 
     const repin = !renderedRef.current || _CV_shouldRepin(lastIdRef.current, messages);
     renderedRef.current = true;
     lastIdRef.current = messages[messages.length - 1]?._id ?? null;
+    if (repin) { setPageAnchor(null); setScrollTarget(null); }
     const next = _CV_afterOutput({ pinned: pinnedRef.current, follow: followRef.current, repin }, el);
     if (next.pinned !== pinnedRef.current) setPinned(next.pinned);
     if (next.stick) stickToBottom(el);
@@ -217,16 +253,20 @@ function ChatView({ messages, planMode, annotations, onAnnotate, hoveredMsgIdx, 
     <div className="chat-wrap">
       <div className="chat-scroll selectable" ref={scrollRef} onScroll={onScroll}>
         <div className="chat-pad" style={_CV_PAD_STYLE}>
-          {/* Note: after a trim, idx shifts for all surviving messages, causing a full
-             re-render of memo'd bubbles in that notify cycle (bounded at MINIMAP_MAX -
-             MINIMAP_COLS = 156). Streaming re-renders are unaffected. Driving annotable
-             and scroll-targeting off _id instead of idx would make trim zero-cost for
-             history, but requires a larger refactor. */}
-          {messages.map((m, i) => {
-            const hl = hoveredMsgIdx === i;
+          {messages.length > _CV_PAGE_SIZE && <div className="chat-history-page mono">
+            <button type="button" className="btn ghost" disabled={page.start === 0}
+              onClick={() => showPage(-1)}>Earlier messages</button>
+            <span>{page.start + 1}–{page.end} of {messages.length}</span>
+            <button type="button" className="btn ghost" disabled={page.end === messages.length}
+              onClick={() => showPage(1)}>Later messages</button>
+          </div>}
+          {messages.slice(page.start, page.end).map((m, offset) => {
+            const i = page.start + offset;
+            const hl = hoveredMsgIdx === i || scrollTarget?.id === m._id;
             if (window.OMP_TURN_STATUS.isHidden(m)) return null;
-            if (m.kind === "user")    return <_CV_UserBubble_M    key={m._id ?? i} idx={i} highlighted={hl} msg={m} />;
-            if (m.kind === "compact") return <CompactRow          key={m._id ?? i} msg={m} />;
+            if (m.kind === "user")    return <_CV_UserBubble_M    key={m._id ?? i} idx={i} highlighted={hl} msg={m}
+              conversationKey={conversationKey} conversationBusy={conversationBusy} onRewind={onRewind} onFork={onFork} />;
+            if (m.kind === "compact") return <CompactRow          key={m._id ?? i} idx={i} highlighted={hl} msg={m} />;
             if (m.kind === "job")     return <JobRow              key={m._id ?? i} idx={i} highlighted={hl} msg={m} />;
             if (m.kind === "retry")   return <_CV_RetryRow        key={m._id ?? i} idx={i} highlighted={hl} msg={m} onStop={onStopRetry} />;
             if (m.kind === "goal")    return <_CV_GoalRow         key={m._id ?? i} idx={i} highlighted={hl} msg={m} />;
@@ -235,20 +275,28 @@ function ChatView({ messages, planMode, annotations, onAnnotate, hoveredMsgIdx, 
               onOpenFile={onOpenFile} onPreviewFile={onPreviewFile} projectRoot={projectRoot} collapsed={collapsed[m._id]} onToggleCollapse={onToggleCollapse} />;
             if (m.kind === "ask")     return <_CV_AskBubble_M     key={m._id ?? i} idx={i} highlighted={hl} msg={m} onAnswer={onAskAnswer} onAnswerDialog={onAskDialogAnswer} onConfirm={onConfirmAsk} onCancelAsk={onCancelAsk} onGrant={onGrantApproval} hasProjectPath={hasProjectPath} submitKey={submitKey} />;
             return <_CV_AssistantBubble_M key={m._id ?? i} idx={i} highlighted={hl} msg={m}
+              conversationKey={conversationKey} conversationBusy={conversationBusy} onFork={onFork}
               annotable={i === lastAsstIdx}
               annotations={annotations}
               onAnnotate={onAnnotate}
               thoughtCollapsed={collapsed[m._id]} onToggleCollapse={onToggleCollapse} />;
           })}
+          {page.end < messages.length && <button type="button" className="btn outlined chat-history-more"
+            onClick={() => showPage(1)}>Show later messages</button>}
           <div style={{ height: 24 }} />
         </div>
       </div>
+      <div className="chat-jump-controls">
+        {lastUser !== -1 && <button type="button" className="chat-jump-user" onClick={() => scrollToMessage(messages[lastUser]._id)}>
+          <_CV_Icon name="arrowUp" size={12} /> Your last message
+        </button>}
       {showJump && (
         <button type="button" className="chat-jump-latest" onClick={jumpToLatest}>
           <_CV_Icon name="chev" size={12} />
           Jump to latest
         </button>
       )}
+      </div>
     </div>
   );
 }

@@ -9,7 +9,7 @@
    are real buttons, so every action is keyboard-reachable.
    ═════════════════════════════════════════════════════════════════════ */
 
-const { Icon, TabRunDot, TabLabel, RenameField } = window;
+const { Icon, TabRunDot, TabLabel, TabForkMark, RenameField } = window;
 const { groupTabs, groupRunState, groupTarget, membersNewestFirst, basename, parentName } = window.OMP_PROJECT_NAV;
 
 // Same guard as chrome.jsx's copy: the registry may not be loaded.
@@ -129,6 +129,7 @@ function ProjectSidebar({
                     <button className="psb-main" title={t.name} onClick={() => onSelectTab(t.id)}
                       onDoubleClick={() => startRename(t.id)}>
                       <span className="psb-name">{t.name}</span>
+                      <TabForkMark fork={t.fork} />
                       <TabRunDot state={t.runState} />
                     </button>
                   )}

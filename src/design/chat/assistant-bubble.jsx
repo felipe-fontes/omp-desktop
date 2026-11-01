@@ -2,7 +2,7 @@
    a failed request's failure) + InlinePlan (mini-plan rendered inline in the
    first plan reply). */
 
-const { Icon: _ChatIcon, MarkdownContent: _ChatMd, AnnotablePlan: _ChatAP, CopyButton: _ChatCopy, CollapseToggle: _ChatCollapse } = window;
+const { Icon: _ChatIcon, MarkdownContent: _ChatMd, AnnotablePlan: _ChatAP, CopyButton: _ChatCopy, CollapseToggle: _ChatCollapse, MessageActions: _ChatMessageActions } = window;
 
 function InlinePlan({ plan }) {
   return (
@@ -84,7 +84,7 @@ function _AB_Retries({ retries: r }) {
 
 // `thoughtCollapsed`: true/false when the thinking has a toggle, undefined
 // when it is too short to collapse (app/chat-collapse.js).
-function AssistantBubble({ msg, idx, highlighted, annotable, annotations, onAnnotate, thoughtCollapsed, onToggleCollapse }) {
+function AssistantBubble({ msg, idx, highlighted, annotable, annotations, onAnnotate, thoughtCollapsed, onToggleCollapse, onFork, conversationBusy, conversationKey }) {
   // A failed request has no text of its own; its copy is the provider's error.
   const copyText = msg.streaming ? "" : (_messageText(msg) || msg.failure?.raw || "");
   return (
@@ -140,6 +140,10 @@ function AssistantBubble({ msg, idx, highlighted, annotable, annotations, onAnno
           return null;
         })}
         {msg.failure && <_AB_Failure failure={msg.failure} />}
+        {msg.entryId && onFork && (
+          <_ChatMessageActions key={JSON.stringify([conversationKey, msg.entryId])}
+            entryId={msg.entryId} onFork={onFork} conversationBusy={conversationBusy || msg.streaming} />
+        )}
       </div>
     </div>
   );

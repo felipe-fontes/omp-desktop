@@ -477,21 +477,26 @@
   // Skips pure tool-result turns; maps thinking blocks to thought field.
   // `ts` is omp's message timestamp: the merge after a tab switch matches
   // live entries to these by it (app/transcript-merge.js).
-  function adaptAgentMessages(apiMessages) {
+  function adaptAgentMessages(apiMessages, { savedHistory = false } = {}) {
     const result = [];
     const messages = Array.isArray(apiMessages) ? apiMessages : [];
     const failures = window.OMP_TURN_STATUS.finalFailures(messages);
+    const toolResults = savedHistory
+      ? new Map(messages.filter(m => m?.role === "toolResult" && m.toolCallId).map(m => [m.toolCallId, m]))
+      : null;
     for (const [index, msg] of messages.entries()) {
       if (!msg || typeof msg !== "object") continue;
       const { role, content } = msg;
       const time   = _formatTime(msg.timestamp ?? msg.createdAt);
       const ts     = window.OMP_TRANSCRIPT.tsOf(msg);
       const blocks = Array.isArray(content) ? content : [{ type: "text", text: String(content ?? "") }];
+      const saved = typeof msg.entryId === "string" && msg.entryId ? { entryId: msg.entryId } : {};
 
       if (role === "user") {
         const { text, images } = adaptUserContent(blocks);
         if (!text && images.length === 0) continue;  // skip pure tool-result turns
-        result.push({ kind: "user", time, ts, text, images });
+        result.push({ kind: "user", time, ts, text, images, ...saved,
+          ...(msg.attribution === "agent" || msg.synthetic ? { agent: true } : {}) });
 
       } else if (role === "assistant") {
         let thought = null;
@@ -521,9 +526,27 @@
             blocks: designBlocks,
             streaming: false,
             tokens, tokensIn, tokensOut,
+            ...saved,
+            ...(msg.stopReason ? { stopReason: msg.stopReason } : {}),
             ...(failure ? { failure } : {}),
           });
         }
+        if (savedHistory) {
+          for (const block of blocks) {
+            if (block.type !== "toolCall" || !block.id) continue;
+            const { _startMs, ...card } = buildToolStartCard({ toolName: block.name, toolCallId: block.id, args: block.arguments }, time);
+            const recorded = toolResults.get(block.id);
+            result.push({ ...card, status: recorded ? "recorded" : "unknown",
+              historyOmittedOutput: true, ...(recorded ? { isError: recorded.isError === true } : {}) });
+          }
+        }
+      } else if (role === "compactionSummary" && savedHistory) {
+        // RPC context summaries precede the retained tail; only the journal
+        // supplies a boundary at its actual position in the conversation.
+        result.push({ kind: "compact", status: "done", time, ...saved,
+          summary: typeof msg.summary === "string" ? msg.summary : "",
+          shortSummary: msg.shortSummary || null, tokensBefore: msg.tokensBefore ?? null,
+          firstKeptEntryId: msg.firstKeptEntryId ?? null });
       }
     }
     return result;

@@ -109,52 +109,55 @@
 .legend-item { display: inline-flex; align-items: center; gap: 4px; }
 .legend-item span:first-child { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
 
-/* ── Minimap (dense token-heatmap grid) ───────────────────────────── */
-.minimap { display: flex; flex-direction: column; gap: 6px; min-height: 0; }
-.minimap-head { display: flex; align-items: center; gap: 6px; font-size: var(--d-text-xs); }
-
+/* ── Entire-conversation minimap ───────────────────────────────────── */
+.minimap { display: flex; flex: 1; flex-direction: column; gap: 8px; min-height: 0; }
+.minimap-head { display: flex; align-items: center; gap: 6px; font-size: var(--d-text-xs); color: var(--fg-4); }
+.minimap-count { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--fg-3); }
+.minimap-error { display: flex; align-items: center; gap: 6px; color: var(--amber); font-size: var(--d-text-xs); }
+.minimap-error .btn { padding: 2px 6px; margin-left: auto; }
 .minimap-grid {
-  display: grid;
-  grid-template-columns: repeat(13, 1fr);
-  gap: 2px;
-  flex: 1; min-height: 0; overflow-y: auto;
-  padding: 6px; border-radius: 6px;
-  background: var(--bg-input);
-  border: 1px solid var(--line);
+  display: grid; grid-template-columns: repeat(13, minmax(0, 1fr)); align-content: start;
+  gap: 4px; flex: 1; min-height: 0; overflow-y: auto;
+  padding: 8px; border-radius: 6px; background: var(--bg-input); border: 1px solid var(--line);
+  scrollbar-width: thin;
 }
 .minimap-cell {
-  aspect-ratio: 1 / 1;
-  border-radius: 2px;
-  cursor: pointer;
-  transition: transform 80ms ease, outline-color 80ms ease;
-  outline: 1px solid transparent;
-  position: relative;
+  appearance: none; padding: 0; border: 1px solid transparent; aspect-ratio: 1;
+  border-radius: 2px; min-width: 0; background: var(--mm-color); opacity: 0.45;
+  cursor: pointer; position: relative; outline: 1px solid transparent;
+  transition: transform 80ms ease, outline-color 80ms ease, opacity 80ms ease;
 }
-.minimap-cell:hover,
-.minimap-cell.hot {
-  transform: scale(1.6);
-  outline-color: var(--fg-2);
-  z-index: 2;
-  opacity: 1 !important;
+.minimap-cell.answer {
+  opacity: 1; border-color: color-mix(in oklab, var(--accent) 45%, var(--fg));
+  box-shadow: 0 0 5px color-mix(in oklab, var(--accent) 45%, transparent);
 }
-.minimap-cell.live {
-  animation: pulseDot 1.8s ease-in-out infinite;
+.minimap-cell.user { background: var(--fg-3); opacity: 0.65; }
+.minimap-cell.reasoning, .minimap-cell.update {
+  background: transparent; border-color: var(--fg-4); opacity: 0.55; border-radius: 50%;
 }
-
-.minimap-legend {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px 10px;
-  font-size: 10px;
-  color: var(--fg-4);
+.minimap-cell.failure, .minimap-cell.ask { opacity: 0.9; }
+.minimap-cell:hover, .minimap-cell.hot, .minimap-cell:focus-visible {
+  transform: scale(1.25); outline-color: var(--fg); z-index: 2; opacity: 1;
 }
+.minimap-cell.compact {
+  grid-column: 1 / -1; aspect-ratio: auto; min-height: 22px; margin: 3px 0;
+  display: flex; align-items: center; justify-content: center; gap: 5px;
+  background: color-mix(in oklab, var(--mm-color) 9%, transparent); color: var(--mm-color);
+  border: 0; border-block: 1px solid color-mix(in oklab, var(--mm-color) 55%, transparent);
+  border-radius: 0; opacity: 1; font: 9px var(--font-mono);
+}
+.minimap-cell.compact:hover, .minimap-cell.compact.hot, .minimap-cell.compact:focus-visible { transform: none; }
+.minimap-cell.live { animation: pulseDot 1.8s ease-in-out infinite; }
+.minimap-legend { display: flex; flex-wrap: wrap; gap: 6px 10px; font-size: 10px; color: var(--fg-3); }
 .minimap-legend-item { display: inline-flex; align-items: center; gap: 4px; }
-.minimap-legend-item i {
-  display: inline-block;
-  width: 6px;
-  height: 6px;
-  border-radius: 2px;
-  flex: none;
+.minimap-legend-item i { width: 7px; height: 7px; border-radius: 2px; flex: none; }
+.minimap-legend-item .answer { background: var(--accent); box-shadow: 0 0 4px var(--accent-glow); }
+.minimap-legend-item .reasoning { border: 1px solid var(--fg-4); border-radius: 50%; }
+.minimap-legend-item .user { background: var(--fg-3); }
+.minimap-legend-item .compact { width: 11px; height: 3px; border-block: 1px solid var(--lilac); border-radius: 0; }
+@media (prefers-reduced-motion: reduce) {
+  .minimap-cell { transition: none; }
+  .minimap-cell.live { animation: none; }
 }
 
 /* Reverse highlight: hovering a minimap cell lights up the chat bubble. */

@@ -322,6 +322,19 @@ async fn conversation_tree(
     off_ipc(move || conversation_tree::load(&app, &session_file, profile.as_deref())).await?
 }
 
+/// Read the active saved parent chain, including pre-compaction messages.
+#[tauri::command]
+async fn conversation_history(
+    session_file: String,
+    profile: Option<String>,
+    store: State<'_, Arc<profiles::ProfileStore>>,
+    app: tauri::AppHandle,
+) -> Result<conversation_tree::ConversationHistory, String> {
+    let profile = store.resolve_owned(profile)?;
+    off_ipc(move || conversation_tree::load_history(&app, &session_file, profile.as_deref()))
+        .await?
+}
+
 /// Kill the omp process for a tab session. Also drops its session-scoped
 /// approval-rule grants (see `approval::RuleBook::clear_session`) and its
 /// widget runs.
@@ -1522,6 +1535,7 @@ pub fn run() {
             open_url_external,
             list_saved_sessions,
             conversation_tree,
+            conversation_history,
             approval_rules_list,
             approval_approve_and_grant,
             approval_rules_revoke,
