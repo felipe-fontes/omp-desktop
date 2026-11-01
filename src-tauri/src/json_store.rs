@@ -87,6 +87,14 @@ fn temp_path_for(path: &Path) -> PathBuf {
 /// failure path; the original error is always returned, never masked by a
 /// cleanup failure.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic_with_modified(path, bytes, None)
+}
+
+fn write_atomic_with_modified(
+    path: &Path,
+    bytes: &[u8],
+    modified: Option<SystemTime>,
+) -> io::Result<()> {
     let dir = path
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
@@ -100,6 +108,9 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let temp_path = temp_path_for(path);
     let write_result = File::create(&temp_path).and_then(|mut file| {
         file.write_all(bytes)?;
+        if let Some(modified) = modified {
+            file.set_modified(modified)?;
+        }
         file.sync_all()
     });
 
@@ -232,8 +243,7 @@ pub fn hex_lower(bytes: &[u8]) -> String {
 // ── snapshot ring ────────────────────────────────────────────────────────────
 
 /// One snapshot's on-disk identity: content-hash id and last-modified time.
-/// Used to order candidates newest-first (`restore_latest`) and to pick
-/// prune victims oldest-first (`prune`).
+/// Used to order recovery candidates newest-first and prune oldest entries.
 struct SnapshotEntry {
     id: String,
     modified: SystemTime,
@@ -244,10 +254,10 @@ struct SnapshotEntry {
 /// `retain` (oldest first, by file modified time) are pruned so the ring
 /// never grows without bound.
 ///
-/// Ordering comes from each snapshot file's own mtime, so no metadata
-/// sidecar is written: a `<id>.meta.json` companion used to be, but
-/// nothing ever read it back. [`Self::prune`] still deletes any such file
-/// left over from an older version of this module.
+/// Ordering remains in each file's mtime, without a metadata sidecar.
+/// Snapshot writes advance it before atomic publication, so coarse clocks
+/// or a wall-clock rollback cannot make an older successful write win.
+/// Pruning also removes legacy `<id>.meta.json` companions.
 pub struct SnapshotRing {
     dir: PathBuf,
     retain: usize,
@@ -269,29 +279,48 @@ impl SnapshotRing {
         self.dir.join(format!("{id}.json"))
     }
 
-    /// Legacy metadata sidecar path. Nothing writes one any more; [`prune`]
-    /// still removes any left behind by an older version of this module.
-    ///
-    /// [`prune`]: SnapshotRing::prune
+    /// Legacy metadata sidecar path, removed along with a pruned snapshot.
     fn legacy_meta_path(&self, id: &str) -> PathBuf {
         self.dir.join(format!("{id}.meta.json"))
     }
 
-    /// Write `bytes` as a new snapshot, returning its content-hash id. If a
-    /// snapshot with identical content already exists, this overwrites its
-    /// file (an atomic no-op content-wise) and refreshes its mtime, so an
-    /// unchanged file re-saved repeatedly doesn't create duplicate ring
-    /// entries. Prunes snapshots beyond `retain` afterward, oldest (by
-    /// mtime) first.
+    /// Write `bytes` as a snapshot, returning its content-hash id. Identical
+    /// content reuses its file, with a new position in the write order.
+    /// Its mtime advances by at least two seconds beyond the previous head
+    /// (representable even on coarse filesystems) before atomic publication.
+    /// Pruning is best-effort and retains the newest `retain` distinct values.
     ///
     /// # Errors
     /// Returns an error if `dir` can't be created or if writing the
     /// snapshot fails.
     pub fn snapshot(&self, bytes: &[u8]) -> io::Result<String> {
         fs::create_dir_all(&self.dir)?;
+        let entries = self.list_entries()?;
+        let now = SystemTime::now();
+        let modified = if let Some(latest) = entries.first() {
+            let next = latest
+                .modified
+                .checked_add(Duration::from_secs(2))
+                .ok_or_else(|| io::Error::other("snapshot write order exceeds timestamp range"))?;
+            now.max(next)
+        } else {
+            now
+        };
         let id = hex_sha256(bytes);
-        write_atomic(&self.snapshot_path(&id), bytes)?;
-        self.prune()?;
+        write_atomic_with_modified(&self.snapshot_path(&id), bytes, Some(modified))?;
+
+        // The current value is newest even when its hash already existed.
+        // Reuse the pre-write listing rather than scanning the directory twice.
+        let ordered = std::iter::once(id.as_str()).chain(
+            entries
+                .iter()
+                .filter(|entry| entry.id != id)
+                .map(|entry| entry.id.as_str()),
+        );
+        for stale in ordered.skip(self.retain) {
+            let _ = fs::remove_file(self.snapshot_path(stale));
+            let _ = fs::remove_file(self.legacy_meta_path(stale));
+        }
         Ok(id)
     }
 
@@ -327,18 +356,6 @@ impl SnapshotRing {
         }
         entries.sort_by_key(|e| std::cmp::Reverse(e.modified));
         Ok(entries)
-    }
-
-    /// Remove snapshots beyond `retain`, oldest first — along with any
-    /// legacy `<id>.meta.json` sidecar an older version of this module
-    /// wrote next to them. Best-effort: a removal failure for one stale
-    /// entry doesn't abort pruning the rest.
-    fn prune(&self) -> io::Result<()> {
-        for stale in self.list_entries()?.iter().skip(self.retain) {
-            let _ = fs::remove_file(self.snapshot_path(&stale.id));
-            let _ = fs::remove_file(self.legacy_meta_path(&stale.id));
-        }
-        Ok(())
     }
 
     /// Read the most recent valid snapshot's bytes. A snapshot whose
@@ -825,6 +842,32 @@ mod tests {
         assert_eq!(restored, Some(b"new".to_vec()));
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn snapshot_recency_survives_clock_rollback() {
+        let dir = unique_test_dir("ring_clock");
+        let ring = SnapshotRing::new(dir.join("snapshots"), 1);
+        let old = ring.snapshot(b"old").expect("snapshot old");
+        OpenOptions::new()
+            .write(true)
+            .open(ring.snapshot_path(&old))
+            .expect("open old snapshot")
+            .set_modified(SystemTime::now() + Duration::from_secs(60))
+            .expect("simulate a clock rollback after the old write");
+
+        ring.snapshot(b"new").expect("snapshot new");
+        assert_eq!(
+            ring.restore_latest().expect("restore latest").as_deref(),
+            Some(b"new".as_slice()),
+            "the latest successful write must survive recovery and pruning"
+        );
+        assert_eq!(
+            ring.restore(&old).expect_err("old snapshot pruned").kind(),
+            ErrorKind::NotFound
+        );
+
+        fs::remove_dir_all(dir).expect("remove scratch directory");
     }
 
     #[test]

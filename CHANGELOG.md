@@ -41,6 +41,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Snapshot recovery keeps the latest saved profile and approval rules when writes share a filesystem timestamp tick or the clock moves backwards. A newer restore point is no longer discarded as older.
 - Automatic conversation naming rechecks native state when a session settles. A busy snapshot at turn end no longer leaves the completed chat labeled **New conversation** until another prompt or tab switch.
 - Windows workspace recovery creates its private storage with the current user's explicit ownership, including elevated launches, instead of inheriting an Administrators-owned root that recovery must reject.
 - Opening a conversation no longer creates an opaque `omp/conversation-<GUID>` branch. Named branches require an entered task, a fresh **Create branch** opt-in and an explicit semantic name; missing or conflicting names never fall back to a GUID. Tasks remain unsent composer drafts, including when a widget inserts text during the same open. Recovery stays detached when the saved checkout was detached or its original branch cannot be safely reused; it never creates an opaque fallback branch.
