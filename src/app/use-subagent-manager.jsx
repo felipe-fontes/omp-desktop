@@ -31,8 +31,11 @@ function useSubagentManager({ bridge, layout, setTweak, activeSessionId, subagen
     setTweak("layout", "split");
     setSelectedId(id != null && window.OMP_SUBAGENTS.getAgent(subagentsRef.current, id) ? id : null);
   }, [setTweak]);
-  const closePane = () => { setTweak("layout", "rail"); setSelectedId(null); };
-  const togglePane = () => (paneOpen ? closePane() : setTweak("layout", "split"));
+  const togglePane = () => {
+    if (!paneOpen) return setTweak("layout", "split");
+    setTweak("layout", "rail");
+    setSelectedId(null);
+  };
 
   // Use the chat's paged navigation for old task calls too.
   const flashRef = React.useRef(null);
@@ -49,7 +52,7 @@ function useSubagentManager({ bridge, layout, setTweak, activeSessionId, subagen
   return {
     paneOpen, selected, select: setSelectedId, filter, setFilter,
     level: window.OMP_SUBAGENTS.subscriptionLevelFor({ inspecting }),
-    open, closePane, togglePane, jumpToCall,
+    open, togglePane, jumpToCall,
   };
 }
 

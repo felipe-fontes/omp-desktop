@@ -24,7 +24,7 @@ function harness() {
   const ctx = vm.createContext({ console: { log() {}, warn() {}, error() {} }, setTimeout: timeout, clearTimeout, queueMicrotask, TextEncoder });
   ctx.window = ctx;
   ctx.timeNow = () => "00:00";
-  for (const file of ["constants", "slash-commands", "subagents", "session-title", "session-prefs", "message-queue", "ask-dialog", "approval", "approval-mode", "turn-status", "goal", "extension-widgets", "live-voice", "transcript-merge", "prompt-history", "project-nav", "live-context"]) {
+  for (const file of ["constants", "slash-commands", "subagents", "background-tasks", "agent-context", "agent-context-sync", "cache-usage", "stream-delta", "session-title", "session-prefs", "message-queue", "ask-dialog", "approval", "approval-mode", "turn-status", "goal", "extension-widgets", "live-voice", "transcript-merge", "prompt-history", "project-nav", "live-context"]) {
     vm.runInContext(source(`app/${file}.js`), ctx, { filename: file });
   }
   vm.runInContext(source("design/tweaks/use-tweaks.js"), ctx, { filename: "use-tweaks.js" });
@@ -54,7 +54,7 @@ function harness() {
         if (args.sessionFile) scratchRow.sessionFile = args.sessionFile;
         return true;
       }
-      if (name === "start_session") return "write";
+      if (name === "start_session") return { approvalMode: "write", path: args.args.cwd, workspace: null };
       if (name === "replay_events") return { dropped: false, events: (journal.get(args.sessionId) ?? []).filter(e => e.seq > args.afterSeq) };
       if (name === "conversation_history") return readHistory(args.sessionFile);
       if (name === "send_command") {
@@ -70,7 +70,15 @@ function harness() {
       return () => { if (listeners.get(name) === callback) listeners.delete(name); };
     } },
   };
-  return { ctx, bridge: ctx.OMP_BRIDGE, emit, reply, commands, histories,
+  const bridge = {
+    ...ctx.OMP_BRIDGE,
+    async openSession(cwd) {
+      const opened = ctx.OMP_BRIDGE.openSession(cwd);
+      await ctx.OMP_BRIDGE.startConversationSetup(snapshot.conversationSetup.id, null);
+      return opened;
+    },
+  };
+  return { ctx, bridge, emit, reply, commands, histories,
     setMoveState: value => { moveState = value; },
     readHistory: fn => { readHistory = fn; }, snapshot: () => snapshot };
 }
@@ -238,6 +246,23 @@ await check("a successful rewind retains its draft's owning tab and selected ima
   assert.equal(result.text, "re-ask this");
   assert.equal(result.images[0].data, "saved-image");
   assert.equal(h.snapshot().messages.length, 0, "the old transcript cannot leak into the new file before reload");
+});
+
+await check("late saved history cannot replace the latest request's cache usage", async () => {
+  const h = harness();
+  const id = await h.bridge.openSession("/tmp/navigation-cache");
+  const earlier = { ...answer("earlier", 1, "a1"), provider: "local", model: "earlier", usage: { input: 10, output: 1, cacheRead: 90, cacheWrite: 0 } };
+  h.emit(id, { type: "response", command: "get_messages", success: true, data: { messages: [earlier] } });
+  let release;
+  h.readHistory(() => new Promise(resolve => { release = resolve; }));
+  h.emit(id, { type: "response", command: "get_state", success: true, data: { sessionFile: "/sessions/cache.jsonl", messageCount: 1 } });
+  await tick();
+  const latest = { ...answer("latest", 2, "a2"), provider: "local", model: "latest", usage: { input: 20, output: 2, cacheRead: 180, cacheWrite: 0 } };
+  h.emit(id, { type: "message_end", message: latest });
+  release({ messages: [earlier], fork: null });
+  await tick();
+  assert.equal(h.snapshot().ctx.cacheUsage.model, "latest");
+  assert.equal(h.snapshot().ctx.cacheUsage.usage.cacheRead, 180);
 });
 
 await check("saved tool status is honest and cannot overwrite a complete live result", () => {

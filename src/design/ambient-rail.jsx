@@ -4,8 +4,6 @@ function AmbientRail({
   ctx,
   activity,
   messages,
-  onClose,
-  sparklineValues,
   hoveredMsgIdx,
   onMinimapHover,
   onMinimapClick,
@@ -16,7 +14,6 @@ function AmbientRail({
   subagentPaneOpen,
   onOpenSubagent,
   onToggleSubagentPane,
-  onOpenTree,
   items,
   tweaks,
   onChange,
@@ -117,24 +114,6 @@ function AmbientRail({
             onClick={() => setControlsOpen((open) => !open)}
           >
             <Icon name="cog" size={12} />
-          </button>
-          <button
-            type="button"
-            className="btn icon ghost"
-            onClick={onOpenTree}
-            aria-label="Conversation tree"
-            title="conversation tree (prompt-cache status)"
-          >
-            <Icon name="branch" size={10} />
-          </button>
-          <button
-            type="button"
-            className="btn icon ghost"
-            onClick={onClose}
-            aria-label="Hide ambient rail"
-            title="hide rail"
-          >
-            <Icon name="close" size={10} />
           </button>
         </span>
       </div>

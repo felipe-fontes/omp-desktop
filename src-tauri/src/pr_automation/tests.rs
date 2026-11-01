@@ -1,3 +1,5 @@
+use super::feedback::{parse_check, SelectedPr};
+use super::git::github_repo;
 use super::*;
 use serde_json::{json, Value};
 
@@ -11,35 +13,84 @@ fn local() -> LocalBranch {
     }
 }
 
+/// `FIND_QUERY`'s answer for alice/project (not a fork) whose upstream head
+/// `abc` is associated with `prs`.
 fn find(prs: Vec<Value>, truncated: bool) -> Value {
     json!({"data":{"repository":{
-        "isFork":false, "nameWithOwner":"alice/project", "parent":null,
-        "pullRequests":{"pageInfo":{"hasNextPage":false},"nodes":[]},
-        "ref":{"target":{"oid":"abc"}},
-        "object":{"oid":"abc","associatedPullRequests":{"pageInfo":{"hasNextPage":truncated},"nodes":prs}}
+        "nameWithOwner":"alice/project", "isFork":false, "parent":null,
+        "ref":{"target":{"oid":"abc","associatedPullRequests":{"pageInfo":{"hasNextPage":truncated},"nodes":prs}}}
     }}})
 }
-fn pr(id: &str, owner: &str) -> Value {
-    json!({"id":id,"state":"OPEN","headRefOid":"abc","headRefName":"topic","headRepository":{"nameWithOwner":owner},"repository":{"nameWithOwner":"alice/project"}})
+/// [`find`] for alice/project as a fork of upstream/project.
+fn fork(prs: Vec<Value>) -> Value {
+    let mut result = find(prs, false);
+    result["data"]["repository"]["isFork"] = json!(true);
+    result["data"]["repository"]["parent"] = json!({"nameWithOwner":"upstream/project"});
+    result
 }
-fn selected(state: PrState) -> discovery::SelectedPr {
-    discovery::SelectedPr {
-        id: "detail".into(),
-        state,
-        repository: "upstream/project".into(),
+/// An open PR #`n` on `topic` at `abc` from `owner`, as GraphQL lists it.
+fn pr(n: u32, owner: &str) -> Value {
+    json!({"url":format!("https://github.com/upstream/project/pull/{n}"),"id":format!("PR_{n}"),"state":"OPEN","headRefOid":"abc","headRefName":"topic","headRepository":{"nameWithOwner":owner}})
+}
+/// The same PR as the REST list returns it, with a differently shaped id.
+fn rest_pr(n: u32, owner: &str) -> Value {
+    json!({"html_url":format!("https://github.com/upstream/project/pull/{n}"),"node_id":format!("PR_rest_{n}"),"state":"open","head":{"ref":"topic","sha":"abc","repo":{"full_name":owner}}})
+}
+/// The REST stand-in: the open PRs listed for alice/project and for
+/// upstream/project, each answered at most once, always for alice's branch.
+fn pulls(
+    repository: Vec<Value>,
+    parent: Vec<Value>,
+) -> impl FnMut(&str, &str) -> Result<Value, String> {
+    let mut lists = [
+        ("alice/project", Some(Value::Array(repository))),
+        ("upstream/project", Some(Value::Array(parent))),
+    ];
+    move |name, head| {
+        assert_eq!(head, "alice:topic");
+        let (_, list) = lists
+            .iter_mut()
+            .find(|(listed, _)| *listed == name)
+            .unwrap_or_else(|| panic!("unexpected repository {name}"));
+        Ok(list.take().expect("each repository is listed once"))
     }
+}
+fn none() -> impl FnMut(&str, &str) -> Result<Value, String> {
+    pulls(vec![], vec![])
+}
+/// What `select_pr` returns for PR id `id` from alice/project.
+fn chosen(id: &str) -> SelectedPr {
+    SelectedPr {
+        id: id.into(),
+        repository: "alice/project".into(),
+    }
+}
+/// The PR `feedback` describes.
+fn selected() -> SelectedPr {
+    chosen("PR_12")
 }
 fn feedback(contexts: Vec<Value>, threads: Vec<Value>) -> Value {
     json!({"data":{
-        "node":{"id":"detail","number":12,"url":"https://github.com/upstream/project/pull/12","title":"Improve project","repository":{"nameWithOwner":"upstream/project"},"additions":42,"deletions":3,"isDraft":true,"state":"OPEN","headRefOid":"abc","headRefName":"topic","headRepository":{"nameWithOwner":"alice/project"},"reviewThreads":{"pageInfo":{"hasNextPage":false},"nodes":threads},
-            "commits":{"nodes":[{"commit":{"oid":"abc","statusCheckRollup":{"state":"SUCCESS","contexts":{"pageInfo":{"hasNextPage":false},"nodes":contexts}}}}]}}
+        "node":{"number":12,"url":"https://github.com/upstream/project/pull/12","title":"Improve project","repository":{"nameWithOwner":"upstream/project"},"additions":42,"deletions":3,"isDraft":true,"state":"OPEN","headRefOid":"abc","headRefName":"topic","headRepository":{"nameWithOwner":"alice/project"},"reviewThreads":{"pageInfo":{"hasNextPage":false},"nodes":threads},
+            "commits":{"nodes":[{"commit":{"oid":"abc","statusCheckRollup":{"contexts":{"pageInfo":{"hasNextPage":false},"nodes":contexts}}}}]}}
     }})
 }
 fn check(id: &str, status: &str, conclusion: Value, started: &str) -> Value {
-    json!({"__typename":"CheckRun","id":id,"name":"test","status":status,"conclusion":conclusion,"detailsUrl":null,"startedAt":started,"completedAt":"2026-01-02T00:00:00Z"})
+    json!({"__typename":"CheckRun","id":id,"name":id,"status":status,"conclusion":conclusion,"detailsUrl":null,"startedAt":started,"completedAt":"2026-01-02T00:00:00Z"})
 }
 fn thread(id: &str, resolved: bool, outdated: bool) -> Value {
-    json!({"id":id,"isResolved":resolved,"isOutdated":outdated,"comments":{"nodes":[{"updatedAt":"2026-01-02T00:00:00Z","url":"https://github.com/u/r/pull/1#discussion_r1"}]}})
+    commented(id, resolved, outdated, &[("2026-01-02T00:00:00Z", false)])
+}
+/// A thread with `comments` (`updatedAt`, `viewerDidAuthor`), oldest first.
+fn commented(id: &str, resolved: bool, outdated: bool, comments: &[(&str, bool)]) -> Value {
+    let nodes: Vec<_> = comments
+        .iter()
+        .map(|(updated, viewer)| json!({"updatedAt":updated,"viewerDidAuthor":viewer}))
+        .collect();
+    json!({"id":id,"isResolved":resolved,"isOutdated":outdated,"comments":{"pageInfo":{"hasPreviousPage":false},"nodes":nodes}})
+}
+fn message<T: std::fmt::Debug>(result: Result<T, LookupError>) -> String {
+    result.unwrap_err().message
 }
 
 #[test]
@@ -68,102 +119,197 @@ fn parses_only_github_com_ssh_or_https_repository_urls() {
 }
 
 #[test]
+fn reads_the_upstream_branch_and_its_github_repository() {
+    let Some(repo) = crate::git_browser::fixture::init("pr-automation-local") else {
+        return;
+    };
+    let head = repo.commit("initial", 1_700_000_000);
+    let err = local_branch(repo.path()).unwrap_err();
+    assert!(err.contains("upstream"), "{err}");
+    repo.git(&[
+        "remote",
+        "add",
+        "origin",
+        "git@github.com:alice/project.git",
+    ]);
+    repo.git(&["config", "branch.main.remote", "origin"]);
+    repo.git(&["config", "branch.main.merge", "refs/heads/topic"]);
+    assert_eq!(
+        local_branch(repo.path()).unwrap(),
+        LocalBranch {
+            branch: "main".into(),
+            head,
+            owner: "alice".into(),
+            repo: "project".into(),
+            remote_ref: "refs/heads/topic".into(),
+        }
+    );
+    repo.git(&[
+        "remote",
+        "set-url",
+        "origin",
+        "https://gitlab.com/alice/project.git",
+    ]);
+    let err = local_branch(repo.path()).unwrap_err();
+    assert!(err.contains("GitHub.com"), "{err}");
+    repo.git(&["checkout", "-q", "--detach"]);
+    let err = local_branch(repo.path()).unwrap_err();
+    assert!(err.contains("detached"), "{err}");
+}
+
+#[test]
 fn selects_only_the_upstream_repository_and_branch_and_rejects_ambiguity() {
-    let mut wrong_branch = pr("wrong", "alice/project");
+    let mut wrong_branch = pr(1, "alice/project");
     wrong_branch["headRefName"] = json!("other");
-    let mut old = pr("old", "alice/project");
+    let mut old = pr(2, "alice/project");
     old["state"] = json!("MERGED");
     let result = find(
         vec![
-            pr("foreign", "bob/project"),
+            pr(3, "bob/project"),
             wrong_branch,
             old,
-            pr("match", "ALICE/project"),
+            pr(4, "ALICE/project"),
         ],
         false,
     );
-    let found = select_pr(&result, &local()).unwrap().unwrap();
-    assert_eq!(found.id, "match");
-    assert_eq!(found.state, PrState::Open);
-    assert!(
-        select_pr(&find(vec![pr("foreign", "bob/project")], false), &local())
-            .unwrap()
-            .is_none()
+    assert_eq!(
+        select_pr(&result, &local(), none()).unwrap(),
+        Some(chosen("PR_4"))
     );
-    assert!(select_pr(
-        &find(
-            vec![pr("a", "alice/project"), pr("b", "alice/project")],
-            false
-        ),
-        &local()
-    )
-    .is_err());
-    assert!(select_pr(&find(vec![], true), &local())
-        .unwrap_err()
-        .contains("limit"));
-    assert!(select_pr(&json!({"data":{"repository":null}}), &local()).is_err());
+    assert_eq!(
+        select_pr(&find(vec![pr(3, "bob/project")], false), &local(), none()).unwrap(),
+        None
+    );
+    let two = find(vec![pr(1, "alice/project"), pr(2, "alice/project")], false);
+    assert!(message(select_pr(&two, &local(), none())).contains("Multiple"));
+    assert!(message(select_pr(&find(vec![], true), &local(), none())).contains("limit"));
+    assert!(select_pr(&json!({"data":{"repository":null}}), &local(), none()).is_err());
+    let mut unsafe_name = find(vec![], false);
+    unsafe_name["data"]["repository"]["nameWithOwner"] = json!("../project");
+    assert!(message(select_pr(&unsafe_name, &local(), none())).contains("repository name"));
+}
+
+/// GitHub follows renames: a remote still on the old URL resolves to the
+/// new name, which PR head repositories carry.
+#[test]
+fn renamed_repository_is_matched_by_its_resolved_name() {
+    let mut result = find(vec![pr(1, "alice/renamed")], false);
+    result["data"]["repository"]["nameWithOwner"] = json!("alice/renamed");
+    let mut listed = Vec::new();
+    let selection = select_pr(&result, &local(), |name, head| {
+        listed.push(format!("{name} {head}"));
+        Ok(json!([]))
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(listed, ["alice/renamed alice:topic"]);
+    assert_eq!(selection.id, "PR_1");
+    assert_eq!(selection.repository, "alice/renamed");
+    let mut result = feedback(vec![], vec![]);
+    result["data"]["node"]["headRepository"]["nameWithOwner"] = json!("Alice/Renamed");
+    assert!(parse_feedback(&result, &local(), &selection).is_ok());
+    // Still the old name: not the PR that was selected.
+    let result = feedback(vec![], vec![]);
+    assert!(message(parse_feedback(&result, &local(), &selection)).contains("changed"));
+}
+
+#[test]
+fn rest_lists_skip_other_forks_and_deduplicate_by_url() {
+    let mut deleted = rest_pr(5, "alice/project");
+    deleted["head"]["repo"] = Value::Null;
+    let listed = vec![
+        rest_pr(1, "alice/project"),
+        rest_pr(2, "bob/project"),
+        deleted,
+    ];
+    // The associated PR and the listed one are the same PR, by URL.
+    let result = find(vec![pr(1, "alice/project")], false);
+    assert_eq!(
+        select_pr(&result, &local(), pulls(listed, vec![])).unwrap(),
+        Some(chosen("PR_1"))
+    );
+    // Not associated with the head commit (yet): the list alone finds it.
+    let result = find(vec![], false);
+    let listed = vec![rest_pr(2, "bob/project"), rest_pr(3, "alice/project")];
+    assert_eq!(
+        select_pr(&result, &local(), pulls(listed, vec![])).unwrap(),
+        Some(chosen("PR_rest_3"))
+    );
+    let result = find(vec![pr(1, "alice/project")], false);
+    let listed = vec![rest_pr(2, "alice/project")];
+    assert!(message(select_pr(&result, &local(), pulls(listed, vec![]))).contains("Multiple"));
+}
+
+#[test]
+fn rejects_full_or_malformed_rest_lists() {
+    let result = find(vec![], false);
+    let full = (0..100).map(|n| rest_pr(n, "bob/project")).collect();
+    assert!(message(select_pr(&result, &local(), pulls(full, vec![]))).contains("limit"));
+    assert!(select_pr(&result, &local(), |_, _| Ok(json!({"message":"x"}))).is_err());
+    for broken in ["html_url", "node_id", "state", "head"] {
+        let mut item = rest_pr(1, "alice/project");
+        item.as_object_mut().unwrap().remove(broken);
+        assert!(
+            select_pr(&result, &local(), pulls(vec![item], vec![])).is_err(),
+            "missing {broken}"
+        );
+    }
+    let mut item = rest_pr(1, "alice/project");
+    item["head"]["sha"] = json!(1);
+    assert!(select_pr(&result, &local(), pulls(vec![item], vec![])).is_err());
+    let mut item = rest_pr(1, "alice/project");
+    item["state"] = json!("draft");
+    assert!(select_pr(&result, &local(), pulls(vec![item], vec![])).is_err());
+    assert!(select_pr(&result, &local(), |_, _| Err("gh failed".into())).is_err());
 }
 
 #[test]
 fn direct_fork_parent_results_cover_default_branch_and_deduplicate() {
-    let mut candidate = pr("match", "alice/project");
-    candidate["repository"]["nameWithOwner"] = json!("upstream/project");
-    // Both independent GraphQL connections must own the same PR fixture.
-    let mut result = find(vec![candidate.clone()], false);
-    result["data"]["repository"]["isFork"] = json!(true);
-    result["data"]["repository"]["parent"] = json!({
-        "nameWithOwner":"upstream/project",
-        "pullRequests":{"pageInfo":{"hasNextPage":false},"nodes":[candidate]}
-    });
-    let found = select_pr(&result, &local()).unwrap().unwrap();
-    assert_eq!(found.id, "match");
-    assert_eq!(found.repository, "upstream/project");
-    result["data"]["repository"]["object"]["associatedPullRequests"]["nodes"] = json!([]);
-    assert_eq!(select_pr(&result, &local()).unwrap().unwrap().id, "match");
-    result["data"]["repository"]["parent"]["pullRequests"]["pageInfo"]["hasNextPage"] = json!(true);
-    assert!(select_pr(&result, &local()).unwrap_err().contains("limit"));
+    let result = fork(vec![pr(1, "alice/project")]);
+    assert_eq!(
+        select_pr(
+            &result,
+            &local(),
+            pulls(vec![], vec![rest_pr(1, "alice/project")])
+        )
+        .unwrap(),
+        Some(chosen("PR_1"))
+    );
+    let result = fork(vec![]);
+    assert_eq!(
+        select_pr(
+            &result,
+            &local(),
+            pulls(vec![], vec![rest_pr(1, "alice/project")])
+        )
+        .unwrap(),
+        Some(chosen("PR_rest_1"))
+    );
+    let full = (0..100).map(|n| rest_pr(n, "alice/project")).collect();
+    assert!(message(select_pr(&result, &local(), pulls(vec![], full))).contains("limit"));
+    let mut result = fork(vec![]);
     result["data"]["repository"]["parent"] = Value::Null;
-    assert!(select_pr(&result, &local()).unwrap_err().contains("parent"));
+    assert!(message(select_pr(&result, &local(), none())).contains("parent"));
 }
 
 #[test]
 fn unmatched_fork_cannot_silently_hide_sibling_pr() {
-    let mut result = find(vec![], false);
-    result["data"]["repository"]["isFork"] = json!(true);
-    result["data"]["repository"]["parent"] = json!({
-        "nameWithOwner":"upstream/project",
-        "pullRequests":{"pageInfo":{"hasNextPage":false},"nodes":[]}
-    });
-    assert!(select_pr(&result, &local())
-        .unwrap_err()
-        .contains("other forks"));
+    let other = vec![rest_pr(1, "bob/project")];
+    assert!(
+        message(select_pr(&fork(vec![]), &local(), pulls(vec![], other))).contains("other forks")
+    );
 }
 
 #[test]
-fn deleted_ref_still_selects_unique_terminal_fork_pr() {
-    for (state, expected) in [("CLOSED", PrState::Closed), ("MERGED", PrState::Merged)] {
-        let mut completed = pr("finished", "alice/project");
+fn completed_fork_pr_is_not_a_discovery_error() {
+    for state in ["CLOSED", "MERGED"] {
+        let mut completed = pr(1, "alice/project");
         completed["state"] = json!(state);
-        completed["repository"]["nameWithOwner"] = json!("upstream/project");
-        let mut result = find(vec![completed], false);
-        result["data"]["repository"]["ref"] = Value::Null;
-        result["data"]["repository"]["isFork"] = json!(true);
-        result["data"]["repository"]["parent"] = json!({
-            "nameWithOwner":"upstream/project",
-            "pullRequests":{"pageInfo":{"hasNextPage":false},"nodes":[]}
-        });
-        let found = select_pr(&result, &local()).unwrap().unwrap();
-        assert_eq!((found.id.as_str(), found.state), ("finished", expected));
-        let mut detail = feedback(vec![], vec![thread("review", false, false)]);
-        detail["data"]["node"]["id"] = json!("finished");
-        detail["data"]["node"]["state"] = json!(state);
-        let snapshot = parse_feedback(&detail, &local(), &found).unwrap();
-        let wire = serde_json::to_value(snapshot).unwrap();
-        assert_eq!(wire["state"], state);
-        assert_eq!(wire["head"], "abc");
-        result["data"]["repository"]["object"]["associatedPullRequests"]["nodes"][0]
+        let mut result = fork(vec![completed]);
+        assert_eq!(select_pr(&result, &local(), none()).unwrap(), None);
+        result["data"]["repository"]["ref"]["target"]["associatedPullRequests"]["nodes"][0]
             ["headRefOid"] = json!("older");
-        assert!(select_pr(&result, &local()).is_err());
+        assert!(select_pr(&result, &local(), none()).is_err());
     }
 }
 
@@ -171,536 +317,94 @@ fn deleted_ref_still_selects_unique_terminal_fork_pr() {
 fn head_mismatch_is_not_mistaken_for_no_pr() {
     let mut result = find(vec![], false);
     result["data"]["repository"]["ref"]["target"]["oid"] = json!("new");
-    assert!(select_pr(&result, &local())
-        .unwrap_err()
-        .contains("Local HEAD"));
-    let mut pr = pr("p", "alice/project");
-    pr["headRefOid"] = json!("new");
-    assert!(select_pr(&find(vec![pr], false), &local())
-        .unwrap_err()
-        .contains("differs"));
-}
-
-#[test]
-fn missing_refs_require_exact_unique_terminal_identity() {
-    let mut result = find(vec![], false);
-    result["data"]["repository"]["ref"] = Value::Null;
-    assert!(select_pr(&result, &local()).is_err());
-
-    let mut open = pr("open", "alice/project");
-    result["data"]["repository"]["pullRequests"]["nodes"] = json!([open]);
-    assert!(select_pr(&result, &local()).is_err());
-
-    open["state"] = json!("MERGED");
-    open["headRefOid"] = json!("old");
-    result["data"]["repository"]["pullRequests"]["nodes"] = json!([open]);
-    assert!(select_pr(&result, &local()).is_err());
-
-    open["headRefOid"] = json!("abc");
-    open["headRepository"]["nameWithOwner"] = json!("another/project");
-    result["data"]["repository"]["pullRequests"]["nodes"] = json!([open]);
-    assert!(select_pr(&result, &local()).is_err());
-
-    open["headRepository"]["nameWithOwner"] = json!("alice/project");
-    open["headRefName"] = json!("other");
-    result["data"]["repository"]["pullRequests"]["nodes"] = json!([open]);
-    assert!(select_pr(&result, &local()).is_err());
-
-    open["headRefName"] = json!("topic");
-    result["data"]["repository"]["pullRequests"]["nodes"] = json!([open]);
-    let found = select_pr(&result, &local()).unwrap().unwrap();
-    assert_eq!((found.id.as_str(), found.state), ("open", PrState::Merged));
-}
-
-#[test]
-fn reused_branches_do_not_resurrect_a_historical_pr() {
-    let mut previous = pr("previous", "alice/project");
-    previous["state"] = json!("MERGED");
-    let current = pr("current", "alice/project");
-    // The following branch-reuse scenarios mutate current and retain previous.
-    let result = find(vec![previous.clone(), current.clone()], false);
-    assert_eq!(select_pr(&result, &local()).unwrap().unwrap().id, "current");
-
-    let mut updated = current;
-    updated["headRefOid"] = json!("new");
-    // The next scenario still needs the original completed PR.
-    let result = find(vec![previous.clone(), updated], false);
-    assert!(select_pr(&result, &local()).is_err());
-
-    let mut result = find(vec![previous], false);
-    result["data"]["repository"]["ref"]["target"]["oid"] = json!("new");
-    assert!(select_pr(&result, &local()).is_err());
-}
-
-#[test]
-fn terminal_ambiguity_and_truncated_discovery_are_errors() {
-    let mut merged = pr("merged", "alice/project");
-    merged["state"] = json!("MERGED");
-    let mut closed = pr("closed", "alice/project");
-    closed["state"] = json!("CLOSED");
-    // Reuse the merged candidate below with a different incomplete connection.
-    let mut result = find(vec![merged.clone(), closed], false);
-    result["data"]["repository"]["ref"] = Value::Null;
-    assert!(select_pr(&result, &local()).is_err());
-
-    let mut result = find(vec![merged], false);
-    result["data"]["repository"]["pullRequests"]["pageInfo"]["hasNextPage"] = json!(true);
-    assert!(select_pr(&result, &local()).unwrap_err().contains("limit"));
-
-    let mut result = find(vec![], false);
-    result["data"]["repository"]["object"]["associatedPullRequests"]["nodes"] =
-        json!(vec![pr("p", "alice/project"); 101]);
-    assert!(select_pr(&result, &local()).is_err());
-}
-
-#[test]
-fn associated_pr_targeting_another_fork_is_not_supported() {
-    let mut sibling_pr = pr("sibling", "alice/project");
-    sibling_pr["repository"]["nameWithOwner"] = json!("sibling/project");
-    let mut result = find(vec![sibling_pr], false);
-    result["data"]["repository"]["isFork"] = json!(true);
-    result["data"]["repository"]["parent"] = json!({
-        "nameWithOwner":"upstream/project",
-        "pullRequests":{"pageInfo":{"hasNextPage":false},"nodes":[]}
-    });
-    assert!(select_pr(&result, &local()).is_err());
-}
-
-#[test]
-fn complete_nonfork_lookup_without_matching_pr_is_normal() {
-    let result = find(vec![], false);
-    assert!(select_pr(&result, &local()).unwrap().is_none());
-}
-
-#[test]
-fn changed_or_malformed_discovery_cannot_select_an_arbitrary_pr() {
-    let mut candidate = pr("p", "alice/project");
-    // The second connection must report a different state for this same PR id.
-    let mut result = find(vec![candidate.clone()], false);
-    candidate["state"] = json!("MERGED");
-    result["data"]["repository"]["pullRequests"]["nodes"] = json!([candidate]);
-    assert!(select_pr(&result, &local()).is_err());
-
-    let mut result = find(vec![pr("p", "alice/project")], false);
-    result["data"]["repository"]["object"]["oid"] = json!("other");
-    assert!(select_pr(&result, &local()).is_err());
-    let mut result = find(vec![pr("p", "alice/project")], false);
-    result["data"]["repository"]["object"] = Value::Null;
-    assert!(select_pr(&result, &local()).is_err());
-
-    let mut unrelated = pr("p", "other/project");
-    unrelated["state"] = json!("UNKNOWN");
-    let result = find(vec![unrelated], false);
-    assert!(select_pr(&result, &local()).is_err());
-
-    let mut result = find(vec![], false);
-    result["data"]["repository"]["pullRequests"]["pageInfo"]["hasNextPage"] = Value::Null;
-    assert!(select_pr(&result, &local()).is_err());
-}
-
-#[test]
-fn changes_outside_a_repository_are_a_definitive_absence() {
-    let dir = std::env::temp_dir().join(format!("omp-changes-not-a-repo-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    if crate::git_browser::discover_optional(&dir)
-        .unwrap()
-        .is_none()
-    {
-        let result = changes(&dir);
-        assert!(result.snapshot.is_none());
-        assert!(result.discovery_error.is_none());
-        assert!(result.local_changes.is_none());
-        assert!(result.local_error.is_none());
-    }
-    std::fs::remove_dir_all(dir).ok();
-}
-
-#[test]
-fn changes_outcomes_are_independent_and_serialized_with_nulls() {
-    let result = collect_changes(
-        || Err("authentication failed".into()),
-        || {
-            Ok(Some(crate::git_browser::LocalChanges {
-                changed: 3,
-                truncated: false,
-            }))
-        },
+    let err = select_pr(&result, &local(), none()).unwrap_err();
+    assert!(
+        err.message.contains("Local HEAD") && !err.retryable,
+        "{err:?}"
     );
+    let mut stale = pr(1, "alice/project");
+    stale["headRefOid"] = json!("new");
+    let err = select_pr(&find(vec![stale], false), &local(), none()).unwrap_err();
+    assert!(err.message.contains("differs") && err.retryable, "{err:?}");
+    let mut stale = rest_pr(1, "alice/project");
+    stale["head"]["sha"] = json!("new");
+    let err = select_pr(&find(vec![], false), &local(), pulls(vec![stale], vec![])).unwrap_err();
+    assert!(err.message.contains("differs") && err.retryable, "{err:?}");
+}
+
+/// The webview retries lag (GitHub not yet showing a push) with a backoff
+/// and pauses on everything else, by `retryable` alone.
+#[test]
+fn only_lag_errors_are_retryable() {
+    let wire = |err: LookupError| serde_json::to_value(err).unwrap();
+    let mut stale = pr(1, "alice/project");
+    stale["headRefOid"] = json!("new");
     assert_eq!(
-        serde_json::to_value(result).unwrap(),
-        json!({
-            "snapshot": null,
-            "discoveryError": "authentication failed",
-            "localChanges": { "changed": 3, "truncated": false },
-            "localError": null
-        })
+        wire(select_pr(&find(vec![stale], false), &local(), none()).unwrap_err()),
+        json!({"message":"PR head differs from the upstream branch; retry after GitHub updates","ghMissing":false,"retryable":true})
     );
-    let result = collect_changes(
-        || {
-            parse_feedback(
-                &feedback(vec![], vec![]),
-                &local(),
-                &selected(PrState::Open),
-            )
-            .map(Some)
-        },
-        || Err("status failed".into()),
-    );
-    let value = serde_json::to_value(result).unwrap();
-    assert_eq!(value["snapshot"]["number"], 12);
-    assert_eq!(value["discoveryError"], Value::Null);
-    assert_eq!(value["localChanges"], Value::Null);
-    assert_eq!(value["localError"], "status failed");
-
-    let result = collect_changes(|| Ok(None), || Ok(None));
+    let mut moved = feedback(vec![], vec![]);
+    moved["data"]["node"]["headRefName"] = json!("other");
     assert_eq!(
-        serde_json::to_value(result).unwrap(),
-        json!({"snapshot": null, "discoveryError": null, "localChanges": null, "localError": null})
+        wire(parse_feedback(&moved, &local(), &selected()).unwrap_err()),
+        json!({"message":"PR head or branch changed while loading feedback","ghMissing":false,"retryable":true})
     );
-}
-
-#[test]
-fn contextual_discovery_distinguishes_ordinary_absence_from_bad_configuration() {
-    let Some(repo) = crate::git_browser::fixture::init("context-discovery") else {
-        return;
-    };
-    repo.write("untracked.txt", "work\n");
-    let unborn = changes(repo.path());
-    assert!(unborn.snapshot.is_none() && unborn.discovery_error.is_none());
-    assert_eq!(unborn.local_changes.unwrap().changed, 1);
-    assert!(unborn.local_error.is_none());
-
-    repo.commit("initial", 1_700_000_000);
-    assert!(contextual_branch(repo.path()).unwrap().is_none());
-    repo.git(&["checkout", "-q", "--detach"]);
-    assert!(contextual_branch(repo.path()).unwrap().is_none());
-    repo.git(&["switch", "-q", "main"]);
-    repo.git(&[
-        "remote",
-        "add",
-        "origin",
-        "https://example.com/alice/project.git",
-    ]);
-    repo.git(&["config", "branch.main.remote", "origin"]);
-    repo.git(&["config", "branch.main.merge", "refs/heads/topic"]);
-    let unsupported = changes(repo.path());
-    assert!(unsupported.snapshot.is_none() && unsupported.discovery_error.is_none());
-    assert_eq!(unsupported.local_changes.unwrap().changed, 1);
-    assert!(unsupported.local_error.is_none());
-
-    repo.git(&[
-        "remote",
-        "set-url",
-        "origin",
-        "https://github.com/alice/project/extra",
-    ]);
-    let malformed = changes(repo.path());
-    assert!(malformed
-        .discovery_error
-        .unwrap()
-        .contains("owner and repository"));
-    assert_eq!(malformed.local_changes.unwrap().changed, 1);
-    assert!(malformed.local_error.is_none());
-
-    repo.git(&[
-        "remote",
-        "set-url",
-        "origin",
-        "https://github.com/alice/project.git",
-    ]);
+    let mut other_commit = feedback(vec![], vec![]);
+    other_commit["data"]["node"]["commits"]["nodes"][0]["commit"]["oid"] = json!("zzz");
     assert_eq!(
-        contextual_branch(repo.path()).unwrap().unwrap().remote_ref,
-        "refs/heads/topic"
+        wire(parse_feedback(&other_commit, &local(), &selected()).unwrap_err()),
+        json!({"message":"GitHub returned feedback for a different commit","ghMissing":false,"retryable":true})
     );
-    repo.git(&["config", "branch.main.merge", "refs/heads/invalid..name"]);
-    assert!(contextual_branch(repo.path()).is_err());
-}
-
-#[test]
-fn contextual_discovery_preserves_config_and_path_errors() {
-    let Some(repo) = crate::git_browser::fixture::init("context-bad-config") else {
-        return;
-    };
-    repo.commit("initial", 1_700_000_000);
-    repo.git(&["config", "branch.main.remote", "missing"]);
-    repo.git(&["config", "branch.main.merge", "refs/heads/topic"]);
-    assert!(contextual_branch(repo.path())
-        .unwrap_err()
-        .contains("remote"));
-    assert!(contextual_branch(&repo.path().join("missing-directory")).is_err());
-    std::fs::write(repo.path().join(".git/config"), "[invalid\n").unwrap();
-    let result = changes(repo.path());
-    assert!(result.discovery_error.is_some());
-    assert!(result.local_error.is_some());
-}
-
-#[test]
-fn contextual_revalidation_keeps_checkout_disappearance_as_an_error() {
-    let Some(repo) = crate::git_browser::fixture::init("context-race") else {
-        return;
-    };
-    repo.commit("initial", 1_700_000_000);
-    repo.git(&[
-        "remote",
-        "add",
-        "origin",
-        "https://github.com/alice/project.git",
-    ]);
-    repo.git(&["config", "branch.main.remote", "origin"]);
-    repo.git(&["config", "branch.main.merge", "refs/heads/topic"]);
-    let original = contextual_branch(repo.path()).unwrap().unwrap();
-    let result = with_local_revalidation(
-        &original,
-        || {
-            repo.git(&["checkout", "-q", "--detach"]);
-            Ok(None::<()>)
-        },
-        || local_branch(repo.path()),
-    );
-    assert!(result.is_err());
-    assert!(contextual_branch(repo.path()).unwrap().is_none());
-}
-
-#[test]
-fn local_identity_is_revalidated_after_success_none_and_read_errors() {
-    for outcome in 0..3 {
-        let read = || match outcome {
-            0 => Ok(Some("snapshot")),
-            1 => Ok(None),
-            _ => Err("GitHub read failed".into()),
-        };
-        let original = local();
-        assert_eq!(
-            with_local_revalidation(&original, read, || Ok(local())),
-            read()
-        );
-        for component in ["branch", "head", "remote_ref", "owner", "repo"] {
-            let mut changed = local();
-            match component {
-                "branch" => changed.branch = "new".into(),
-                "head" => changed.head = "new".into(),
-                "remote_ref" => changed.remote_ref = "refs/heads/new".into(),
-                "owner" => changed.owner = "new".into(),
-                "repo" => changed.repo = "new".into(),
-                _ => unreachable!(),
-            }
-            let err = with_local_revalidation(&original, read, || Ok(changed)).unwrap_err();
-            assert!(err.contains("changed"), "{component}: {err}");
-        }
-        let err = with_local_revalidation(&original, read, || {
-            Err("cannot reread local checkout".into())
-        })
-        .unwrap_err();
-        assert!(err.contains("cannot reread"));
-    }
-}
-
-#[test]
-fn revalidation_observes_real_checkout_branch_head_and_upstream_changes() {
-    let Some(repo) = crate::git_browser::fixture::init("pr-lifecycle-race") else {
-        return;
-    };
-    repo.commit("initial", 1_700_000_000);
-    repo.git(&[
-        "remote",
-        "add",
-        "origin",
-        "https://github.com/alice/project.git",
-    ]);
-    repo.git(&["config", "branch.main.remote", "origin"]);
-    repo.git(&["config", "branch.main.merge", "refs/heads/topic"]);
-
-    let original = local_branch(repo.path()).unwrap();
-    let error = with_local_revalidation(
-        &original,
-        || {
-            repo.git(&["switch", "-q", "-c", "next"]);
-            repo.git(&["config", "branch.next.remote", "origin"]);
-            repo.git(&["config", "branch.next.merge", "refs/heads/topic"]);
-            Ok(())
-        },
-        || local_branch(repo.path()),
-    )
-    .unwrap_err();
-    assert!(error.contains("changed"));
-
-    let original = local_branch(repo.path()).unwrap();
-    let error = with_local_revalidation(
-        &original,
-        || {
-            repo.commit("advance", 1_700_000_001);
-            Ok(())
-        },
-        || local_branch(repo.path()),
-    )
-    .unwrap_err();
-    assert!(error.contains("changed"));
-
-    let original = local_branch(repo.path()).unwrap();
-    let error = with_local_revalidation(
-        &original,
-        || {
-            repo.git(&["config", "branch.next.merge", "refs/heads/reused"]);
-            Ok(())
-        },
-        || local_branch(repo.path()),
-    )
-    .unwrap_err();
-    assert!(error.contains("changed"));
-}
-
-#[test]
-fn terminal_transition_is_visible_but_reopen_requires_fresh_open_discovery() {
-    for (state, expected) in [("MERGED", PrState::Merged), ("CLOSED", PrState::Closed)] {
-        let mut detail = feedback(vec![], vec![thread("review", false, false)]);
-        detail["data"]["node"]["state"] = json!(state);
-        let snapshot = parse_feedback(&detail, &local(), &selected(PrState::Open)).unwrap();
-        assert_eq!(snapshot.state, expected);
-        assert_eq!(snapshot.threads.len(), 1);
-        assert_eq!(serde_json::to_value(snapshot).unwrap()["state"], state);
-        assert!(parse_feedback(&detail, &local(), &selected(expected)).is_ok());
-
-        detail["data"]["node"]["state"] = json!("OPEN");
-        assert!(parse_feedback(&detail, &local(), &selected(expected)).is_err());
-        assert_eq!(
-            parse_feedback(&detail, &local(), &selected(PrState::Open))
-                .unwrap()
-                .state,
-            PrState::Open
-        );
-    }
-}
-
-#[test]
-fn reopened_pr_is_actionable_only_after_live_ref_is_rediscovered() {
-    let mut candidate = pr("detail", "alice/project");
-    candidate["state"] = json!("CLOSED");
-    // Retain the candidate so the detail lookup can simulate reopening it.
-    let mut discovery = find(vec![candidate.clone()], false);
-    discovery["data"]["repository"]["ref"] = Value::Null;
-    let closed = select_pr(&discovery, &local()).unwrap().unwrap();
-
-    let mut detail = feedback(vec![], vec![]);
-    detail["data"]["node"]["repository"]["nameWithOwner"] = json!("alice/project");
-    assert!(parse_feedback(&detail, &local(), &closed).is_err());
-
-    candidate["state"] = json!("OPEN");
-    discovery["data"]["repository"]["object"]["associatedPullRequests"]["nodes"] =
-        json!([candidate]);
-    assert!(select_pr(&discovery, &local()).is_err());
-    discovery["data"]["repository"]["ref"] = json!({"target":{"oid":"abc"}});
-    let reopened = select_pr(&discovery, &local()).unwrap().unwrap();
-    assert_eq!(reopened.state, PrState::Open);
+    let two = find(vec![pr(1, "alice/project"), pr(2, "alice/project")], false);
     assert_eq!(
-        parse_feedback(&detail, &local(), &reopened).unwrap().state,
-        PrState::Open
+        wire(select_pr(&two, &local(), none()).unwrap_err())["retryable"],
+        false
     );
-}
-
-#[test]
-fn detail_identity_must_still_match_the_selected_pr() {
-    for (key, value) in [
-        ("id", json!("different")),
-        ("headRefOid", json!("different")),
-        ("headRefName", json!("different")),
-        ("headRepository", json!({"nameWithOwner":"other/project"})),
-        ("headRepository", Value::Null),
-        ("repository", json!({"nameWithOwner":"other/project"})),
-        ("state", json!("REOPENED")),
-        ("state", Value::Null),
-    ] {
-        let mut detail = feedback(vec![], vec![]);
-        detail["data"]["node"][key] = value;
-        assert!(
-            parse_feedback(&detail, &local(), &selected(PrState::Open)).is_err(),
-            "changed or malformed {key}"
-        );
-    }
-}
-
-#[test]
-fn check_rollup_distinguishes_none_pending_success_failure_and_unknown() {
-    let mut no_rollup = feedback(vec![], vec![]);
-    no_rollup["data"]["node"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = Value::Null;
-    let snapshot = parse_feedback(&no_rollup, &local(), &selected(PrState::Open)).unwrap();
-    assert_eq!(snapshot.checks_state, ChecksState::None);
-    assert!(snapshot.failed_checks.is_empty());
+    let mut behind = find(vec![], false);
+    behind["data"]["repository"]["ref"]["target"]["oid"] = json!("new");
     assert_eq!(
-        serde_json::to_value(snapshot).unwrap()["checksState"],
-        "none"
+        wire(select_pr(&behind, &local(), none()).unwrap_err())["retryable"],
+        false
     );
-
-    for (rollup, expected, wire) in [
-        ("PENDING", ChecksState::Pending, "pending"),
-        ("SUCCESS", ChecksState::Success, "success"),
-        ("FAILURE", ChecksState::Failure, "failure"),
-        ("ERROR", ChecksState::Failure, "failure"),
-        ("EXPECTED", ChecksState::Unknown, "unknown"),
-    ] {
-        let mut detail = feedback(vec![], vec![]);
-        detail["data"]["node"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["state"] =
-            json!(rollup);
-        let snapshot = parse_feedback(&detail, &local(), &selected(PrState::Open)).unwrap();
-        assert_eq!(snapshot.checks_state, expected, "{rollup}");
-        assert!(snapshot.failed_checks.is_empty());
-        assert_eq!(serde_json::to_value(snapshot).unwrap()["checksState"], wire);
-    }
-
-    let pending = check("pending", "IN_PROGRESS", Value::Null, "t");
-    let mut detail = feedback(vec![pending], vec![]);
-    detail["data"]["node"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["state"] =
-        json!("PENDING");
-    let snapshot = parse_feedback(&detail, &local(), &selected(PrState::Open)).unwrap();
-    assert_eq!(snapshot.checks_state, ChecksState::Pending);
-    assert!(snapshot.failed_checks.is_empty());
+    let mut truncated = feedback(vec![], vec![]);
+    truncated["data"]["node"]["reviewThreads"]["pageInfo"]["hasNextPage"] = json!(true);
+    assert_eq!(
+        wire(parse_feedback(&truncated, &local(), &selected()).unwrap_err())["retryable"],
+        false
+    );
 }
 
+/// Auto-fix replies as the viewer; its own reply must not make the thread
+/// new again.
 #[test]
-fn pending_rollup_with_a_failed_check_keeps_failure_visible() {
-    let mut detail = feedback(
-        vec![
-            check("failed", "COMPLETED", json!("FAILURE"), "t1"),
-            check("pending", "QUEUED", Value::Null, "t2"),
-        ],
+fn thread_identity_ignores_the_viewers_own_comments() {
+    let result = feedback(
         vec![],
+        vec![
+            commented(
+                "replied",
+                false,
+                false,
+                &[("t1", false), ("t2", false), ("t3", true)],
+            ),
+            commented("own", false, false, &[("t4", true), ("t5", true)]),
+        ],
     );
-    detail["data"]["node"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["state"] =
-        json!("PENDING");
-    let snapshot = parse_feedback(&detail, &local(), &selected(PrState::Open)).unwrap();
-    assert!(snapshot.is_draft);
-    assert_eq!(snapshot.checks_state, ChecksState::Failure);
-    assert_eq!(snapshot.failed_checks.len(), 1);
-}
-
-#[test]
-fn malformed_check_enums_are_not_described_as_success() {
-    for invalid in [
-        json!("UNKNOWN"),
-        json!(""),
-        json!(null),
-        json!(false),
-        json!(42),
-    ] {
-        let mut detail = feedback(vec![], vec![]);
-        detail["data"]["node"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["state"] =
-            invalid;
-        assert!(parse_feedback(&detail, &local(), &selected(PrState::Open)).is_err());
-    }
-    let mut detail = feedback(vec![], vec![]);
-    detail["data"]["node"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
-        .as_object_mut()
-        .unwrap()
-        .remove("state");
-    assert!(parse_feedback(&detail, &local(), &selected(PrState::Open)).is_err());
-
-    for run in [
-        check("run", "UNKNOWN", Value::Null, "t"),
-        check("run", "COMPLETED", json!("UNSUPPORTED"), "t"),
-        json!({"__typename":"StatusContext","id":"legacy","context":"ci","state":"UNKNOWN","targetUrl":null,"createdAt":"t"}),
-    ] {
-        let detail = feedback(vec![run], vec![]);
-        assert!(parse_feedback(&detail, &local(), &selected(PrState::Open)).is_err());
-    }
+    let snapshot = parse_feedback(&result, &local(), &selected()).unwrap();
+    let ids: Vec<_> = snapshot
+        .threads
+        .iter()
+        .map(|t| (t.id.as_str(), t.updated_at.as_str()))
+        .collect();
+    assert_eq!(ids, [("replied", "t2"), ("own", "t4")]);
+    let mut result = feedback(vec![], vec![thread("long", false, false)]);
+    result["data"]["node"]["reviewThreads"]["nodes"][0]["comments"]["pageInfo"]
+        ["hasPreviousPage"] = json!(true);
+    assert!(message(parse_feedback(&result, &local(), &selected())).contains("limit"));
+    let mut result = feedback(vec![], vec![thread("bad", false, false)]);
+    result["data"]["node"]["reviewThreads"]["nodes"][0]["comments"]["nodes"][0]
+        ["viewerDidAuthor"] = Value::Null;
+    assert!(parse_feedback(&result, &local(), &selected()).is_err());
 }
 
 #[test]
@@ -722,7 +426,7 @@ fn includes_only_actionable_completed_checks_and_open_current_threads() {
     }
     checks.push(json!({"__typename":"StatusContext","id":"legacy","context":"legacy-ci","state":"ERROR","targetUrl":"https://example.test/ci","createdAt":"t3"}));
     checks.push(json!({"__typename":"StatusContext","id":"ok","context":"ok","state":"SUCCESS","targetUrl":null,"createdAt":"t4"}));
-    let mut result = feedback(
+    let result = feedback(
         checks,
         vec![
             thread("open", false, false),
@@ -730,35 +434,57 @@ fn includes_only_actionable_completed_checks_and_open_current_threads() {
             thread("outdated", false, true),
         ],
     );
-    result["data"]["node"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["state"] =
-        json!("FAILURE");
-    let snapshot = parse_feedback(&result, &local(), &selected(PrState::Open)).unwrap();
+    let snapshot = parse_feedback(&result, &local(), &selected()).unwrap();
     assert_eq!(snapshot.number, 12);
     assert_eq!(snapshot.title, "Improve project");
     assert_eq!(snapshot.repository, "upstream/project");
     assert_eq!(snapshot.additions, 42);
     assert_eq!(snapshot.deletions, 3);
     assert!(snapshot.is_draft);
-    assert_eq!(snapshot.state, PrState::Open);
-    assert_eq!(snapshot.checks_state, ChecksState::Failure);
     assert_eq!(snapshot.branch, "local");
     assert_eq!(snapshot.failed_checks.len(), 5);
     assert_eq!(
         snapshot.failed_checks[0].id,
         "failed:t1:2026-01-02T00:00:00Z"
     );
-    assert_eq!(snapshot.failed_checks[0].url, snapshot.url);
     assert_eq!(snapshot.failed_checks[4].id, "legacy:t3");
+    // The card gets every check, in GitHub's order, failed or not.
+    let states: Vec<_> = snapshot
+        .checks
+        .iter()
+        .map(|c| (c.name.as_str(), c.state))
+        .collect();
+    assert_eq!(
+        states,
+        [
+            ("failed", CheckState::Failure),
+            ("inflight", CheckState::Running),
+            ("TIMED_OUT", CheckState::Failure),
+            ("ACTION_REQUIRED", CheckState::Failure),
+            ("STARTUP_FAILURE", CheckState::Failure),
+            ("CANCELLED", CheckState::Neutral),
+            ("SUCCESS", CheckState::Success),
+            ("NEUTRAL", CheckState::Neutral),
+            ("SKIPPED", CheckState::Neutral),
+            ("legacy-ci", CheckState::Failure),
+            ("ok", CheckState::Success),
+        ]
+    );
+    // No details page: the PR stands in.
+    assert_eq!(snapshot.checks[0].url, snapshot.url);
+    assert_eq!(snapshot.checks[9].url, "https://example.test/ci");
     assert_eq!(snapshot.threads.len(), 1);
     assert_eq!(snapshot.threads[0].id, "open");
     assert_eq!(snapshot.threads[0].updated_at, "2026-01-02T00:00:00Z");
     let wire = serde_json::to_value(snapshot).unwrap();
     assert!(wire.get("failedChecks").is_some());
+    assert_eq!(wire["checks"][1]["state"], "running");
     assert_eq!(wire["isDraft"], true);
-    assert_eq!(wire["state"], "OPEN");
-    assert_eq!(wire["checksState"], "failure");
     assert_eq!(wire["repository"], "upstream/project");
-    assert!(wire["threads"][0].get("updatedAt").is_some());
+    assert_eq!(
+        wire["threads"][0],
+        json!({"id":"open","updatedAt":"2026-01-02T00:00:00Z"})
+    );
 }
 
 #[test]
@@ -767,7 +493,7 @@ fn requires_valid_display_metadata() {
         let mut result = feedback(vec![], vec![]);
         result["data"]["node"].as_object_mut().unwrap().remove(key);
         assert!(
-            parse_feedback(&result, &local(), &selected(PrState::Open)).is_err(),
+            parse_feedback(&result, &local(), &selected()).is_err(),
             "missing {key}"
         );
     }
@@ -787,7 +513,7 @@ fn requires_valid_display_metadata() {
         let mut result = feedback(vec![], vec![]);
         result["data"]["node"][key] = invalid;
         assert!(
-            parse_feedback(&result, &local(), &selected(PrState::Open)).is_err(),
+            parse_feedback(&result, &local(), &selected()).is_err(),
             "invalid {key}"
         );
     }
@@ -795,7 +521,7 @@ fn requires_valid_display_metadata() {
     result["data"]["node"]["additions"] = json!(0);
     result["data"]["node"]["deletions"] = json!(0);
     result["data"]["node"]["isDraft"] = json!(false);
-    let snapshot = parse_feedback(&result, &local(), &selected(PrState::Open)).unwrap();
+    let snapshot = parse_feedback(&result, &local(), &selected()).unwrap();
     assert_eq!(
         (snapshot.additions, snapshot.deletions, snapshot.is_draft),
         (0, 0, false)
@@ -803,20 +529,35 @@ fn requires_valid_display_metadata() {
 }
 
 #[test]
+fn checks_not_started_are_queued_and_a_pending_status_is_running() {
+    for status in ["QUEUED", "REQUESTED", "WAITING", "PENDING"] {
+        let parsed = parse_check(&check("run", status, Value::Null, "t"), "fallback").unwrap();
+        assert_eq!(parsed.ci.state, CheckState::Queued, "{status}");
+        assert!(parsed.failed.is_none());
+    }
+    for (state, want) in [
+        ("PENDING", CheckState::Running),
+        ("EXPECTED", CheckState::Queued),
+    ] {
+        let status = json!({"__typename":"StatusContext","id":"s","context":"ext","state":state,"targetUrl":null,"createdAt":"t"});
+        assert_eq!(parse_check(&status, "fallback").unwrap().ci.state, want);
+    }
+    let unknown = json!({"__typename":"StatusContext","id":"s","context":"ext","state":"LATER","targetUrl":null,"createdAt":"t"});
+    assert!(parse_check(&unknown, "fallback").is_err());
+}
+
+#[test]
 fn new_attempts_produce_new_ids() {
-    let first = failed_check(
-        &check("run", "COMPLETED", json!("FAILURE"), "first"),
-        "fallback",
-    )
-    .unwrap()
-    .unwrap();
-    let second = failed_check(
-        &check("run", "COMPLETED", json!("FAILURE"), "second"),
-        "fallback",
-    )
-    .unwrap()
-    .unwrap();
-    assert_ne!(first.id, second.id);
+    let failed = |started| {
+        parse_check(
+            &check("run", "COMPLETED", json!("FAILURE"), started),
+            "fallback",
+        )
+        .unwrap()
+        .failed
+        .unwrap()
+    };
+    assert_ne!(failed("first").id, failed("second").id);
 }
 
 #[test]
@@ -824,106 +565,74 @@ fn startup_failure_with_nullable_timestamps_is_actionable() {
     let mut run = check("startup", "COMPLETED", json!("STARTUP_FAILURE"), "unused");
     run["startedAt"] = Value::Null;
     run["completedAt"] = Value::Null;
-    let result = failed_check(&run, "fallback").unwrap().unwrap();
+    let result = parse_check(&run, "fallback").unwrap().failed.unwrap();
     assert_eq!(result.id, "startup::");
     run["startedAt"] = json!(42);
-    assert!(failed_check(&run, "fallback").is_err());
+    assert!(parse_check(&run, "fallback").is_err());
 }
 
 #[test]
 fn rejects_truncated_malformed_or_changed_data() {
     let mut result = feedback(vec![], vec![]);
     result["data"]["node"]["reviewThreads"]["pageInfo"]["hasNextPage"] = json!(true);
-    assert!(parse_feedback(&result, &local(), &selected(PrState::Open))
+    assert!(parse_feedback(&result, &local(), &selected())
         .unwrap_err()
+        .message
         .contains("limit"));
     let mut result = feedback(vec![], vec![]);
     result["data"]["node"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]
         ["pageInfo"]["hasNextPage"] = json!(true);
-    assert!(parse_feedback(&result, &local(), &selected(PrState::Open))
+    assert!(parse_feedback(&result, &local(), &selected())
         .unwrap_err()
+        .message
         .contains("limit"));
     let mut result = feedback(vec![], vec![thread("t", false, false)]);
     result["data"]["node"]["reviewThreads"]["nodes"][0]["comments"]["nodes"] = json!([]);
-    assert!(parse_feedback(&result, &local(), &selected(PrState::Open)).is_err());
+    assert!(parse_feedback(&result, &local(), &selected()).is_err());
     let mut result = feedback(vec![], vec![]);
     result["data"]["node"]["headRefOid"] = json!("new");
-    assert!(parse_feedback(&result, &local(), &selected(PrState::Open))
+    assert!(parse_feedback(&result, &local(), &selected())
         .unwrap_err()
+        .message
         .contains("changed"));
     let result = feedback(vec![json!({"__typename":"Unknown"})], vec![]);
-    assert!(parse_feedback(&result, &local(), &selected(PrState::Open)).is_err());
+    assert!(parse_feedback(&result, &local(), &selected()).is_err());
     let result = feedback(vec![check("id", "COMPLETED", Value::Null, "t")], vec![]);
-    assert!(parse_feedback(&result, &local(), &selected(PrState::Open)).is_err());
-    let mut result = feedback(vec![], vec![]);
-    result["data"]["node"]["commits"]["nodes"][0]["commit"]["oid"] = json!("other");
-    assert!(parse_feedback(&result, &local(), &selected(PrState::Open)).is_err());
+    assert!(parse_feedback(&result, &local(), &selected()).is_err());
+    let result = feedback(vec![], vec![]);
+    let moved = LocalBranch {
+        head: "other".into(),
+        ..local()
+    };
+    assert!(parse_feedback(&result, &moved, &selected()).is_err());
 }
 
+/// The webview hides the card for a missing gh and shows every other
+/// failure, by `ghMissing` alone.
 #[test]
-fn feedback_requires_exactly_the_latest_matching_commit() {
-    let mut detail = feedback(
-        vec![check("current", "COMPLETED", json!("SUCCESS"), "t")],
-        vec![],
-    );
-    let snapshot = parse_feedback(&detail, &local(), &selected(PrState::Open)).unwrap();
-    assert_eq!(snapshot.checks_state, ChecksState::Success);
-    assert!(snapshot.failed_checks.is_empty());
-
-    let commits = &mut detail["data"]["node"]["commits"]["nodes"];
-    let current = commits.as_array_mut().unwrap().remove(0);
-    assert!(parse_feedback(&detail, &local(), &selected(PrState::Open)).is_err());
-
-    detail["data"]["node"]["commits"]["nodes"] =
-        json!([{"commit":{"oid":"old","statusCheckRollup":null}}, current]);
-    assert!(parse_feedback(&detail, &local(), &selected(PrState::Open)).is_err());
+fn only_a_missing_gh_is_marked_gh_missing() {
+    let dir = crate::test_support::TempDir::new("pr-automation", "gh-missing");
+    let folder = dir.path().join("not-a-repo");
+    std::fs::create_dir_all(&folder).unwrap();
+    let err = snapshot_in(&[], &folder).unwrap_err();
+    assert!(err.gh_missing && !err.retryable, "{err:?}");
+    assert_eq!(serde_json::to_value(&err).unwrap()["ghMissing"], true);
+    let bin = dir.path().join("bin");
+    crate::test_support::executable(&bin.join(format!("gh{}", std::env::consts::EXE_SUFFIX)), "");
+    // gh is found; the folder is no Git checkout, so no gh run happens.
+    let err = snapshot_in(&[bin], &folder).unwrap_err();
+    assert!(!err.gh_missing, "{err:?}");
+    assert_eq!(serde_json::to_value(&err).unwrap()["ghMissing"], false);
 }
 
 /// Run explicitly with `OMP_PR_AUTOMATION_SMOKE_PROJECT` set to a local
-/// checkout. Optionally require a lifecycle with
-/// `OMP_PR_AUTOMATION_SMOKE_EXPECT_STATE=OPEN|MERGED|CLOSED` and a deleted
-/// remote ref with `OMP_PR_AUTOMATION_SMOKE_EXPECT_DELETED_REF=1`.
-/// This only reads Git metadata and queries GitHub via `gh`.
+/// checkout. This only reads Git metadata and queries GitHub via `gh`.
 #[test]
 #[ignore = "requires an authenticated gh and a GitHub.com checkout"]
 fn live_read_only_snapshot() {
     let folder = std::env::var_os("OMP_PR_AUTOMATION_SMOKE_PROJECT")
         .expect("set OMP_PR_AUTOMATION_SMOKE_PROJECT to a checkout");
     let path = Path::new(&folder);
-    let local = local_branch(path).expect("local branch");
-    eprintln!("local: {local:?}");
-    let result = snapshot(path).expect("GitHub snapshot");
-    if let Ok(expected) = std::env::var("OMP_PR_AUTOMATION_SMOKE_EXPECT_STATE") {
-        assert!(matches!(expected.as_str(), "OPEN" | "MERGED" | "CLOSED"));
-        let actual = serde_json::to_value(result.as_ref().expect("expected a PR")).unwrap();
-        assert_eq!(actual["state"], expected);
-    }
-    if std::env::var("OMP_PR_AUTOMATION_SMOKE_EXPECT_DELETED_REF")
-        .ok()
-        .as_deref()
-        == Some("1")
-    {
-        let branch = local.remote_ref.strip_prefix("refs/heads/").unwrap();
-        let response = gh::Gh::locate()
-            .expect("locate gh")
-            .query(
-                FIND_QUERY,
-                &[
-                    ("owner", &local.owner),
-                    ("repo", &local.repo),
-                    ("ref", &local.remote_ref),
-                    ("branch", branch),
-                    ("head", &local.head),
-                ],
-            )
-            .expect("read upstream ref");
-        assert!(
-            response
-                .pointer("/data/repository/ref")
-                .expect("upstream ref field")
-                .is_null(),
-            "expected the remote branch ref to be deleted"
-        );
-    }
-    eprintln!("snapshot: {result:?}");
+    eprintln!("local: {:?}", local_branch(path).expect("local branch"));
+    eprintln!("snapshot: {:?}", snapshot(path).expect("GitHub snapshot"));
 }

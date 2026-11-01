@@ -13,6 +13,8 @@
 //!   `read_until_capped`, and credential redaction.
 //! - [`journal`]    — bounded per-session event ring + replay.
 //! - [`ext_ui`]     — latest omp extension status lines / widgets (#52).
+//! - [`inflight`]   — the assistant message being streamed, rebuilt from
+//!   `messageUpdates: "delta"` frames.
 //! - [`approvals`]  — open tool-approval prompts a grant is bound to.
 //!
 //! A stopped session's descendants (subagents, tool calls) die with it
@@ -23,6 +25,7 @@ mod context_catalog;
 mod context_extension;
 mod evidence_requests;
 pub mod ext_ui;
+pub mod inflight;
 mod inner;
 pub mod journal;
 mod reader;
@@ -38,23 +41,35 @@ use approvals::PendingApprovals;
 use context_catalog::Catalog;
 pub use context_catalog::SkillPreview;
 use ext_ui::ExtUiState;
+use inflight::{InFlight, Snapshot};
 use inner::BridgeInner;
 use journal::{EventJournal, Replay};
 use reader::{spawn_stderr_reader, spawn_stdout_reader};
 use spawn::spawn_omp;
 
-/// Ring capacity for each session's event journal. 256 lines is generous
-/// headroom for the gap between a tab losing its live listener and
-/// regaining it (background tab switch) without holding unbounded memory
-/// for a long-idle session.
-const EVENT_JOURNAL_CAPACITY: usize = 256;
+/// Ring capacity for each session's event journal: headroom for the gap
+/// between a tab losing its live listener and regaining it (background tab
+/// switch). Counted in lines, and a streamed reply is one line per delta
+/// (`DELTA_EVENT_FILTER`), a few hundred bytes each: 4096 of them hold a long
+/// reply and its tool calls well inside the byte budget below.
+const EVENT_JOURNAL_CAPACITY: usize = 4096;
 
 /// Total byte budget for one session's event journal. Bounds the ring by
 /// size as well as entry count: a single RPC line may be up to
-/// `reader::MAX_LINE_BYTES` (16 MiB), so 256 entries alone would permit
-/// gigabytes of resident memory per open tab. 8 MiB comfortably holds a
+/// `reader::MAX_LINE_BYTES` (16 MiB), so the line count alone (4096 × 16 MiB)
+/// would permit tens of gigabytes of resident memory per open tab. 8 MiB comfortably holds a
 /// normal background-tab gap while capping the pathological case.
 const EVENT_JOURNAL_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Written to every omp process's stdin right after the spawn, before the
+/// frontend sends anything: `message_update` frames then carry only their
+/// increment instead of the whole message so far (rebuilt by the frontend's
+/// `app/stream-delta.js` and by [`inflight`]). Sent here rather than by the
+/// frontend so no process streams whole snapshots, a background tab the
+/// phone prompts before it was ever shown included. omp 18.13.2 (the version
+/// floor) is the first whose delta frames can be rebuilt.
+const DELTA_EVENT_FILTER: &str =
+    r#"{"type":"set_event_filter","events":null,"messageUpdates":"delta"}"#;
 
 /// `type` values the frontend may legitimately send over `send_command`.
 /// Anything else is rejected before it reaches omp's stdin — hardens the
@@ -115,7 +130,7 @@ const ALLOWED_COMMAND_TYPES: &[&str] = &[
     "cancel_subagent",
     // Conversation tree (src/app/conversation-tree.js): "Branch here" starts
     // a new file from a user prompt, "Fork after the reply" from a turn's last
-    // assistant entry. `fork` first shipped in omp 18.4.11.
+    // assistant entry. `fork` first shipped in omp 18.4.11 (below the version floor).
     "branch",
     "fork",
     // Goal mode: omp's `goal` command (get/create/resume/pause/drop).
@@ -181,10 +196,9 @@ impl AgentBridge {
     }
 
     /// Spawn omp for a session. If a session with this id already exists
-    /// it is replaced atomically; the previous child is reaped on a
-    /// background thread so this never blocks. On spawn failure the
-    /// error string is cached so subsequent `send` / `session_status`
-    /// calls can surface the real reason.
+    /// it is replaced atomically; the previous child is reaped before this
+    /// returns, preserving the workspace teardown barrier. On spawn failure
+    /// the error is cached for subsequent `send` / `session_status` calls.
     ///
     /// `rule_book` is consulted (and its session-scope entry populated on
     /// `stop_session`/replacement) so a granted tool-approval rule can
@@ -235,7 +249,10 @@ impl AgentBridge {
                 return Err(e);
             }
         };
-        let stdin = child.stdin.take().expect("stdin piped");
+        let mut stdin = child.stdin.take().expect("stdin piped");
+        // A failed write means omp is already gone; the stdout reader reports
+        // its exit like any other.
+        let _ = writeln!(stdin, "{DELTA_EVENT_FILTER}");
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
         let stdin_arc = Arc::new(Mutex::new(stdin));
@@ -247,6 +264,7 @@ impl AgentBridge {
         let ext_ui = Arc::new(Mutex::new(ExtUiState::default()));
         // Catalog and Evidence keep independent epoch guards for this process.
         let context_catalog = Arc::new(Mutex::new(Catalog::new(epoch.clone())));
+        let inflight = Arc::new(Mutex::new(InFlight::default()));
         let project_root = cwd.filter(|c| !c.is_empty()).map(std::path::PathBuf::from);
         // A second copy of the folder: the reader checks rules against its
         // own on every prompt, this one travels with a grant.
@@ -279,6 +297,7 @@ impl AgentBridge {
                     supervisor: Some(supervisor),
                     journal: Arc::clone(&journal),
                     ext_ui: Arc::clone(&ext_ui),
+                    inflight: Arc::clone(&inflight),
                     approvals: Arc::clone(&approvals),
                     context_catalog: Arc::clone(&context_catalog),
                     // Kept alive (pun intended) on the map entry; the reader
@@ -318,6 +337,7 @@ impl AgentBridge {
             gen,
             journal,
             ext_ui,
+            inflight,
             approvals,
             context_catalog,
             evidence,
@@ -487,6 +507,18 @@ impl AgentBridge {
         ext_ui
             .lock()
             .map_or_else(|_| ExtUiState::default(), |s| s.clone())
+    }
+
+    /// The assistant message a session is streaming, as far as it got (see
+    /// [`inflight`]); `None` between messages and for an unknown or ended
+    /// session.
+    pub fn streaming_message(&self, session_id: &str) -> Option<Snapshot> {
+        let Ok(Some(inflight)) = self.with_entry(session_id, |inner| Arc::clone(&inner.inflight))
+        else {
+            return None;
+        };
+        // Copied out under the reader's lock, serialised after it is released.
+        inflight.lock().ok().and_then(|s| s.snapshot())
     }
 
     /// `pick` applied to `session_id`'s map entry, holding the `sessions`
@@ -789,6 +821,7 @@ mod tests {
                 EVENT_JOURNAL_MAX_BYTES,
             ))),
             ext_ui: Arc::default(),
+            inflight: Arc::default(),
             approvals: Arc::new(Mutex::new(PendingApprovals::new(None))),
             context_catalog: Arc::default(),
             alive,

@@ -92,6 +92,8 @@ function harness() {
     "app/project-nav.js",
     "app/live-voice.js",
     "app/live-context.js",
+    "app/cache-usage.js",
+    "app/stream-delta.js",
     "app/ask-dialog.js",
     "app/ask-recovery.js",
     "app/agent-context.js",
@@ -135,7 +137,7 @@ function harness() {
             workspace: null,
           };
         if (name === "replay_events") return { dropped: false, events: [] };
-        if (name === "start_git_watch") return "feature";
+        if (name === "start_git_watch") return { branch: "feature", root: args.path };
         if (name === "send_command") {
           const command = JSON.parse(args.json);
           commands.push(command);

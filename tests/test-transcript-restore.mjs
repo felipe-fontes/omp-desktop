@@ -9,6 +9,7 @@ ctx.window = ctx;
 for (const file of [
   "app/turn-status.js",
   "app/transcript-merge.js",
+  "app/cache-usage.js",
   "adapter.js",
 ]) {
   vm.runInContext(
@@ -185,25 +186,6 @@ test("a persisted result completes a live card whose end frame was lost", () => 
   assert.equal(finished._id, 9);
 });
 
-test("trimming within a tool batch does not resurrect its earlier tools", () => {
-  const persisted = adapt(history);
-  const tail = persisted.slice(4);
-  const merged = mergeTranscript(tail, persisted, { trimmed: true });
-  assert.deepEqual(
-    Array.from(merged, (m) => (m.kind === "tool" ? m.tool : m.kind)),
-    ["edit", "eval", "assistant"],
-  );
-});
-
-test("raw calls retain a trim boundary held only by provisional result cards", () => {
-  const raw = adapt(history);
-  const filtered = adapt(history.filter((m) => m.role === "toolResult"));
-  const merged = mergeTranscript(filtered, raw, { trimmed: true });
-  assert.deepEqual(
-    Array.from(merged, (m) => (m.kind === "tool" ? m.tool : m.kind)),
-    ["read", "bash", "edit", "eval", "assistant"],
-  );
-});
 
 test("raw entries restore only the active branch, including history before compaction", () => {
   const entries = history.map((message, i) => ({

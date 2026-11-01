@@ -224,25 +224,32 @@ fn staged_submodule_is_explicitly_incomplete() {
 
 #[test]
 fn ci_mapping_preserves_actual_states_and_commit_identity() {
-    for (input, expected) in [
-        ("none", "absent"),
-        ("pending", "pending"),
-        ("success", "success"),
-        ("failure", "failure"),
-        ("unknown", "unknown"),
-        ("future", "unknown"),
+    for (states, expected) in [
+        (vec![], "absent"),
+        (vec!["queued"], "pending"),
+        (vec!["running", "failure"], "pending"),
+        (vec!["success", "neutral"], "success"),
+        (vec!["success", "failure"], "failure"),
+        (vec!["neutral"], "unknown"),
+        (vec!["success", "future"], "unknown"),
     ] {
-        let result = ci_result(Ok(Some(json!({"head":"abcdef", "checksState":input,
-            "number":7, "repository":"owner/repo", "failedChecks":[{"name":"unit", "url":"https://github.com/x"}]}))));
+        let checks: Vec<_> = states
+            .into_iter()
+            .map(|state| json!({"state": state, "name": "unit", "url": "https://github.com/x"}))
+            .collect();
+        let result = ci_result(Ok(Some(json!({"head":"abcdef", "checks":checks,
+            "number":7, "repository":"owner/repo"}))));
         assert_eq!(result["state"], expected);
         assert_eq!(result["sourceSha"], "abcdef");
         assert!(result["limitations"]
             .as_str()
             .unwrap()
             .contains("uncommitted"));
-        assert_eq!(result["snapshot"]["failedChecks"][0]["name"], "unit");
+        for check in result["snapshot"]["failedChecks"].as_array().unwrap() {
+            assert_eq!(check["name"], "unit");
+        }
     }
-    let no_head = ci_result(Ok(Some(json!({"checksState":"success"}))));
+    let no_head = ci_result(Ok(Some(json!({"checks":[{"state":"success"}]}))));
     assert_eq!(no_head["state"], "unknown");
     let absent = ci_result(Ok(None));
     assert_eq!(absent["state"], "absent");
@@ -259,11 +266,9 @@ fn ci_metadata_and_errors_are_bounded_on_utf8_boundaries() {
     assert!(error["reason"].as_str().unwrap().ends_with("[truncated]"));
     let large = "é".repeat(2000);
     let checks: Vec<_> = (0..120)
-        .map(|_| json!({"name":large, "url":large}))
+        .map(|_| json!({"state":"failure", "name":large, "url":large}))
         .collect();
-    let result = ci_result(Ok(Some(
-        json!({"head":"abc", "checksState":"failure", "failedChecks":checks}),
-    )));
+    let result = ci_result(Ok(Some(json!({"head":"abc", "checks":checks}))));
     assert_eq!(
         result["snapshot"]["failedChecks"].as_array().unwrap().len(),
         100
@@ -280,15 +285,12 @@ fn ci_metadata_and_errors_are_bounded_on_utf8_boundaries() {
 
 #[test]
 fn ci_serialized_payload_stays_bounded_even_when_strings_escape() {
-    let id = "\0".repeat(256);
     let name = "\0".repeat(256);
     let url = "\0".repeat(512);
     let checks: Vec<_> = (0..100)
-        .map(|_| json!({"id":id, "name":name, "url":url}))
+        .map(|_| json!({"state":"failure", "name":name, "url":url}))
         .collect();
-    let result = ci_result(Ok(Some(
-        json!({"head":"abc", "checksState":"failure", "failedChecks":checks}),
-    )));
+    let result = ci_result(Ok(Some(json!({"head":"abc", "checks":checks}))));
     assert!(serde_json::to_vec(&result).unwrap().len() < 128 * 1024);
     assert_eq!(result["snapshot"]["truncated"], true);
     assert!(result["limitations"]

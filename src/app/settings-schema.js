@@ -6,7 +6,7 @@
 //
 // Two row kinds:
 //   - `tweak`: one key of TWEAK_DEFAULTS (app/constants.js), rendered by the
-//     page itself; `type` is toggle | seg | slider | themes | swatches.
+//     page itself; `type` is toggle | seg | slider | themes | swatches | screens.
 //   - `custom`: rendered by `window.OMP_SETTINGS_ROWS[type]`
 //     (design/settings/rows-*.jsx). `keys` / `keyPrefix` name the tweak keys
 //     the row owns, so its changes count in the badges and the section
@@ -15,9 +15,10 @@
 // `desc` is schema-authored text; `backtick` segments render as code.
 // Bounds of collapseAfter / promptHistoryLimit / pasteCollapseLines and the
 // fold modes come from OMP_COLLAPSE / OMP_PROMPT_HISTORY / OMP_SESSION_UI,
-// read late (getters), as are OMP_ACCENT (accent comparison), OMP_KEYMAP
-// (shortcut keywords) and TWEAK_DEFAULTS, so load order among the plain
-// app/*.js modules does not matter.
+// the start screens from OMP_BACKDROPS, read late (getters), as are
+// OMP_ACCENT (accent comparison), OMP_KEYMAP (shortcut keywords) and
+// TWEAK_DEFAULTS, so load order among the plain app/*.js modules does not
+// matter.
 (function () {
   const THEMES = Object.freeze([
     { id: "aurora", tone: "dark", accent: "#8AF0C8" },
@@ -34,6 +35,8 @@
   const sessionUi = () => window.OMP_SESSION_UI;
   const opts = (values, labels = {}) => values.map(v => ({ value: v, label: labels[v] ?? String(v) }));
   const foldOptions = () => opts(collapse()?.MODES ?? ["auto", "open", "folded"]);
+  const screenOptions = () => (window.OMP_BACKDROPS?.SCREENS ?? [{ id: "matrix", label: "Matrix", blurb: "" }])
+    .map(s => ({ value: s.id, label: s.label, blurb: s.blurb }));
 
   // Descriptors, not spread: spread would read the bound getters once, now.
   const withExtra = (base, extra) => Object.defineProperties(base, Object.getOwnPropertyDescriptors(extra ?? {}));
@@ -41,10 +44,12 @@
   const custom = (type, label, desc, kw, extra) => withExtra({ kind: "custom", id: `custom:${type}`, type, label, desc, kw }, extra);
 
   const SECTIONS = [
-    { id: "appearance", icon: "sparkle", title: "Appearance", blurb: "Colour theme, accent, density and text size of the whole window.", groups: [
+    { id: "appearance", icon: "sparkle", title: "Appearance", blurb: "Colour theme, accent, start screen, density and text size of the whole window.", groups: [
       { name: "Theme", rows: [
         tweak("theme", "themes", "Theme", "Picking a theme also resets the accent to the theme's own.", "dark light colour color aurora phosphor daylight"),
         tweak("accent", "swatches", "Accent", "Focus rings, the active tab, links and the assistant's marks.", "color colour highlight"),
+        tweak("startScreen", "screens", "Start screen", "The animated screen behind the logo while no tab is open. It follows the theme and accent.", "welcome backdrop empty animation matrix latent embedding next token sampling agent loop orbit forward pass neural attention transformer self-attention",
+          { get options() { return screenOptions(); } }),
       ] },
       { name: "Text", rows: [
         tweak("density", "seg", "Density", "Row height, padding and the base text size.", "spacing compact",
@@ -86,10 +91,17 @@
         tweak("followOutput", "toggle", "Follow new output", "Keep the transcript scrolled to the newest message while the agent works. Scrolling up always pauses it.", "auto scroll bottom pin"),
       ] },
     ] },
-    { id: "composer", icon: "edit", title: "Composer", blurb: "Sending, pasting and recalling prompts.", groups: [
+    { id: "composer", icon: "edit", title: "Composer", blurb: "Sending, voice input, pasting and recalling prompts.", groups: [
       { name: "Sending", rows: [
         tweak("submitKey", "seg", "Send with", "In the composer, an ask's answer box and a subagent's steer box; the other chord inserts a newline. One-line fields always send with Enter.", "submit newline shift enter",
           { options: opts(["enter", "ctrl+enter"]) }),
+      ] },
+      { name: "Voice", rows: [
+        tweak("dictationSend", "toggle", "Send voice to text on stop", "Stopping voice to text yourself (the microphone, the panel's stop or a pause below) sends the draft with the dictated text, as Enter would. Off, the text only goes into the draft. A stop caused by switching tabs or opening Settings never sends.", "dictation speech microphone voice auto send submit"),
+        tweak("dictationAutoStop", "seg", "Stop voice to text after a pause", "Stop recording once no new words have come in for this long; until your first words it keeps waiting. Background noise that omp hears as words keeps it going.", "dictation speech microphone voice silence auto stop hands-free",
+          { options: opts([0, 1.5, 2, 3, 5], { 0: "off", 1.5: "1.5 s", 2: "2 s", 3: "3 s", 5: "5 s" }) }),
+        tweak("voiceSpectrumBands", "seg", "Spectrum bars", "How many frequency bars the microphone equalizer above the input draws while voice to text or a live conversation records.", "voice microphone equalizer spectrum fft bands bars",
+          { options: opts([16, 32, 48, 64, 96, 128]) }),
       ] },
       { name: "Pasting", rows: [
         tweak("pasteCollapseLines", "slider", "Collapse pastes longer than", "A longer paste shows as a `[paste #1 +40 lines]` chip; the agent still gets the full text.", "paste chip",
@@ -114,7 +126,7 @@
         tweak("showBackgroundTasks", "toggle", "Background tasks", "Running jobs, the agent's wait, and recent outcomes. Hiding this card never stops tasks.", "activity async bash eval task jobs background waiting"),
         tweak("showRadar", "toggle", "Agent radar", "What the agent is doing right now.", "activity"),
         tweak("showSubagents", "toggle", "Subagents", "Running and finished subagents of this tab.", "tasks"),
-        tweak("showChanges", "toggle", "Changes", "Show the PR for this project's current branch. Off also stops PR monitoring and turns off Auto-fix; enabling this card does not enable Auto-fix.", "github pull request pr auto fix ci checks review"),
+        tweak("showChanges", "toggle", "Changes", "Show local changes and the PR for this project's current branch. PR monitoring needs the GitHub CLI (`gh`), signed in with `gh auth login`; without it, the card appears only for local changes. Off also stops PR monitoring and turns off Auto-fix; enabling this card does not enable Auto-fix.", "github pull request pr auto fix ci checks review gh cli"),
         tweak("showEvidence", "toggle", "Evidence", "Acceptance criteria, verification gaps and inspectable proof. Hiding this card does not disable collection; use its Collection control.", "outcomes evidence tests screenshots video artifacts build runtime verification presets collection acceptance"),
         tweak("showMinimap", "toggle", "Minimap", "An overview of the transcript to jump around in.", "overview"),
       ] },
@@ -150,7 +162,7 @@
         custom("goalContinue", "Keep working on a goal", "omp continues an active goal on its own after each turn instead of waiting for you. Costs tokens while unattended.", "goal auto continue"),
       ] },
       { name: "omp behaviour", rows: [
-        custom("contextPolicy", "Context and compaction", "Adjust the selected model's target here or directly in the Context ring.", "compaction context window threshold budget percentage percent model handoff tokens profile"),
+        custom("contextPolicy", "Context and compaction", "Adjust auto-compaction and the selected model's target here or directly in the Context ring. With auto-compaction off, run `/compact` yourself.", "compaction context window threshold budget percentage percent model handoff tokens profile"),
         tweak("autoRetry", "toggle", "Retry failed requests", "omp retries a request the provider refused or dropped, with a retry row you can stop.", "retry error rate limit"),
       ] },
     ] },
@@ -227,7 +239,7 @@
       const stepped = row.min + Math.round((n - row.min) / row.step) * row.step;
       return Math.min(row.max, Math.max(row.min, stepped));
     }
-    if (row.type === "seg") return row.options.some(o => o.value === v) ? v : fallback;
+    if (row.options) return row.options.some(o => o.value === v) ? v : fallback;
     if (row.type === "toggle") return typeof v === "boolean" ? v : fallback;
     return v ?? fallback;
   }

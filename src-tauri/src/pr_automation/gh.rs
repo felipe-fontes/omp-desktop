@@ -1,23 +1,51 @@
-//! Bounded, supervised `gh api graphql` execution. No project-provided
-//! executable or API endpoint is ever used.
-use std::io::Read;
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+//! Bounded, supervised `gh api` execution (GraphQL, and one REST list). No
+//! project-provided executable or API endpoint is ever used.
+use std::path::PathBuf;
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::child_path::{child_path_dirs, locate_program, TrustedProgram};
+use crate::child_path::{locate_program, TrustedProgram};
+use crate::child_run::{collect, WaitError};
 use crate::supervisor::ProcessSupervisor;
 
 const OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
+/// How much of gh's stderr is kept (the tail) for the error message.
 const ERROR_LIMIT: usize = 16 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(20);
+/// gh's documented exit code for "authentication required".
+const AUTH_REQUIRED_EXIT: i32 = 4;
+const SIGNED_OUT: &str =
+    "GitHub CLI is not signed in. Run \"gh auth login\" in a terminal, then return to the app.";
+const SIZE_ERROR: &str = "gh output exceeded its size limit";
+const TIMED_OUT: &str = "gh request timed out";
 
 pub(super) struct Gh(TrustedProgram);
 
 impl Gh {
-    pub(super) fn locate() -> Result<Self, String> {
-        locate_program(&child_path_dirs(), "gh").map(Self)
+    pub(super) fn locate_in(dirs: &[PathBuf]) -> Result<Self, String> {
+        locate_program(dirs, "gh").map(Self)
+    }
+
+    /// `gh api <endpoint>` against github.com, whatever the environment
+    /// says: `GH_REPO` would redirect `{owner}` placeholders, and
+    /// `GH_DEBUG`, `CLICOLOR_FORCE` and `GH_FORCE_TTY` mix logs or ANSI
+    /// colour into the JSON even when it goes to a pipe.
+    fn api(&self, endpoint: &str, method: &str) -> Command {
+        let mut cmd = Command::new(&self.0.binary);
+        cmd.env("PATH", &self.0.path)
+            .env_remove("GH_REPO")
+            .env_remove("GH_DEBUG")
+            .env_remove("CLICOLOR_FORCE")
+            .env_remove("GH_FORCE_TTY")
+            .args([
+                "api",
+                endpoint,
+                "--hostname",
+                "github.com",
+                "--method",
+                method,
+            ]);
+        cmd
     }
 
     pub(super) fn query(
@@ -25,25 +53,29 @@ impl Gh {
         query: &str,
         variables: &[(&str, &str)],
     ) -> Result<serde_json::Value, String> {
-        let mut cmd = Command::new(&self.0.binary);
-        cmd.env("PATH", &self.0.path)
-            .env_remove("GH_REPO")
-            .env_remove("GH_DEBUG")
-            .args([
-                "api",
-                "graphql",
-                "--hostname",
-                "github.com",
-                "--method",
-                "POST",
-                "-f",
-            ])
-            .arg(format!("query={query}"));
+        let mut cmd = self.api("graphql", "POST");
+        cmd.arg("-f").arg(format!("query={query}"));
         for (key, value) in variables {
             // -f treats values literally, unlike -F's @file interpretation.
             cmd.arg("-f").arg(format!("{key}={value}"));
         }
         parse_response(&run(&mut cmd, TIMEOUT)?)
+    }
+
+    /// The REST list of open PRs into `repository` (a validated GitHub
+    /// `owner/name`) whose head is `head` (`owner:branch`), up to 100. For a
+    /// GET, gh URL-encodes the `-f` fields into the query string.
+    pub(super) fn open_pulls(
+        &self,
+        repository: &str,
+        head: &str,
+    ) -> Result<serde_json::Value, String> {
+        let mut cmd = self.api(&format!("repos/{repository}/pulls"), "GET");
+        cmd.args(["-f", "state=open", "-f"])
+            .arg(format!("head={head}"))
+            .args(["-f", "per_page=100"]);
+        serde_json::from_slice(&run(&mut cmd, TIMEOUT)?)
+            .map_err(|_| "GitHub returned malformed JSON".to_string())
     }
 }
 
@@ -64,40 +96,21 @@ fn parse_response(bytes: &[u8]) -> Result<serde_json::Value, String> {
     Ok(value)
 }
 
-fn drain(
-    pipe: impl Read + Send + 'static,
-    limit: usize,
-    overflow: Arc<AtomicBool>,
-) -> Result<mpsc::Receiver<std::io::Result<Vec<u8>>>, String> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::Builder::new()
-        .name("pr-gh-drain".into())
-        .spawn(move || {
-            let mut pipe = pipe;
-            let mut result = Vec::new();
-            let mut chunk = [0; 8192];
-            let read = loop {
-                match pipe.read(&mut chunk) {
-                    Ok(0) => break Ok(result),
-                    Ok(n) if result.len() + n > limit => {
-                        overflow.store(true, Ordering::Relaxed);
-                        break Ok(result);
-                    }
-                    Ok(n) => result.extend_from_slice(&chunk[..n]),
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(e) => break Err(e),
-                }
-            };
-            let _ = tx.send(read);
-        })
-        .map_err(|e| format!("could not start GitHub output reader: {e}"))?;
-    Ok(rx)
-}
-
-fn terminate(supervisor: &ProcessSupervisor, child: &mut std::process::Child) {
-    supervisor.kill_tree();
-    let _ = child.kill();
-    let _ = child.wait();
+/// The error for a gh run that exited unsuccessfully. A signed-out gh (exit
+/// 4, or a revoked token's `HTTP 401`) gets one readable message instead of
+/// gh's own hint; anything else keeps a redacted start of gh's stderr.
+fn failure(status: ExitStatus, stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    if status.code() == Some(AUTH_REQUIRED_EXIT) || text.contains("HTTP 401") {
+        return SIGNED_OUT.to_string();
+    }
+    let redacted = crate::widgets::redact::redact_secrets(text.trim());
+    let preview = crate::text::prefix_within(&redacted, 1024);
+    if preview.is_empty() {
+        format!("gh failed ({status})")
+    } else {
+        format!("gh failed ({status}): {preview}")
+    }
 }
 
 fn run(cmd: &mut Command, timeout: Duration) -> Result<Vec<u8>, String> {
@@ -109,60 +122,29 @@ fn run(cmd: &mut Command, timeout: Duration) -> Result<Vec<u8>, String> {
     let mut child =
         crate::spawn_gate::spawn(cmd).map_err(|e| format!("could not start gh: {e}"))?;
     let supervisor = ProcessSupervisor::attach(&child);
-    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
-        terminate(&supervisor, &mut child);
-        return Err("could not capture gh output".into());
-    };
-    let overflow = Arc::new(AtomicBool::new(false));
-    let out = drain(stdout, OUTPUT_LIMIT, Arc::clone(&overflow))
-        .inspect_err(|_| terminate(&supervisor, &mut child))?;
-    let err = drain(stderr, ERROR_LIMIT, Arc::clone(&overflow))
-        .inspect_err(|_| terminate(&supervisor, &mut child))?;
-    let status = loop {
-        if overflow.load(Ordering::Relaxed) {
-            terminate(&supervisor, &mut child);
-            return Err("gh output exceeded its size limit".into());
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= deadline => {
-                terminate(&supervisor, &mut child);
-                return Err("gh request timed out".into());
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-            Err(e) => {
-                terminate(&supervisor, &mut child);
-                return Err(format!("could not wait for gh: {e}"));
-            }
-        }
-    };
-    supervisor.kill_tree(); // Do not let descendants keep the pipes open.
-    let receive = |rx: mpsc::Receiver<std::io::Result<Vec<u8>>>| {
-        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .map_err(|_| "gh output timed out".to_string())?
-            .map_err(|e| format!("could not read gh output: {e}"))
-    };
-    let stdout = receive(out)?;
-    let stderr = receive(err)?;
-    if overflow.load(Ordering::Relaxed) {
-        return Err("gh output exceeded its size limit".into());
+    let done = collect(
+        &mut child,
+        &supervisor,
+        OUTPUT_LIMIT,
+        ERROR_LIMIT,
+        deadline,
+        |_| Ok(()),
+    )
+    .map_err(|e| match e {
+        WaitError::Overflow => SIZE_ERROR.to_string(),
+        WaitError::TimedOut => TIMED_OUT.to_string(),
+        WaitError::Failed(e) => format!("gh: {e}"),
+    })?;
+    if !done.status.success() {
+        return Err(failure(done.status, &done.stderr));
     }
-    if !status.success() {
-        let text = String::from_utf8_lossy(&stderr);
-        let redacted = crate::widgets::redact::redact_secrets(text.trim());
-        let preview = crate::text::prefix_within(&redacted, 1024);
-        return Err(if preview.is_empty() {
-            format!("gh failed ({status})")
-        } else {
-            format!("gh failed ({status}): {preview}")
-        });
-    }
-    Ok(stdout)
+    Ok(done.stdout)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::shell;
 
     #[test]
     fn rejects_partial_error_and_malformed_graphql_responses() {
@@ -176,30 +158,68 @@ mod tests {
         assert!(parse_response(br#"{"data":{"repository":null},"errors":[]}"#).is_ok());
     }
 
-    #[cfg(unix)]
+    /// A child that writes `stderr` (plain words) and exits with `code`.
+    fn failing(stderr: &str, code: i32) -> Command {
+        #[cfg(unix)]
+        let script = format!("echo {stderr} >&2; exit {code}");
+        #[cfg(windows)]
+        let script = format!("echo {stderr} 1>&2 & exit {code}");
+        shell(&script)
+    }
+
     #[test]
     fn captures_success_and_reports_failure() {
-        let mut ok = Command::new("/bin/sh");
-        ok.args(["-c", "printf hello"]);
-        assert_eq!(run(&mut ok, Duration::from_secs(2)).unwrap(), b"hello");
-        let mut fail = Command::new("/bin/sh");
-        fail.args(["-c", "echo denied >&2; exit 2"]);
-        assert!(run(&mut fail, Duration::from_secs(2))
-            .unwrap_err()
-            .contains("denied"));
+        let out = run(&mut shell("echo hello"), Duration::from_secs(10)).unwrap();
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "hello");
+        let err = run(&mut failing("denied", 2), Duration::from_secs(10)).unwrap_err();
+        assert!(err.contains("denied"), "{err}");
+        assert_ne!(err, SIGNED_OUT);
+    }
+
+    #[test]
+    fn signed_out_gh_gets_one_readable_error() {
+        // gh's own exit code for "authentication required"…
+        let mut signed_out = failing("To get started with GitHub CLI run gh auth login", 4);
+        assert_eq!(
+            run(&mut signed_out, Duration::from_secs(10)).unwrap_err(),
+            SIGNED_OUT
+        );
+        // …and a revoked or invalid token, which gh reports as a plain failure.
+        let mut revoked = failing("HTTP 401: Bad credentials", 1);
+        assert_eq!(
+            run(&mut revoked, Duration::from_secs(10)).unwrap_err(),
+            SIGNED_OUT
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn times_out_and_caps_output() {
-        let mut slow = Command::new("/bin/sh");
-        slow.args(["-c", "sleep 5"]);
+        let mut slow = shell("sleep 5");
         assert!(run(&mut slow, Duration::from_millis(100))
             .unwrap_err()
             .contains("timed out"));
-        let mut flood = Command::new("/bin/sh");
-        flood.args(["-c", "yes x"]);
+        let mut flood = shell("yes x");
         assert!(run(&mut flood, Duration::from_secs(5))
+            .unwrap_err()
+            .contains("size limit"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn times_out_and_caps_output() {
+        let start = Instant::now();
+        let mut slow = shell("ping -n 30 127.0.0.1");
+        assert!(run(&mut slow, Duration::from_millis(500))
+            .unwrap_err()
+            .contains("timed out"));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must not wait for ping"
+        );
+        let line = "x".repeat(1000);
+        let mut flood = shell(&format!("for /L %i in (1,1,100000) do @echo {line}"));
+        assert!(run(&mut flood, Duration::from_secs(20))
             .unwrap_err()
             .contains("size limit"));
     }

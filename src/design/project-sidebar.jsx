@@ -12,14 +12,9 @@
 const { Icon, TabRunDot, TabLabel, TabForkMark, RenameField, WorktreeIndicator } = window;
 const { groupTabs, groupRunState, groupTarget, membersNewestFirst, basename, parentName } = window.OMP_PROJECT_NAV;
 
-// Same guard as chrome.jsx's copy: the registry may not be loaded.
-function sidebarHint(actionId, fallback) {
-  return window.OMP_KEYMAP ? window.OMP_KEYMAP.hintFor(actionId) : fallback;
-}
-
 function ProjectSidebar({
   tabs, activeId, recents, profileLabel, prStatuses = {}, chats = [], chatsLoading, chatsError,
-  onSelectTab, onCloseTab, onRenameTab, onNewInProject, onConfigureProject, onOpenRecent, onForgetRecent, onOpenFolder, onHide, onReorder,
+  onSelectTab, onCloseTab, onRenameTab, onNewInProject, onConfigureProject, onOpenRecent, onForgetRecent, onOpenFolder, onReorder,
   onNewChat, onOpenChat, onManageChat,
 }) {
   // Group keys the user folded. Not persisted: tab ids (and so pathless
@@ -52,16 +47,10 @@ function ProjectSidebar({
   // Drag to reorder (#40), the same lists as the tab bar's: projects (a
   // project's rows move as one block), and members within their project.
   const reorder = window.useDragReorder(onReorder);
-  const hideHint = sidebarHint("desktop.sidebar.toggle", "Ctrl+B");
 
   return (
     <aside className="project-sidebar" aria-label="Chats and projects">
-      <div className="psb-head">
-        <span>workspace</span>
-        <button className="psb-act" title={`hide sidebar (${hideHint})`} onClick={onHide}>
-          <Icon name="sidebar" size={11} />
-        </button>
-      </div>
+      <div className="psb-head">workspace</div>
 
       <div className="psb-scroll" onPointerDown={reorder.onPointerDown}>
         <div className="psb-section">chats</div>

@@ -1,63 +1,52 @@
 //! Read-only GitHub.com PR feedback for a tab's configured upstream branch.
 //! Every GitHub connection is capped and rejected if incomplete. No URLs
 //! returned by GitHub are fetched; `gh` always talks to github.com itself.
-mod discovery;
 mod feedback;
 mod gh;
 mod git;
 #[cfg(test)]
 mod tests;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::State;
 
+use crate::child_path::child_path_dirs;
 use crate::terminal::TerminalManager;
 
-use discovery::select_pr;
-#[cfg(test)]
-use feedback::failed_check;
-use feedback::parse_feedback;
-#[cfg(test)]
-use git::github_repo;
-use git::{contextual_branch, local_branch, LocalBranch};
+use feedback::{parse_feedback, select_pr};
+use git::{local_branch, LocalBranch};
 
-const FIND_QUERY: &str = r"query($owner:String!, $repo:String!, $ref:String!, $branch:String!, $head:String!) {
+/// The upstream repository as GitHub resolves it (renames and transfers
+/// followed), its fork parent, and the PRs associated with the upstream
+/// branch's head commit. Open PRs from the head owner's branch are listed
+/// per repository over REST ([`gh::Gh::open_pulls`]) instead: GraphQL's
+/// `pullRequests(headRefName:)` lists every fork's PRs with that branch name.
+const FIND_QUERY: &str = r"query($owner:String!, $repo:String!, $ref:String!) {
   repository(owner:$owner, name:$repo) {
-    isFork nameWithOwner
-    pullRequests(first:100, states:[OPEN, MERGED, CLOSED], headRefName:$branch) {
-      pageInfo { hasNextPage } nodes { ...PrIdentity }
-    }
-    parent {
-      nameWithOwner
-      pullRequests(first:100, states:[OPEN, MERGED, CLOSED], headRefName:$branch) {
-        pageInfo { hasNextPage } nodes { ...PrIdentity }
-      }
-    }
-    ref(qualifiedName:$ref) { target { ... on Commit { oid } } }
-    object(expression:$head) { ... on Commit { oid
+    nameWithOwner isFork
+    parent { nameWithOwner }
+    ref(qualifiedName:$ref) { target { ... on Commit { oid
       associatedPullRequests(first:100) {
-        pageInfo { hasNextPage } nodes { ...PrIdentity }
+        pageInfo { hasNextPage }
+        nodes { url id state headRefOid headRefName headRepository { nameWithOwner } }
       }
-    } }
+    } } }
   }
-}
-fragment PrIdentity on PullRequest {
-  id state headRefOid headRefName headRepository { nameWithOwner }
-  repository { nameWithOwner }
 }";
 
 const FEEDBACK_QUERY: &str = r"query($id:ID!) {
   node(id:$id) { ... on PullRequest {
-    id number url title repository { nameWithOwner } additions deletions isDraft
+    number url title repository { nameWithOwner } additions deletions isDraft
     state headRefOid headRefName headRepository { nameWithOwner }
     reviewThreads(first:100) { pageInfo { hasNextPage } nodes {
-      id isResolved isOutdated comments(last:1) { nodes { updatedAt url } }
+      id isResolved isOutdated
+      comments(last:100) { pageInfo { hasPreviousPage } nodes { updatedAt viewerDidAuthor } }
     } }
     commits(last:1) { nodes { commit {
-      oid statusCheckRollup { state contexts(first:100) { pageInfo { hasNextPage } nodes {
+      oid statusCheckRollup { contexts(first:100) { pageInfo { hasNextPage } nodes {
         __typename
         ... on CheckRun { id name status conclusion detailsUrl startedAt completedAt }
         ... on StatusContext { id context state targetUrl createdAt }
@@ -65,24 +54,6 @@ const FEEDBACK_QUERY: &str = r"query($id:ID!) {
     } } }
   } }
 }";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "UPPERCASE")]
-enum PrState {
-    Open,
-    Merged,
-    Closed,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-enum ChecksState {
-    None,
-    Pending,
-    Success,
-    Failure,
-    Unknown,
-}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -94,83 +65,106 @@ pub struct PrAutomationSnapshot {
     additions: u64,
     deletions: u64,
     is_draft: bool,
-    state: PrState,
-    checks_state: ChecksState,
     head: String,
     branch: String,
+    /// Every check of the head commit, in GitHub's order, for the card.
+    checks: Vec<CiCheck>,
+    /// The failed ones' Auto-fix identities.
     failed_checks: Vec<FailedCheck>,
     threads: Vec<ReviewThread>,
 }
 
+/// Where a check is, as the card draws it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum CheckState {
+    /// Not started: queued, requested, waiting, pending; a commit status
+    /// that is expected but not reported yet.
+    Queued,
+    Running,
+    Success,
+    /// Failed, timed out, needs action or never started.
+    Failure,
+    /// Neutral, skipped, cancelled or stale.
+    Neutral,
+}
+
+#[derive(Debug, Serialize)]
+struct CiCheck {
+    name: String,
+    state: CheckState,
+    /// Its CI page, or the PR when GitHub has none.
+    url: String,
+}
+
+/// A failed check's Auto-fix identity: node id plus attempt timestamps.
 #[derive(Debug, Serialize)]
 struct FailedCheck {
     id: String,
-    name: String,
-    url: String,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ReviewThread {
     id: String,
+    /// When someone other than the viewer last commented, so the agent's
+    /// own replies do not make the thread new again.
     updated_at: String,
-    url: String,
 }
 
-/// Independent PR discovery and local worktree outcomes for a tab.
+/// A failed lookup, as the webview receives it. `ghMissing` marks the one
+/// failure for which the Changes card is hidden instead of showing an error:
+/// there is no GitHub CLI to ask. `retryable` marks transient lag (GitHub
+/// not yet showing a push, the branch moving mid-read), which the webview
+/// retries with a backoff instead of pausing Auto-fix.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ChangesSnapshot {
-    snapshot: Option<PrAutomationSnapshot>,
-    discovery_error: Option<String>,
-    local_changes: Option<crate::git_browser::LocalChanges>,
-    local_error: Option<String>,
+pub struct LookupError {
+    pub(crate) message: String,
+    gh_missing: bool,
+    retryable: bool,
 }
 
+impl LookupError {
+    /// A failure that clears up once GitHub or the checkout settles.
+    fn transient(message: &str) -> Self {
+        Self {
+            message: message.to_owned(),
+            gh_missing: false,
+            retryable: true,
+        }
+    }
+}
+
+impl From<String> for LookupError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            gh_missing: false,
+            retryable: false,
+        }
+    }
+}
+
+/// Local working-tree changes are independent of GitHub discovery and gh.
 #[tauri::command]
 pub async fn changes_snapshot(
     session_id: String,
     terminal: State<'_, Arc<TerminalManager>>,
-) -> Result<ChangesSnapshot, String> {
+) -> Result<Option<crate::git_browser::LocalChanges>, String> {
     let folder = terminal
         .folder(&session_id)
         .filter(|p| !p.as_os_str().is_empty())
         .ok_or_else(|| "Tab has no project folder".to_string())?;
-    crate::off_ipc(move || changes(&folder)).await
+    crate::off_ipc(move || crate::git_browser::change_summary(&folder)).await?
 }
 
-fn changes(folder: &Path) -> ChangesSnapshot {
-    collect_changes(
-        || contextual_branch(folder)?.map_or(Ok(None), |local| snapshot_for_local(folder, local)),
-        || crate::git_browser::change_summary(folder),
-    )
-}
-
-fn collect_changes(
-    discovery: impl FnOnce() -> Result<Option<PrAutomationSnapshot>, String>,
-    local: impl FnOnce() -> Result<Option<crate::git_browser::LocalChanges>, String>,
-) -> ChangesSnapshot {
-    let (snapshot, discovery_error) = match discovery() {
-        Ok(snapshot) => (snapshot, None),
-        Err(error) => (None, Some(error)),
-    };
-    let (local_changes, local_error) = match local() {
-        Ok(changes) => (changes, None),
-        Err(error) => (None, Some(error)),
-    };
-    ChangesSnapshot {
-        snapshot,
-        discovery_error,
-        local_changes,
-        local_error,
-    }
-}
 /// Snapshot the project registered for this tab, never a frontend-supplied path.
 #[tauri::command]
 pub async fn pr_automation_snapshot(
     session_id: String,
     terminal: State<'_, Arc<TerminalManager>>,
-) -> Result<Option<PrAutomationSnapshot>, String> {
+) -> Result<Option<PrAutomationSnapshot>, LookupError> {
     let folder = terminal
         .folder(&session_id)
         .filter(|p| !p.as_os_str().is_empty())
@@ -178,50 +172,42 @@ pub async fn pr_automation_snapshot(
     crate::off_ipc(move || snapshot(&folder)).await?
 }
 
-pub fn snapshot(folder: &Path) -> Result<Option<PrAutomationSnapshot>, String> {
-    snapshot_for_local(folder, local_branch(folder)?)
+pub fn snapshot(folder: &Path) -> Result<Option<PrAutomationSnapshot>, LookupError> {
+    snapshot_in(&child_path_dirs(), folder)
 }
 
-fn snapshot_for_local(
+/// [`snapshot`] with `gh` looked up in `dirs`.
+fn snapshot_in(
+    dirs: &[PathBuf],
     folder: &Path,
-    local: LocalBranch,
-) -> Result<Option<PrAutomationSnapshot>, String> {
-    with_local_revalidation(
-        &local,
-        || {
-            let gh = gh::Gh::locate()?;
-            let remote_branch = local
-                .remote_ref
-                .strip_prefix("refs/heads/")
-                .ok_or_else(|| "Invalid upstream branch".to_string())?;
-            let result = gh.query(
-                FIND_QUERY,
-                &[
-                    ("owner", &local.owner),
-                    ("repo", &local.repo),
-                    ("ref", &local.remote_ref),
-                    ("branch", remote_branch),
-                    ("head", &local.head),
-                ],
-            )?;
-            let Some(selected) = select_pr(&result, &local)? else {
-                return Ok(None);
-            };
-            let result = gh.query(FEEDBACK_QUERY, &[("id", &selected.id)])?;
-            parse_feedback(&result, &local, &selected).map(Some)
-        },
-        || local_branch(folder),
-    )
-}
-
-fn with_local_revalidation<T>(
-    local: &LocalBranch,
-    read: impl FnOnce() -> Result<T, String>,
-    reread: impl FnOnce() -> Result<LocalBranch, String>,
-) -> Result<T, String> {
-    let result = read();
-    if reread()? != *local {
-        return Err("Git branch, HEAD, or upstream changed while loading PR feedback".into());
+) -> Result<Option<PrAutomationSnapshot>, LookupError> {
+    // First, so a missing gh reads as such in any folder, GitHub or not.
+    let gh = gh::Gh::locate_in(dirs).map_err(|message| LookupError {
+        message,
+        gh_missing: true,
+        retryable: false,
+    })?;
+    let local = local_branch(folder)?;
+    let result = gh.query(
+        FIND_QUERY,
+        &[
+            ("owner", &local.owner),
+            ("repo", &local.repo),
+            ("ref", &local.remote_ref),
+        ],
+    )?;
+    let Some(pr) = select_pr(&result, &local, |repository, head| {
+        gh.open_pulls(repository, head)
+    })?
+    else {
+        return Ok(None);
+    };
+    let result = gh.query(FEEDBACK_QUERY, &[("id", &pr.id)])?;
+    let snapshot = parse_feedback(&result, &local, &pr)?;
+    if local_branch(folder)? != local {
+        return Err(LookupError::transient(
+            "Git branch, HEAD, or upstream changed while loading PR feedback",
+        ));
     }
-    result
+    Ok(Some(snapshot))
 }

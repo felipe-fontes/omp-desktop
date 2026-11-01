@@ -26,6 +26,7 @@
   const TASKS = window.OMP_BACKGROUND_TASKS;
   const TASK_EVENTS = new Set(["subagent_lifecycle", "subagent_progress", "tool_execution_start", "tool_execution_update", "tool_execution_end", "message_end", "session_settled"]);
   const EXT = window.OMP_EXT_WIDGETS;
+  const DELTA = window.OMP_STREAM_DELTA;
   const LIVE = window.OMP_LIVE_VOICE;
   const DICTATION = LIVE.DICTATION;
   const CACHE = window.OMP_CACHE_USAGE;
@@ -104,11 +105,20 @@
     extWidgets:     EXT.EMPTY,
     liveVoice:      LIVE.EMPTY,
     dictation:      DICTATION.EMPTY,
+    // Whether this tab's profile has omp's Codex login, which live voice
+    // needs (`_refreshCodexLogin`); null until known.
+    codexLogin:     null,
   };
 
   // Cancels in-flight reads and sends when the tab's conversation is replaced.
   let sessionContext = {};
   let streamingBubble = null;
+  // The streaming message's content, rebuilt from delta frames
+  // (app/stream-delta.js `accFor`): `{ mid, blocks, seed }` — omp's
+  // `messageId`, its blocks so far, and the `streamSnapshot` they started
+  // from (or null). Kept off the bubble, which the transcript (and the
+  // phone) carries.
+  let streamAcc = null;
   let activeToolCards = new Map();    // toolCallId → message index
   const ASK_FLUSH_MS = 150;         // upper bound on how long an ask may stay buffered
   // Ask bubbles (and auto-approval rows) awaiting a flush into
@@ -125,6 +135,10 @@
   // after a dropped replay): replayed and buffered setStatus / setWidget
   // frames at or below it are already in `state.extWidgets`. 0 = none.
   let extSnapshotSeq  = 0;
+  // The backend's copy of the message streaming when a dropped replay ran
+  // (`streaming_message`: `{ messageId, seq, message }`), or null. Its frames
+  // at or below `seq` are already in it.
+  let streamSnapshot  = null;
   // The user's `abort` is in flight — set by `abort()`, cleared by its
   // id-less response. omp pauses an active goal on abort, and that pause is
   // labelled as the user's stop (app/goal.js `fromFrame`).
@@ -328,6 +342,10 @@
   // Completed captures wait here until the mounted composer consumes them;
   // React may coalesce snapshots across a tab switch or several captures.
   let _dictationCompleted = [];
+  // The capture the user stopped with "send on stop" on: its completion is
+  // tagged `send`, so the composer sends that tab's draft once it holds the
+  // text. Stops for a tab switch, Settings or a close never set it.
+  let _dictationSendCapture = null;
   let _nextCmdId = 1;
   // Timeout for a short interactive command a user is waiting on.
   const QUICK_CMD_TIMEOUT_MS = 15000;
@@ -445,6 +463,7 @@
       extWidgets:      state.extWidgets,
       liveVoice:       state.liveVoice,
       dictation:       state.dictation,
+      codexLogin:      state.codexLogin,
       dictationCompleted: _dictationCompleted,
       // Tab list — derived from session registry, not per-session state.
       // runState: active tab reads live state; background tabs read their
@@ -871,6 +890,19 @@
     };
   }
 
+  // The bubble of omp message `mid` starting to stream (`streamAcc` holds its
+  // content): empty, or as far as the backend's copy got when a dropped
+  // replay loaded one for it (`streamSnapshot`).
+  function _startStreamingBubble(mid, ts, time) {
+    streamAcc = DELTA.accFor(null, mid, streamSnapshot, lastSeq).acc;
+    return {
+      kind: "assistant", time, ts,
+      ...DELTA.view(streamAcc.blocks),
+      streaming: true,
+      model: state.model?.name ?? "–",
+    };
+  }
+
   // Show a run's final failure (`make(previous)` builds it, app/turn-status.js)
   // on the bubble its failed message created: the one with the failed
   // message's `ts` when the caller knows it — even one still marked
@@ -1046,7 +1078,7 @@
       if (!original || !sessionRegistry.has(original.id)) return;
       sessionRegistry.set(original.id, original);
       if (temporary) {
-        if (!await window.OMP_BRIDGE.closeSession(original.id)) throw new Error("Temporary chat could not be closed");
+        if (!await window.OMP_BRIDGE.closeSession(original.id, { throwOnFailure: true })) throw new Error("Temporary chat could not be closed");
       } else if (stopped || forked) {
         const restored = await _respawnSession(original.id, { profile: original.profile, resume: original.sessionFile, reason: "Chat restoration" });
         if (!restored.ok) throw new Error(restored.error);
@@ -1071,7 +1103,7 @@
       if (!promote) {
         assertIdle();
         for (const tab of _sessionsView().filter(t => t.scratchId === id)) {
-          if (!await window.OMP_BRIDGE.closeSession(tab.id)) throw new Error("Chat could not be closed");
+          if (!await window.OMP_BRIDGE.closeSession(tab.id, { throwOnFailure: true })) throw new Error("Chat could not be closed");
         }
         await window.__TAURI__.core.invoke("scratch_delete", { id });
         _scratchKeys.delete(id);
@@ -1226,9 +1258,12 @@
       extWidgets:    EXT.EMPTY,
       liveVoice:     keepVoice ? state.liveVoice : LIVE.EMPTY,
       dictation:     keepVoice ? state.dictation : DICTATION.EMPTY,
+      codexLogin:    keepVoice ? state.codexLogin : null,
     });
     sessionContext = {};
     streamingBubble = null;
+    streamAcc       = null;
+    streamSnapshot  = null;
     lastTurnOk  = true;
     pendingAskBubbles = [];
     _disarmAskFlush();
@@ -1285,9 +1320,11 @@
       extWidgets:    state.extWidgets,
       liveVoice:     state.liveVoice,
       dictation:     state.dictation,
+      codexLogin:    state.codexLogin,
       // volatile vars
       sessionContext,
       streamingBubble,
+      streamAcc,
       activeToolCards: new Map(activeToolCards),
       tpsSamples:    [...tpsSamples],
       turnStartTime,
@@ -1333,9 +1370,11 @@
       extWidgets:    snap.extWidgets ?? EXT.EMPTY,
       liveVoice:     snap.liveVoice ?? LIVE.EMPTY,
       dictation:     snap.dictation ?? DICTATION.EMPTY,
+      codexLogin:    snap.codexLogin ?? null,
     });
     sessionContext = snap.sessionContext ?? {};
     streamingBubble = snap.streamingBubble;
+    streamAcc       = snap.streamAcc ?? null;
     activeToolCards = snap.activeToolCards;
     tpsSamples      = snap.tpsSamples;
     turnStartTime   = snap.turnStartTime;
@@ -1422,6 +1461,7 @@
     // (never lost, never double-processed) — drained once replay is applied.
     _replayBuffer = [];
     extSnapshotSeq = 0;
+    streamSnapshot = null;
 
     // Each callback checks it still belongs to this activation: an unlisten
     // only settles after an IPC round-trip, and until it does a superseded
@@ -1497,6 +1537,11 @@
         const evidence = await _invokeSafe("evidence_snapshot", { sessionId: id }, null);
         if (!current()) return;
         if (evidence) _evidenceController().restore(evidence);
+        // The message streaming now: omp sends only increments, so its
+        // bubble cannot be rebuilt from what is left of the journal.
+        const streaming = await _invokeSafe("streaming_message", { sessionId: id }, null);
+        if (!current()) return; // superseded by a newer switch, or detached
+        streamSnapshot = streaming;
       }
       if (replay.backgroundTasks) _dispatchEnvelope(replay.backgroundTasks);
       for (const ev of replay.events) _dispatchEnvelope(ev);
@@ -1505,7 +1550,7 @@
       // will never be swallowed, and nothing else would release the flag:
       // refinements would stay blocked for good. The replayed events above
       // had their chance to swallow it; if the note is in fact still to
-      // come (generation outlasting 256 lines of output), the cost is one
+      // come (generation outlasting the journal's window), the cost is one
       // plumbing line in the transcript.
       if (replay.dropped && sessionRegistry.get(id)?.autoRenameInFlight) {
         sessionRegistry.set(id, { ...sessionRegistry.get(id), autoRenameInFlight: false });
@@ -1691,11 +1736,14 @@
       // Replacing a racing respawn's handle must not orphan its listener.
       _dropGitListener(id);
       gitListeners.set(id, unlisten);
-      const branch = await window.__TAURI__.core
+      const watch = await window.__TAURI__.core
         .invoke("start_git_watch", { sessionId: id, path: actualCwd })
         .catch(() => null);
       const entry = sessionRegistry.get(id);
-      if (entry && !observed) sessionRegistry.set(id, { ...entry, branch: branch ?? null });
+      if (entry) sessionRegistry.set(id, {
+        ...entry, repoRoot: watch?.root ?? null,
+        ...(!observed ? { branch: watch?.branch ?? null } : {}),
+      });
       if (!entry) {
         _dropGitListener(id);
         await window.__TAURI__.core.invoke("stop_git_watch", { sessionId: id }).catch(() => {});
@@ -2219,9 +2267,10 @@
     const tabName = name || _tabNameFor(workspaceBinding?.projectPath || cwd, resume ? "resumed" : "new session");
     const color = resume ? "var(--cyan)" : "var(--lilac)";
     // Register in tab list before starting omp so the tab shows immediately.
-    // Register with null branch — chip hidden until git resolves.
+    // Register with null branch — chip hidden until git resolves. `repoRoot`:
+    // the repository's work tree, shared by every tab on a folder of it.
     sessionRegistry.set(id, {
-      id, name: tabName, path: cwd ?? "", color, branch: null, gitRevision: 0, profile, scratchId,
+      id, name: tabName, path: cwd ?? "", color, branch: null, repoRoot: null, gitRevision: 0, profile, scratchId,
       preparing: true, workspace: workspaceBinding,
       // The approval mode `start_session` spawned this tab's current omp
       // with (set by `_spawnSession`); null while no process runs it.
@@ -2781,14 +2830,6 @@
     }
     _agentContextSync().observe(ev);
 
-    if (type === "auto_compaction_start" || type === "auto_compaction_end") {
-      _invalidateContext(null, type === "auto_compaction_start");
-      if (type === "auto_compaction_end") {
-        _send({ type: "get_state" });
-        void _agentContextSync().loadMain().catch(() => {});
-      }
-      return;
-    }
     if (type === "model_changed") {
       _invalidateContext();
       _send({ type: "get_state" });
@@ -2802,6 +2843,7 @@
     }
 
     if (type === "auto_compaction_start") {
+      _invalidateContext(null, true);
       if (!state.messages.some(m => m.kind === "compact" && m.status === "pending")) {
         state.messages = [...state.messages, { kind: "compact", status: "pending", time, automatic: true }];
       }
@@ -2821,8 +2863,10 @@
         if (idx !== -1) state.messages = state.messages.map((m, i) => i === idx ? { ...m, ...row } : m);
         else if (result) state.messages = [...state.messages, row];
       }
+      _invalidateContext(null, false);
       _historyRead = null;
       _send({ type: "get_state" });
+      void _agentContextSync().loadMain().catch(() => {});
       notify();
       return;
     }
@@ -3158,13 +3202,7 @@
           }
         }
       } else if (role === "assistant") {
-        streamingBubble = {
-          kind: "assistant", time, ts,
-          thought: null, lead: null,
-          blocks: [{ type: "text", text: "" }],
-          streaming: true,
-          model: state.model?.name ?? "–",
-        };
+        streamingBubble = _startStreamingBubble(ev.messageId, ts, time);
         state.messages = [...state.messages, streamingBubble];
         notify();
       }
@@ -3172,26 +3210,31 @@
     }
 
     if (type === "message_update") {
-      if (!streamingBubble) return;
-      const msg = ev.message;
-      if (!msg) return;
-
-      const blocks = Array.isArray(msg.content) ? msg.content : [];
-      let thought = null;
-      const designBlocks = [];
-      for (const block of blocks) {
-        if (block.type === "thinking" && block.thinking?.trim()) thought = block.thinking;
-        else if (block.type === "text" && block.text) designBlocks.push({ type: "text", text: block.text });
+      // Delta frames (app/stream-delta.js): `message` carries only the role.
+      const mid = ev.messageId;
+      let changed = false;
+      if (!streamingBubble && streamSnapshot?.messageId === mid) {
+        // The message's start fell out of a dropped replay: show it from the
+        // backend's copy.
+        streamingBubble = _startStreamingBubble(mid, tsOf(streamSnapshot.message), time);
+        state.messages = [...state.messages, streamingBubble];
+        changed = true;
       }
+      if (!streamingBubble) return;
+      // Another message than the bubble's restarts it (lost frames); the
+      // copy, when it is this message's, seeds it. A delta carries no
+      // timestamp, so the bubble takes the copy's `ts`, else keeps its own
+      // until `message_end` (see get_messages).
+      const step = DELTA.accFor(streamAcc, mid, streamSnapshot, lastSeq);
+      if (step.changed && step.acc.seed) streamingBubble.ts = tsOf(step.acc.seed.message) ?? streamingBubble.ts;
+      streamAcc = step.acc;
+      changed = step.changed || changed;
+      if (!step.skip) changed = DELTA.applyEvent(streamAcc.blocks, ev.assistantMessageEvent) || changed;
+      if (!changed) return;
 
-      streamingBubble.thought = thought;
-      streamingBubble.lead    = thought ? "thinking" : null;
-      streamingBubble.blocks  = designBlocks.length > 0 ? designBlocks : [{ type: "text", text: "" }];
-      // The message this bubble shows: after frames were lost, a bubble left
-      // streaming can receive the next message's updates (see get_messages).
-      if (msg.role === "assistant") streamingBubble.ts = tsOf(msg) ?? streamingBubble.ts;
+      Object.assign(streamingBubble, DELTA.view(streamAcc.blocks));
 
-      const updated = { ...streamingBubble, blocks: [...streamingBubble.blocks] };
+      const updated = { ...streamingBubble };
       // Find by streaming flag — indexOf fails after the first update because
       // each update replaces the entry with a new copy; ask bubbles may also
       // sit after the streaming bubble in state.messages.
@@ -3269,6 +3312,10 @@
         }
         streamingBubble = null;
       }
+      // Settled: its rebuilt blocks (a whole file write, image data) and the
+      // backend's copy of it are done with, and no later frame can need them.
+      if (!streamingBubble) streamAcc = null;
+      if (streamSnapshot?.messageId === ev.messageId) streamSnapshot = null;
       // A retried request answered: the retries are over even if more turns
       // follow in this run (app/turn-status.js `retryFinished`). By omp's
       // rule only output counts: after an empty stop omp keeps retrying.
@@ -3673,7 +3720,21 @@
           _agentContextSync().refreshAgents();
           notify();
         }).catch(error => console.warn("[live] subagent snapshot failed:", error));
+        _refreshCodexLogin();
       });
+  }
+
+  // Ask omp whether the active tab's profile has a Codex login. Refreshed on
+  // activation, after a login and after a failed live start (a login can
+  // also end outside the app).
+  function _refreshCodexLogin() {
+    const id = activeSessionId;
+    _sendWithResponse({ type: "get_login_providers" }, QUICK_CMD_TIMEOUT_MS).then(data => {
+      const login = LIVE.codexLogin(data?.providers);
+      if (id !== activeSessionId || login === null || login === state.codexLogin) return;
+      state.codexLogin = login;
+      notify();
+    }, () => {});
   }
 
   // ── Send a command to the active session's omp ────────────────────────────
@@ -4135,6 +4196,26 @@
     return confirmAdmission ? _sendWithResponse(frame).then(() => true) : _send(frame);
   }
 
+  /** A predicate that stays true while `sessionId` is still the selected,
+   *  settled-in tab on the conversation and branch it had at this call: any
+   *  tab switch, respawn, conversation reset or branch change voids a PR
+   *  automation read or send started before it. */
+  function _prAutomationCurrent(sessionId) {
+    const context = sessionContext, switchGen = _switchGen;
+    const branch = sessionRegistry.get(sessionId)?.branch;
+    return () =>
+      !!window.__TAURI__ &&
+      sessionRegistry.has(sessionId) &&
+      sessionId === activeSessionId &&
+      !_replayBuffer &&
+      _switchAwayFrom !== sessionId &&
+      !_respawning.has(sessionId) &&
+      sessionContext === context &&
+      _switchGen === switchGen &&
+      sessionRegistry.get(sessionId)?.branch === branch;
+  }
+
+
   /** A `goal` command's `{goal, state}` result applied to the active tab. */
   function _applyGoalResult(data) {
     const next = GOAL.fromSnapshot(state.goal, data?.state ?? null);
@@ -4173,10 +4254,24 @@
     if (next !== state.liveVoice) { state.liveVoice = next; notify(); }
   }
 
+  // Why the active tab cannot open a microphone now, or null when it can.
+  // `otherBusy`: the other voice mode still holds or is releasing it.
+  function _voiceStartRefusal(otherBusy, otherLabel) {
+    if (!window.__TAURI__ || !activeSessionId || !sessionRegistry.has(activeSessionId)) return "Not connected";
+    if (_replayBuffer || _switchAwayFrom === activeSessionId || _respawning.has(activeSessionId) || _closingVoiceTabs.has(activeSessionId)) return "Tab is not ready";
+    return otherBusy ? `${otherLabel} is active` : null;
+  }
+
+  // A failed live request updates the call only while it is still that call.
+  function _liveRequestFailed(id, gen, type, e) {
+    const error = String(e?.message ?? e);
+    if (id === activeSessionId && gen === _liveGen) _voiceUpdate({ type, error });
+    return { ok: false, error };
+  }
+
   function _liveStart() {
-    if (!window.__TAURI__ || !activeSessionId || !sessionRegistry.has(activeSessionId)) return Promise.resolve({ ok: false, error: "Not connected" });
-    if (_replayBuffer || _switchAwayFrom === activeSessionId || _respawning.has(activeSessionId) || _closingVoiceTabs.has(activeSessionId)) return Promise.resolve({ ok: false, error: "Tab is not ready" });
-    if (state.dictation.active || _dictationStopPending) return Promise.resolve({ ok: false, error: "Voice to text is active" });
+    const refusal = _voiceStartRefusal(state.dictation.active || !!_dictationStopPending, "Voice to text");
+    if (refusal) return Promise.resolve({ ok: false, error: refusal });
     if (state.liveVoice.active) {
       if (_liveStartPending && state.liveVoice.phase !== "stopping") return _liveStartPending.promise;
       return Promise.resolve({ ok: false, error: state.liveVoice.phase === "stopping" ? "Live voice is stopping" : "Live voice is already active" });
@@ -4204,6 +4299,8 @@
       } catch (e) {
         const error = String(e?.message ?? e);
         if (id === activeSessionId && gen === _liveGen) _voiceUpdate({ type: "start_failure", error, paused: wasPaused });
+        // omp's end frame for a missing login cancels this request first.
+        if (id === activeSessionId) _refreshCodexLogin();
         return { ok: false, error: id === activeSessionId && state.liveVoice.error || error };
       } finally {
         if (_liveStartPending === op) _liveStartPending = null;
@@ -4243,9 +4340,7 @@
         _voiceUpdate({ type: "stop_success", paused });
         return { ok: true };
       } catch (e) {
-        const error = String(e?.message ?? e);
-        if (id === activeSessionId && gen === _liveGen) _voiceUpdate({ type: "stop_failure", error });
-        return { ok: false, error };
+        return _liveRequestFailed(id, gen, "stop_failure", e);
       } finally {
         if (_liveStopPending === op) _liveStopPending = null;
       }
@@ -4274,9 +4369,7 @@
         _voiceUpdate({ type: "mute_success", muted: data?.muted });
         return { ok: true };
       } catch (e) {
-        const error = String(e?.message ?? e);
-        if (id === activeSessionId && gen === _liveGen) _voiceUpdate({ type: "mute_failure", error });
-        return { ok: false, error };
+        return _liveRequestFailed(id, gen, "mute_failure", e);
       } finally {
         if (_liveMutePending === op) _liveMutePending = null;
       }
@@ -4303,17 +4396,18 @@
     const next = DICTATION.apply(before, event);
     if (next === before || next.active) return;
     state.dictation = next;
+    const send = before.captureId === _dictationSendCapture;
+    if (send) _dictationSendCapture = null;
     if (next.text && sessionRegistry.has(activeSessionId)) {
-      _dictationCompleted = [..._dictationCompleted, { sessionId: activeSessionId, captureId: before.captureId, text: next.text }];
+      _dictationCompleted = [..._dictationCompleted, { sessionId: activeSessionId, captureId: before.captureId, text: next.text, send }];
     }
     _dictationStartPending?.request?.cancel(next.error || "Voice to text ended");
     notify();
   }
 
   function _dictationStart() {
-    if (!window.__TAURI__ || !activeSessionId || !sessionRegistry.has(activeSessionId)) return Promise.resolve({ ok: false, error: "Not connected" });
-    if (_replayBuffer || _switchAwayFrom === activeSessionId || _respawning.has(activeSessionId) || _closingVoiceTabs.has(activeSessionId)) return Promise.resolve({ ok: false, error: "Tab is not ready" });
-    if (state.liveVoice.active || _liveStopPending) return Promise.resolve({ ok: false, error: "Live conversation is active" });
+    const refusal = _voiceStartRefusal(state.liveVoice.active || !!_liveStopPending, "Live conversation");
+    if (refusal) return Promise.resolve({ ok: false, error: refusal });
     if (state.dictation.active) {
       if (state.dictation.phase === "starting" && _dictationStartPending) return _dictationStartPending.promise;
       return Promise.resolve({ ok: false, error: "Voice to text is already active" });
@@ -4345,10 +4439,13 @@
     return op.promise;
   }
 
-  function _dictationStop() {
+  function _dictationStop(send = false) {
     if (_dictationStopPending) return _dictationStopPending.promise;
     if (!state.dictation.active) return Promise.resolve({ ok: true });
     const id = activeSessionId, captureId = state.dictation.captureId, gen = ++_dictationGen;
+    // Each stop decides: a failed send-stop's tag must not carry over to a
+    // retry that is not the user's (tab switch, Settings).
+    _dictationSendCapture = send ? captureId : null;
     const startHandoff = _dictationStartPending?.request.handedOff;
     _dictationStartPending?.request.cancel("Voice to text was stopped");
     state.dictation = DICTATION.apply(state.dictation, { type: "stop" });
@@ -4381,9 +4478,9 @@
     return op.promise;
   }
 
-  // Both read-only checkout views reject results for a replaced conversation.
+  // Local changes stay independent of GitHub; stale reads never mean clean.
   // Capture identity fields by value: registry entries can mutate during IPC.
-  async function _readCheckout(sessionId, command) {
+  async function _readLocalChanges(sessionId) {
     const owner = sessionRegistry.get(sessionId);
     const { path, branch, profile, sessionFile, processStartedAt, conversationVersion } = owner || {};
     const current = () => {
@@ -4393,9 +4490,20 @@
         entry.profile === profile && entry.sessionFile === sessionFile &&
         entry.processStartedAt === processStartedAt && entry.conversationVersion === conversationVersion;
     };
-    if (!current()) return null;
-    const result = await window.__TAURI__.core.invoke(command, { sessionId });
-    return current() ? result : null;
+    const { STALE } = window.OMP_PR_AUTOMATION;
+    if (!current()) return STALE;
+    const result = await window.__TAURI__.core.invoke("changes_snapshot", { sessionId });
+    return current() ? result : STALE;
+  }
+
+  // Voice spectrum start/stop run one after another (each is an async Rust
+  // command on a worker thread, so they could otherwise finish out of order
+  // and leave the microphone reader running).
+  let _voiceSpectrumChain = Promise.resolve();
+  function _voiceSpectrumCall(cmd, args) {
+    const call = _voiceSpectrumChain.then(() => _invokeResult(cmd, args));
+    _voiceSpectrumChain = call;
+    return call;
   }
 
   // ── OMP_BRIDGE public API ─────────────────────────────────────────────────
@@ -4417,24 +4525,23 @@
     liveStop: () => _liveStop(),
     liveMute: _liveMute,
     dictationStart: _dictationStart,
-    stopActiveVoice() {
-      return state.dictation.active || _dictationStopPending
-        ? _dictationStop()
-        : state.liveVoice.active || _liveStopPending
-          ? _livePause()
-          : Promise.resolve({ ok: true });
-    },
-    dictationStop: _dictationStop,
+    stopActiveVoice() { return state.dictation.active || _dictationStopPending ? _dictationStop() : state.liveVoice.active || _liveStopPending ? _livePause() : Promise.resolve({ ok: true }); },
+    dictationStop: ({ send = false } = {}) => _dictationStop(send),
     ackDictation(captureIds) {
       const ids = new Set(captureIds);
-      const remaining = _dictationCompleted.filter(
-        (item) => !ids.has(item.captureId),
-      );
-      if (remaining.length !== _dictationCompleted.length) {
-        _dictationCompleted = remaining;
-        notify();
-      }
+      const remaining = _dictationCompleted.filter(item => !ids.has(item.captureId));
+      if (remaining.length !== _dictationCompleted.length) { _dictationCompleted = remaining; notify(); }
     },
+    /** The composer's voice spectrum (Rust `voice_spectrum`): an
+     *  analysis-only reader of the default microphone, run while voice
+     *  capture records, `bands` bars wide (8..=128; another count restarts
+     *  it). Start and stop are queued so a stop never overtakes the start
+     *  before it; both resolve to `{ ok, error? }`. */
+    voiceSpectrumStart(bands) { return _voiceSpectrumCall("voice_spectrum_start", { bands }); },
+    voiceSpectrumStop() { return _voiceSpectrumCall("voice_spectrum_stop"); },
+    /** `cb(bands)` per frame (~30/s): as many values 0..255 as the start
+     *  asked for, low to high frequency. Returns `{ stop, ready }`. */
+    onVoiceSpectrum(cb) { return _listen("voice://spectrum", p => cb(p?.bands ?? null)); },
 
     // ── Messaging ────────────────────────────────────────────────────────────
     // The bubble shows at once; omp's echo (`message_start`) ties it to the
@@ -4446,78 +4553,47 @@
     },
     // Monitoring is read-only. Only the selected, fully settled tab may
     // receive remediation; recheck here after the asynchronous GitHub read.
-    prAutomationSnapshot(sessionId) {
-      return _readCheckout(sessionId, "pr_automation_snapshot");
+    // A read the tab can't take now is `OMP_PR_AUTOMATION.STALE`, never
+    // `null`: that is Rust's "no PR", and the card would say so.
+    async prAutomationSnapshot(sessionId) {
+      const { STALE } = window.OMP_PR_AUTOMATION;
+      const current = _prAutomationCurrent(sessionId);
+      if (!current()) return STALE;
+      const result = await window.__TAURI__.core.invoke(
+        "pr_automation_snapshot", { sessionId },
+      );
+      return current() ? result : STALE;
     },
     changesSnapshot(sessionId) {
-      return _readCheckout(sessionId, "changes_snapshot");
+      return _readLocalChanges(sessionId);
     },
-    // true = accepted, false = attempted but refused, null = not attempted.
     async prAutomationSend(sessionId, text, expected, canSend) {
-      if (
-        expected?.state !== "OPEN" ||
-        !expected.url ||
-        !expected.branch ||
-        !expected.head ||
-        typeof canSend !== "function"
-      )
-        return null;
-      const context = sessionContext,
-        switchGen = _switchGen;
-      const branch = sessionRegistry.get(sessionId)?.branch;
-      const current = () =>
-        !!window.__TAURI__ &&
-        sessionRegistry.has(sessionId) &&
-        sessionId === activeSessionId &&
-        !_replayBuffer &&
-        _switchAwayFrom !== sessionId &&
-        !_respawning.has(sessionId) &&
-        sessionContext === context &&
-        _switchGen === switchGen &&
-        sessionRegistry.get(sessionId)?.branch === branch;
+      if (!expected?.url || !expected.branch || !expected.head || typeof canSend !== "function") return false;
+      const current = _prAutomationCurrent(sessionId);
       const ready = () => {
         const entry = sessionRegistry.get(sessionId);
         return (
-          canSend() &&
-          current() &&
-          !!entry?.path &&
-          !userAbortInFlight &&
-          !entry.autoRenameInFlight &&
-          state.rpcState?.isSettled === true &&
-          runStateCached(state) === "idle" &&
-          !state.queueSending.length &&
-          !(state.rpcState?.queuedMessageCount > 0) &&
-          !state.queue.steering.length &&
-          !state.queue.followUp.length &&
+          canSend() && current() && !!entry?.path &&
+          !userAbortInFlight && !entry.autoRenameInFlight &&
+          state.rpcState?.isSettled === true && runStateCached(state) === "idle" &&
+          !state.queueSending.length && !(state.rpcState?.queuedMessageCount > 0) &&
+          !state.queue.steering.length && !state.queue.followUp.length &&
           !GOAL.isOpen(state.goal) &&
-          !_sessionsView().some(
-            (s) =>
-              s.id !== sessionId &&
-              s.path === entry.path &&
-              TURN.isBusyRunState(s.runState),
-          )
+          !TURN.busyElsewhere(_sessionsView(), sessionId, entry.path)
         );
       };
-      if (!ready()) return null;
+      if (!ready()) return false;
       // Re-read Rust's current branch/HEAD immediately before the handoff;
       // a displayed snapshot is not permission to fix a different revision.
-      let latest;
-      try {
-        latest = await window.__TAURI__.core.invoke("pr_automation_snapshot", {
-          sessionId,
-        });
-      } catch {
-        return null;
-      }
-      if (
-        !ready() ||
-        latest?.state !== "OPEN" ||
-        latest.url.toLowerCase() !== expected.url.toLowerCase() ||
-        latest.branch !== expected.branch ||
-        latest.head !== expected.head
-      )
-        return null;
-      return _sendPrompt(text, undefined, undefined, ready);
+      const latest = await window.__TAURI__.core.invoke(
+        "pr_automation_snapshot", { sessionId },
+      );
+      if (!ready() || !latest || latest.url.toLowerCase() !== expected.url.toLowerCase() || latest.branch !== expected.branch || latest.head !== expected.head) return false;
+      // `ready()` just ran in this same synchronous step, so nothing can
+      // change between it and the handoff. Once handed to omp the prompt is
+      // out, whatever happens meanwhile: the controller records it as sent
+      // even after a tab switch.
+      return _sendPrompt(text);
     },
     // No id on purpose: a pending-id match returns before the command
     // switch, and the abort response is what releases a cancelled
@@ -4959,6 +5035,7 @@
           null,
         );
       }
+      _refreshCodexLogin();
       return res;
     },
 
@@ -5130,6 +5207,20 @@
     /** A file as of commit `sha` with that commit's change inline: `FileView`. */
     gitBrowserCommitFile(sha, relPath) {
       return _gitBrowserInvoke("git_browser_commit_file", { sha, relPath });
+    },
+
+    /** The branches the status bar's picker offers: `Branch[]` (`{ name,
+     *  remote, at }`), newest tip first, without the checked-out one or a
+     *  remote branch whose local one exists. */
+    gitBranches() {
+      return _gitBrowserInvoke("git_browser_branches", {});
+    },
+
+    /** Switch the project's work tree to a listed branch (`git switch`; a
+     *  `remote` one gets a local branch tracking it). The HEAD watcher then
+     *  reports the new branch (`git://branch/{id}`). */
+    gitSwitchBranch(name, remote) {
+      return _gitBrowserInvoke("workspace_switch_branch", { name, remote });
     },
 
     /** A file of the active tab's project for the preview (issue #39):
@@ -5974,7 +6065,7 @@
 
     /** Close a tab after stopping its microphone; a failed stop leaves the
      *  tab visible so the user can retry. */
-    async closeSession(id, { worktreeAction = null } = {}) {
+    async closeSession(id, { worktreeAction = null, throwOnFailure = false } = {}) {
       if (!sessionRegistry.has(id) || _closingVoiceTabs.has(id)) return false;
       _closingVoiceTabs.add(id);
       try {
@@ -5992,6 +6083,7 @@
           )
           {
             _reportCloseFailure(id, stopped.error || "The active microphone could not be stopped; the worktree was retained.");
+            if (throwOnFailure) throw new Error(stopped.error || "The active microphone could not be stopped");
             return false;
           }
           if (!sessionRegistry.has(id)) return false;
@@ -6003,6 +6095,7 @@
         });
         if (!closed.ok) {
           _reportCloseFailure(id, closed.error);
+          if (throwOnFailure) throw new Error(closed.error);
           return false;
         }
         sessionRegistry.delete(id);

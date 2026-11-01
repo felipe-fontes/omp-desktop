@@ -39,7 +39,7 @@ check("voice meter handles silence, invalid input and full-scale boundaries", ()
 });
 check("start opens a connecting call and each phase is visible", () => {
   let s = start();
-  assert.deepEqual(s, { active: true, paused: false, phase: "connecting", muted: false, input: 0, output: 0, transcripts: [], error: null, turnOffset: 0, discardTranscripts: false });
+  assert.deepEqual(s, { active: true, paused: false, phase: "connecting", muted: false, input: 0, output: 0, transcripts: [], error: null, turnOffset: 0, discardTranscripts: false, resumable: false });
   for (const phase of ["listening", "working", "speaking", "muted"]) {
     s = apply(s, { type: "live_phase", phase });
     assert.equal(s.phase, phase);
@@ -108,8 +108,37 @@ check("start, mute, and process failures remain observable", () => {
   s = apply(s, caption("user", 1, "kept"), { type: "process_exit", error: "omp crashed" });
   assert.deepEqual([s.active, s.paused, s.phase, s.error, s.transcripts[0].text], [false, true, "paused", "omp crashed", "kept"]);
   const failed = apply(start(), { type: "live_end", error: "Provider refused connection" }, { type: "process_exit", error: "omp crashed" });
-  assert.deepEqual([failed.phase, failed.error, failed.transcripts], ["paused", "Provider refused connection", []]);
+  assert.deepEqual([failed.phase, failed.paused, failed.error, failed.transcripts], ["error", false, "Provider refused connection", []]);
   assert.equal(apply(V.EMPTY, { type: "process_exit" }), V.EMPTY);
+});
+check("a call that never connected ends in error, a resumed one stays resumable", () => {
+  // omp's order for a missing Codex login: phase error and end, then the failed reply.
+  const fresh = apply(start(), { type: "live_phase", phase: "connecting" }, { type: "live_phase", phase: "error" },
+    { type: "live_end", error: "No Codex OAuth credential is available for a live call." },
+    { type: "start_failure", error: "No Codex OAuth credential is available for a live call." });
+  assert.deepEqual([fresh.active, fresh.paused, fresh.phase, fresh.error], [false, false, "error", "No Codex OAuth credential is available for a live call."]);
+  const paused = apply(start(), { type: "live_phase", phase: "listening" }, caption("user", 1, "kept", true), { type: "stop" }, { type: "stop_success", paused: true });
+  const resumed = apply(paused, { type: "start" }, { type: "live_phase", phase: "error" }, { type: "live_end", error: "network down" });
+  assert.deepEqual([resumed.paused, resumed.phase, resumed.error, resumed.transcripts[0].text], [true, "paused", "network down", "kept"]);
+});
+check("Codex login comes from get_login_providers; unknown stays null", () => {
+  assert.equal(V.codexLogin([{ id: "anthropic", authenticated: true }, { id: "openai-codex", authenticated: true }]), true);
+  assert.equal(V.codexLogin([{ id: "openai-codex", authenticated: false }]), false);
+  assert.equal(V.codexLogin([{ id: "anthropic", authenticated: true }]), false, "an omp without the Codex provider cannot run live voice");
+  assert.equal(V.codexLogin(undefined), null);
+});
+check("live button is Codex only: greyed out without a login, a running call stays stoppable", () => {
+  assert.deepEqual(V.liveButton(V.EMPTY, false, true), { label: "Start live conversation (Codex only)", disabled: false });
+  assert.deepEqual(V.liveButton(V.EMPTY, false, null), { label: "Start live conversation (Codex only)", disabled: false }, "an unknown login does not block");
+  assert.deepEqual(V.liveButton(V.EMPTY, false, false), { label: V.CODEX_MISSING, disabled: true });
+  const paused = apply(start(), { type: "live_phase", phase: "listening" }, { type: "stop" }, { type: "stop_success", paused: true });
+  assert.deepEqual(V.liveButton(paused, false, false), { label: V.CODEX_MISSING, disabled: true });
+  assert.deepEqual(V.liveButton(paused, false, true), { label: "Resume live conversation (Codex only)", disabled: false });
+  const calling = apply(start(), { type: "live_phase", phase: "listening" });
+  assert.deepEqual(V.liveButton(calling, false, false), { label: "Stop live conversation (Codex only)", disabled: false });
+  assert.deepEqual(V.liveButton(start(), false, false), { label: "Cancel live conversation (Codex only)", disabled: false });
+  assert.equal(V.liveButton(apply(calling, { type: "stop" }), false, true).disabled, true, "stopping");
+  assert.equal(V.liveButton(V.EMPTY, true, true).disabled, true, "voice to text running");
 });
 check("stop preserves captions and later calls use distinct turn keys", () => {
   const s = apply(start(), caption("user", 1, "saved while viewing"), { type: "stop" },
@@ -148,17 +177,27 @@ check("dictation previews replace rather than accumulate, and stale captures are
   assert.deepEqual([s.active, s.text, s.error], [false, "final", "STT failed"]);
   assert.equal(D.apply(s, { type: "dictation_end", captureId: "one", text: "duplicate" }), s);
 });
+check("auto-stop arms only while recording after the first words", () => {
+  const recording = text => ({ ...D.EMPTY, active: true, phase: "recording", captureId: "c", text });
+  assert.equal(D.autoStopDelay(recording("Hello."), 2), 2000);
+  assert.equal(D.autoStopDelay(recording("Hello."), 1.5), 1500);
+  assert.equal(D.autoStopDelay(recording(""), 2), null, "no words yet: keep waiting");
+  assert.equal(D.autoStopDelay(recording("Hello."), 0), null, "off");
+  assert.equal(D.autoStopDelay({ ...recording("Hello."), phase: "stopping" }, 2), null);
+  assert.equal(D.autoStopDelay({ ...recording("Hello."), phase: "starting" }, 2), null);
+  assert.equal(D.autoStopDelay(D.EMPTY, 2), null);
+});
 
 // Render the actual JSX controls with the same lightweight React stand-in used
 // by the settings UI regressions; exercise the buttons rather than the bridge.
 check("voice controls start independently and retain stop and cancel actions", () => {
   const Babel = createRequire(import.meta.url)(join(root, "src/babel.min.js"));
   const { code } = Babel.transform(readFileSync(join(root, "src/design/live-voice.jsx"), "utf8"), { presets: ["react"] });
-  const window = { Icon: () => null };
+  const window = { Icon: () => null, OMP_LIVE_VOICE: V };
   const React = { Fragment: "fragment", createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }) };
   runInNewContext(code, { window, React });
   const actions = [];
-  const render = (live = {}, dictation = {}) => window.VoiceModeButton({ live, dictation,
+  const render = (live = {}, dictation = {}, codexLogin = null) => window.VoiceModeButton({ live, dictation, codexLogin,
     onLiveAction: action => actions.push(["live", action]),
     onDictationAction: action => actions.push(["dictation", action]),
   }).children;
@@ -195,6 +234,8 @@ check("voice controls start independently and retain stop and cancel actions", (
   assert.equal(live.props.disabled, false);
   live.props.onClick();
   assert.deepEqual(actions, [["dictation", "start"], ["live", "start"], ["dictation", "stop"], ["live", "stop"], ["dictation", "stop"], ["live", "stop"]]);
+  [dictation, live] = render({}, {}, false);
+  assert.deepEqual([live.props.disabled, live.props.title, dictation.props.disabled], [true, V.CODEX_MISSING, false], "no Codex login greys out live only");
 });
 
 // Exercise the public bridge against a deterministic fake IPC transport. The
@@ -207,7 +248,7 @@ function bridgeHarness() {
     OMP_SUBAGENTS: { emptySubagents: () => ({}), subscriptionLevelFor: () => "progress", mergeSnapshots: () => ({}) },
     OMP_QUEUE: { EMPTY_QUEUE: {} }, OMP_GOAL: { UNKNOWN: {} }, OMP_EXT_WIDGETS: { EMPTY: {} },
     OMP_TRANSCRIPT: {}, OMP_PROMPT_HISTORY: { DEFAULT_LIMIT: 100 },
-    OMP_SESSION_PREFS: { fromTweaks: () => ({ autoRetry: true }), closeGuardArmed: () => false },
+    OMP_SESSION_PREFS: { fromTweaks: () => ({ autoCompaction: true, autoRetry: true }), closeGuardArmed: () => false },
     OMP_TWEAKS_STORE: { read: () => ({}) },
     OMP_TURN_STATUS: { runStateOf: () => "idle", isBusyRunState: () => false, retryCleared: messages => messages },
     DEFAULT_PROFILE_ID: "default", INTENT_FRAMING: () => "", timeNow: () => "00:00",
@@ -217,7 +258,7 @@ function bridgeHarness() {
   new Function("window", readFileSync(join(root, "src/app/live-context.js"), "utf8"))(w);
   new Function("window", readFileSync(join(root, "src/app/approval-mode.js"), "utf8"))(w);
   new Function("window", readFileSync(join(root, "src/app/project-nav.js"), "utf8"))(w);
-  for (const file of ["agent-context.js", "agent-context-sync.js"])
+  for (const file of ["session-title.js", "agent-context.js", "agent-context-sync.js", "context-policy.js", "evidence-client.js", "cache-usage.js", "stream-delta.js"])
     new Function("window", readFileSync(join(root, "src/app", file), "utf8"))(w);
   // The fake is attached after bridge initialization, so no boot restore or
   // real process is started. Only timers for other bridge commands are unref'd.
@@ -254,6 +295,7 @@ function bridgeHarness() {
         return Promise.resolve({ default: approvalMode, projects: {} });
       }
       if (command === "start_session") return Promise.resolve({ approvalMode, path: args.args.cwd, workspace: null });
+      if (command === "start_git_watch") return Promise.resolve({ branch: null, root: args.path });
       if (command === "replay_events") return Promise.resolve({ dropped: false, events: (journal.get(args.sessionId) ?? []).filter(e => e.seq > args.afterSeq) });
       if (command === "send_command") {
         const cmd = { ...JSON.parse(args.json), sessionId: args.sessionId };
@@ -597,7 +639,7 @@ await checkAsync("dictation cancels while starting, flushes before switching, an
   await switching;
   await starting;
   assert.equal(h.snapshot().activeSessionId, b);
-  assert.deepEqual(h.snapshot().dictationCompleted, [{ sessionId: a, captureId: start.captureId, text: "final words" }]);
+  assert.deepEqual(h.snapshot().dictationCompleted, [{ sessionId: a, captureId: start.captureId, text: "final words", send: false }]);
   assert.equal(h.commands.some(c => c.type === "prompt"), false);
   h.reply(start);
   await h.bridge.activateSession(a);
@@ -624,7 +666,7 @@ await checkAsync("failed dictation stop keeps the microphone visible until retry
   h.reply(await h.waitCommand("dictation_stop", 2), true, { text: "saved" });
   await switch2;
   assert.equal(h.snapshot().activeSessionId, b);
-  assert.deepEqual(h.snapshot().dictationCompleted, [{ sessionId: a, captureId: start.captureId, text: "saved" }]);
+  assert.deepEqual(h.snapshot().dictationCompleted, [{ sessionId: a, captureId: start.captureId, text: "saved", send: false }]);
 });
 
 await checkAsync("unsolicited terminal wins a late failed reply and prevents stale frames", async () => {
@@ -686,7 +728,7 @@ await checkAsync("process exit preserves preview and close refuses a failed stop
   h.exit(a, "omp crashed");
   assert.equal(h.snapshot().dictation.active, false);
   assert.equal(h.snapshot().dictation.error, "omp crashed");
-  assert.deepEqual(h.snapshot().dictationCompleted, [{ sessionId: a, captureId: start.captureId, text: "recover me" }]);
+  assert.deepEqual(h.snapshot().dictationCompleted, [{ sessionId: a, captureId: start.captureId, text: "recover me", send: false }]);
   await h.bridge.closeSession(a);
   assert.deepEqual(h.snapshot().dictationCompleted, []);
 });
@@ -706,7 +748,7 @@ await checkAsync("profile respawn flushes dictation and preserves the originatin
   assert.equal((await restart).ok, true);
   assert.equal(h.snapshot().activeSessionId, a);
   assert.equal(h.snapshot().dictation.active, false);
-  assert.deepEqual(h.snapshot().dictationCompleted, [{ sessionId: a, captureId: command.captureId, text: "before restart" }]);
+  assert.deepEqual(h.snapshot().dictationCompleted, [{ sessionId: a, captureId: command.captureId, text: "before restart", send: false }]);
   assert.equal(h.invocations.some(call => call.command === "stop_session"), true);
 });
 
@@ -741,4 +783,66 @@ await checkAsync("same-conversation process replacement preserves paused voice h
   h.reply(command); await resume;
 });
 
+await checkAsync("Codex login is read per tab on activation and again after omp refuses a live call", async () => {
+  const h = bridgeHarness();
+  const { a, b } = await twoTabs(h);
+  const providers = authenticated => ({ providers: [{ id: "anthropic", authenticated: true }, { id: "openai-codex", authenticated }] });
+  const loginOf = async (sid, count) => (await h.waitCommand("get_login_providers", count)).sessionId === sid;
+  // Activations: a, b, a again — each tab asks its own omp.
+  assert.equal(await loginOf(a, 3), true);
+  h.reply(h.commands.filter(c => c.type === "get_login_providers")[2], true, providers(true));
+  await new Promise(r => setTimeout(r, 0));
+  assert.equal(h.snapshot().codexLogin, true);
+  // omp's order without a login: end frame, then the failed reply.
+  const starting = h.bridge.liveStart(), command = await h.waitCommand("live_start");
+  h.emit(a, { type: "live_phase", phase: "error" });
+  h.emit(a, { type: "live_end", error: "No Codex OAuth credential is available for a live call." });
+  h.reply(command, false, null, "No Codex OAuth credential is available for a live call.");
+  assert.equal((await starting).ok, false);
+  const refresh = await h.waitCommand("get_login_providers", 4);
+  h.reply(refresh, true, providers(false));
+  await new Promise(r => setTimeout(r, 0));
+  assert.deepEqual([h.snapshot().codexLogin, h.snapshot().liveVoice.phase, h.snapshot().liveVoice.paused], [false, "error", false]);
+  // A tab's login travels with its snapshot; the other tab is asked anew.
+  await h.bridge.activateSession(b);
+  assert.equal(h.snapshot().codexLogin, null, "b has not answered yet");
+  await h.bridge.activateSession(a);
+  assert.equal(h.snapshot().codexLogin, false);
+});
+
+await checkAsync("send on stop tags only the capture the user stopped, never a tab-switch stop", async () => {
+  const h = bridgeHarness();
+  const { a, b } = await twoTabs(h);
+  const capture = async (n, stopWith) => {
+    const starting = h.bridge.dictationStart(), start = await h.waitCommand("dictation_start", n);
+    h.reply(start); await starting;
+    const stopping = stopWith();
+    const stop = await h.waitCommand("dictation_stop", n);
+    h.emit(a, { type: "dictation_end", captureId: start.captureId, text: `words ${n}` });
+    h.reply(stop, true, { text: `words ${n}` });
+    await stopping;
+  };
+  await capture(1, () => h.bridge.dictationStop({ send: true }));
+  await capture(2, () => h.bridge.dictationStop());
+  await capture(3, () => h.bridge.activateSession(b));
+  assert.deepEqual(h.snapshot().dictationCompleted.map(item => [item.text, item.send]),
+    [["words 1", true], ["words 2", false], ["words 3", false]]);
+  assert.equal(h.commands.some(c => c.type === "prompt"), false, "the bridge never sends; the composer does");
+});
+
+await checkAsync("a failed send-on-stop does not tag the Settings stop that follows", async () => {
+  const h = bridgeHarness();
+  const { a } = await twoTabs(h);
+  const starting = h.bridge.dictationStart(), start = await h.waitCommand("dictation_start");
+  h.reply(start); await starting;
+  const failed = h.bridge.dictationStop({ send: true });
+  h.reply(await h.waitCommand("dictation_stop"), false, null, "microphone busy");
+  assert.equal((await failed).ok, false);
+  assert.equal(h.snapshot().dictation.active, true);
+  const settingsStop = h.bridge.stopActiveVoice(), stop = await h.waitCommand("dictation_stop", 2);
+  h.emit(a, { type: "dictation_end", captureId: start.captureId, text: "words" });
+  h.reply(stop, true, { text: "words" });
+  await settingsStop;
+  assert.deepEqual(h.snapshot().dictationCompleted.map(item => [item.text, item.send]), [["words", false]]);
+});
 console.log(`test-live-voice: ${passed} checks passed`);

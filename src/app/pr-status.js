@@ -7,7 +7,6 @@
     pending: 3,
     failure: 4,
   };
-  const STATE_PRIORITY = { OPEN: 0, CLOSED: 1, MERGED: 2 };
 
   function countText(count, singular, plural) {
     return `${count} ${count === 1 ? singular : plural}`;
@@ -23,72 +22,47 @@
       case "pending":
         return failedCount ? `Checks pending; ${failed}` : "Checks pending";
       case "success":
-        return failedCount ? `Checks passed; ${failed}` : "Checks passed";
+        return "Checks passed";
       case "none":
-        return failedCount ? `No check rollup; ${failed}` : "No checks";
+        return "No checks";
       default:
-        return failedCount
-          ? `Check results unknown; ${failed}`
-          : "Check results unknown";
+        return "Check results unknown";
     }
   }
 
   function maxChecks(left, right) {
-    const a = Object.hasOwn(CHECK_PRIORITY, left) ? left : "unknown";
-    const b = Object.hasOwn(CHECK_PRIORITY, right) ? right : "unknown";
-    return CHECK_PRIORITY[a] >= CHECK_PRIORITY[b] ? a : b;
+    return CHECK_PRIORITY[left] >= CHECK_PRIORITY[right] ? left : right;
   }
+  // The PR lookup returns only open PRs and individual CI checks.
+  function snapshotChecks(snapshot) {
+    const state = window.OMP_PR_AUTOMATION.ciSummary(snapshot.checks).state;
+    return state === "running" || state === "queued" ? "pending"
+      : state === "neutral" ? "unknown" : state;
+  }
+
 
   function identity(snapshot) {
     return `${snapshot.repository.trim().toLowerCase()}#${snapshot.number}`;
   }
 
-  // Fresh reports supersede stale duplicates. When concurrent fresh reads differ,
-  // prefer a terminal lifecycle and merge feedback only for the chosen state.
+  // Fresh reports supersede stale duplicates of the same PR.
   function summarize(reports) {
     const fresh = reports.filter((status) => !status.discoveryError);
     const snapshots = (fresh.length ? fresh : reports).map(
       (status) => status.snapshot,
     );
-    const state = snapshots.reduce(
-      (best, snapshot) =>
-        STATE_PRIORITY[snapshot.state] > STATE_PRIORITY[best]
-          ? snapshot.state
-          : best,
-      "OPEN",
-    );
-    const selected = snapshots.filter((snapshot) => snapshot.state === state);
-    const draft =
-      state === "OPEN" && selected.some((snapshot) => snapshot.isDraft);
+    const draft = snapshots.some((snapshot) => snapshot.isDraft);
     const checks = new Set();
     const threads = new Set();
     let checksState = "none";
-    for (const snapshot of selected) {
-      checksState = maxChecks(checksState, snapshot.checksState);
-      for (const check of snapshot.failedChecks || []) {
-        if (check && typeof check.id === "string" && check.id)
-          checks.add(check.id);
-      }
-      if (state === "OPEN") {
-        for (const thread of snapshot.threads || []) {
-          if (
-            thread &&
-            typeof thread.id === "string" &&
-            thread.id &&
-            !thread.isResolved &&
-            !thread.isOutdated &&
-            !thread.resolved &&
-            !thread.outdated
-          ) {
-            threads.add(thread.id);
-          }
-        }
-      }
+    for (const snapshot of snapshots) {
+      checksState = maxChecks(checksState, snapshotChecks(snapshot));
+      for (const check of snapshot.failedChecks) checks.add(check.id);
+      for (const thread of snapshot.threads) threads.add(thread.id);
     }
-    const snapshot = selected[0];
-    const repository = selected.map((item) => item.repository).sort()[0];
+    const snapshot = snapshots[0];
+    const repository = snapshots.map((item) => item.repository).sort()[0];
     return {
-      state,
       draft,
       checksState,
       failedCount: checks.size,
@@ -100,10 +74,6 @@
   }
 
   function lifecycle(group) {
-    if (group.state === "MERGED")
-      return { glyph: "merged", tone: "merged", label: "Merged" };
-    if (group.state === "CLOSED")
-      return { glyph: "closed", tone: "closed", label: "Closed" };
     const glyph = group.draft ? "draft" : "open";
     const tone =
       group.checksState === "failure" || group.failedCount ? "failure" : glyph;
@@ -114,10 +84,7 @@
     const { label } = lifecycle(group);
     const identityText = `${label} pull request #${group.number}${includeRepository ? ` (${group.repository})` : ""}`;
     const checks = checksText(group.checksState, group.failedCount);
-    const parts = [
-      identityText,
-      group.state === "OPEN" ? checks : `Historical CI: ${checks}`,
-    ];
+    const parts = [identityText, checks];
     if (group.threadCount) {
       parts.push(
         countText(
@@ -178,20 +145,17 @@
       };
     }
 
-    const open = summaries.filter((group) => group.state === "OPEN");
-    const checksState = open.length
-      ? open.reduce(
-          (state, group) => maxChecks(state, group.checksState),
-          "none",
-        )
-      : null;
-    const failedCount = open.reduce(
+    const checksState = summaries.reduce(
+      (state, group) => maxChecks(state, group.checksState),
+      "none",
+    );
+    const failedCount = summaries.reduce(
       (count, group) => count + group.failedCount,
       0,
     );
-    const threads = new Set(open.flatMap((group) => [...group.threads]));
+    const threads = new Set(summaries.flatMap((group) => [...group.threads]));
     const threadCount = threads.size;
-    const failed = open.some(
+    const failed = summaries.some(
       (group) => group.checksState === "failure" || group.failedCount,
     );
     const details = summaries
@@ -215,7 +179,7 @@
       repository: null,
       lifecycleLabel: label,
       lifecycleDescription: `${stale ? "Last known: " : ""}${heading}; ${details}${noPr}`,
-      checksDescription: checksState ? checksText(checksState, failedCount) : null,
+      checksDescription: checksText(checksState, failedCount),
       reviewDescription: countText(threadCount, "unresolved review thread", "unresolved review threads"),
       refreshDescription: stale ? `Last known PR status; refresh failed: ${[...errors].sort().join("; ")}` : null,
       checksState,

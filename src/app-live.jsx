@@ -18,7 +18,7 @@
    ═════════════════════════════════════════════════════════════════════ */
 
 const {
-  Icon, ChatView, Composer, CommandBridge, WindowChrome, TabBar, SubagentPane, ProjectSidebar, EmptyWorkspace,
+  Icon, ChatView, Composer, CommandBridge, WindowChrome, Toolbar, TabBar, SubagentPane, ProjectSidebar, EmptyWorkspace,
   StatusBar, AmbientRail, ConversationTree, PlanKanban, HistoryModal, GitBrowser, FilePreview, ApprovalRulesPanel, UsageStatsPanel, PromptHistoryModal, UpdateModal, useTweaks,
   SettingsPage, ConfirmCloseDialog, NewConversationDialog, ChatWorkspace,
   useWidgets, WidgetCard, WidgetErrorCard, WidgetApprovalCard, WidgetBoundary,
@@ -143,6 +143,8 @@ function App() {
   const [extWidgets,   setExtWidgets]   = React.useState(_EXT_EMPTY);
   const [liveVoice, setLiveVoice] = React.useState(null);
   const [dictation, setDictation] = React.useState(null);
+  // Whether the tab's profile has the Codex login live voice needs (null = unknown).
+  const [codexLogin, setCodexLogin] = React.useState(null);
   const [dictationCompleted, setDictationCompleted] = React.useState([]);
   const [dictationErrors, setDictationErrors] = React.useState({});
   const dictationActionSeq = React.useRef({});
@@ -198,7 +200,7 @@ function App() {
     setModelState, setThinkingLevel,
     setSessions, setActiveSessionId, setProfiles, setStartupProfileId, setRecentProjects,
     setNoTabProfileId, setWorkspaceNotes, setApprovalModes, setCloseConfirm, setWorktreeCloseConfirm, setConversationSetup,
-    setPromptHistory, setSubagents, setSubagentTranscripts, setBackgroundTasks, setAgentContext, setContextPolicy, setEvidence, setQueue, setQueueSending, setGoal, setExtWidgets, setLiveVoice, setDictation, setDictationCompleted,
+    setPromptHistory, setSubagents, setSubagentTranscripts, setBackgroundTasks, setAgentContext, setContextPolicy, setEvidence, setQueue, setQueueSending, setGoal, setExtWidgets, setLiveVoice, setDictation, setCodexLogin, setDictationCompleted,
   });
   useRemote({ bridge });
   useNotifications({ sessions, viewedSession: stab.active ? null : activeSessionId, tweaks: t });
@@ -253,7 +255,7 @@ function App() {
   // the bridge spawns the next tab into the empty workspace's pick or the
   // ticked startup profile (nothing to inherit from) — so showing the
   // built-in would tick a profile that isn't where the next tab actually
-  // goes. Shared by WindowChrome's menu, the keymap, recents and the
+  // goes. Shared by the toolbar's profile menu, the keymap, recents and the
   // usage-stats panel's header label, instead of a second copy.
   const activeProfileId    = activeProject.id ? activeProject.profile : noTabProfileId;
   const activeProfileLabel = profiles.find(p => p.id === activeProfileId)?.name ?? activeProfileId;
@@ -268,7 +270,7 @@ function App() {
     processStartedAt: activeProject.processStartedAt,
     conversationVersion: activeProject.conversationVersion, snapshot: evidenceState,
   });
-  // Status-bar approvals cell: the mode the rendered tab's omp runs, or
+  // Toolbar approvals button: the mode the rendered tab's omp runs, or
   // `running ⇢ target` while a change waits for its turn to end. Read
   // late-bound: app/approval-mode.js is a plain module like the others.
   const approvalCell = window.OMP_APPROVAL_MODE.statusCell(approvalModes, activeProject.id ? activeProject : null);
@@ -381,26 +383,21 @@ function App() {
     dictationActionSeq.current = pruneEntries(dictationActionSeq.current, sessionIds);
   }, [sessionIds]);
 
-  const requestLiveAction = (action) => {
-    if ((action === "start" || action === "resume") && settingsOpening.current) return Promise.resolve(false);
+  // One voice request for the shown tab: its error belongs to that tab, and
+  // only the tab's latest request of the mode may report one.
+  const runVoiceAction = (seqs, setErrors, label, call) => {
     const id = planKey;
-    const report = error => setLiveErrors(m => ({ ...m, [id]: error }));
-    const seq = (liveActionSeq.current[id] ?? 0) + 1;
-    liveActionSeq.current[id] = seq;
-    report(null);
+    const seq = (seqs.current[id] ?? 0) + 1;
+    seqs.current[id] = seq;
+    setErrors(m => ({ ...m, [id]: null }));
     const fail = error => {
-      if (liveActionSeq.current[id] === seq && openVoiceTabs.current.includes(id)) {
-        report(error || "Live voice failed.");
+      if (seqs.current[id] === seq && openVoiceTabs.current.includes(id)) {
+        setErrors(m => ({ ...m, [id]: error || `${label} failed.` }));
       }
     };
     try {
-      if (!bridge) { fail("Live voice is unavailable without an agent connection."); return Promise.resolve(false); }
-      const request = action === "start" ? bridge.liveStart()
-        : action === "pause" ? bridge.livePause()
-        : action === "resume" ? bridge.liveResume()
-        : action === "stop" ? bridge.liveStop()
-        : bridge.liveMute(action === "mute");
-      return Promise.resolve(request).then(result => {
+      if (!bridge) { fail(`${label} is unavailable without an agent connection.`); return Promise.resolve(false); }
+      return Promise.resolve(call(bridge)).then(result => {
         if (!result?.ok) fail(result?.error);
         return !!result?.ok;
       }, error => { fail(error?.message ?? String(error)); return false; });
@@ -408,6 +405,15 @@ function App() {
       fail(error?.message ?? String(error));
       return Promise.resolve(false);
     }
+  };
+  const requestLiveAction = (action) => {
+    if ((action === "start" || action === "resume") && settingsOpening.current) return Promise.resolve(false);
+    return runVoiceAction(liveActionSeq, setLiveErrors, "Live voice", b =>
+      action === "start" ? b.liveStart()
+        : action === "pause" ? b.livePause()
+        : action === "resume" ? b.liveResume()
+        : action === "stop" ? b.liveStop()
+        : b.liveMute(action === "mute"));
   };
   // Wait for Settings to leave the screen before opening a microphone, and
   // discard the request if its owning tab has changed in the meantime.
@@ -418,27 +424,23 @@ function App() {
     if (pending.id === planKey && !settingsOpening.current) requestLiveAction(pending.action);
   }, [stab.active, planKey]);
   const requestDictationAction = action => {
-    const id = planKey;
     if (action === "start" && settingsOpening.current) return Promise.resolve(false);
-    const seq = (dictationActionSeq.current[id] ?? 0) + 1;
-    dictationActionSeq.current[id] = seq;
-    setDictationErrors(m => ({ ...m, [id]: null }));
-    const fail = error => {
-      if (dictationActionSeq.current[id] === seq && openVoiceTabs.current.includes(id)) {
-        setDictationErrors(m => ({ ...m, [id]: error || "Voice to text failed." }));
-      }
-    };
-    try {
-      if (!bridge) { fail("Voice to text is unavailable without an agent connection."); return Promise.resolve(false); }
-      return Promise.resolve(action === "start" ? bridge.dictationStart() : bridge.dictationStop()).then(result => {
-        if (!result?.ok) fail(result?.error);
-        return !!result?.ok;
-      }, error => { fail(error?.message ?? String(error)); return false; });
-    } catch (error) {
-      fail(error?.message ?? String(error));
-      return Promise.resolve(false);
-    }
+    // The user's own stop sends the draft when Settings › Composer says so.
+    return runVoiceAction(dictationActionSeq, setDictationErrors, "Voice to text",
+      b => action === "start" ? b.dictationStart() : b.dictationStop({ send: !!t.dictationSend }));
   };
+  // Settings › Composer › Stop after a pause: no new dictated text for that
+  // long stops the capture as the user's own stop, so "Send voice to text on
+  // stop" applies to it too. Every text change re-arms the timer.
+  const dictationAutoStopMs = window.OMP_LIVE_VOICE.DICTATION.autoStopDelay(dictation, t.dictationAutoStop);
+  React.useEffect(() => {
+    if (dictationAutoStopMs == null) return undefined;
+    const timer = setTimeout(() => requestDictationAction("stop"), dictationAutoStopMs);
+    return () => clearTimeout(timer);
+  }, [dictationAutoStopMs, dictation?.captureId, dictation?.text, t.dictationSend]);
+  // The equalizer above the input while the microphone records (Rust reads
+  // the device itself; omp's capture is out of reach in its own process).
+  const voiceSpectrum = useVoiceSpectrum(bridge, window.OMP_VOICE_SPECTRUM.shouldRun(dictation, liveVoice), t.voiceSpectrumBands);
   const handleLiveAction = (args = "") => {
     const action = window.OMP_SLASH.liveCommand(args, liveVoice);
     if (!action) {
@@ -527,10 +529,27 @@ function App() {
   };
 
   // `activeProject.id`, not `activeSessionId`: the latter keeps a closed
-  // tab's id (see handleSelectProfile below). Widgets only run while the
-  // rail is on screen — not in focus layout, not under the tree or browser.
+  // tab's id (see handleSelectProfile below). Widgets only run, and the PR
+  // card only reads with Auto-fix off, while the rail is on screen — not in
+  // focus layout, not under the tree or browser.
+  const railVisible = t.layout !== "focus" && side === "rail";
+  // The toolbar's rail button: hiding is the focus layout (which also
+  // closes a subagent split, as the layout is one setting); showing leaves
+  // focus layout and brings the rail back in place of the tree or browser.
+  const toggleRail = () => {
+    if (stab.active) {
+      if (t.layout === "focus") setTweak("layout", "rail");
+      setSide("rail");
+      setStab(window.OMP_SETTINGS_TAB.selectProject);
+    } else if (railVisible) {
+      setTweak("layout", "focus");
+    } else {
+      if (t.layout === "focus") setTweak("layout", "rail");
+      setSide("rail");
+    }
+  };
   const widgets = useWidgets({
-    bridge, activeSessionId: activeProject.id, activeProjectPath: activeProject.path ?? null, railVisible: t.layout !== "focus" && side === "rail", tweaks: t, setTweak,
+    bridge, activeSessionId: activeProject.id, activeProjectPath: activeProject.path ?? null, railVisible, tweaks: t, setTweak,
   });
   // Pushed by omp, not run by the desktop: nothing to schedule, only a
   // Settings → Rail toggle per card (`widget:ext-status`, `widget:ext:<key>`).
@@ -747,13 +766,15 @@ function App() {
   });
 
   const prAutomation = usePrAutomation({
-    bridge, tabId: planKey, sessions,
+    bridge, tabId: planKey, sessionIds, sessions, projectKey: activeProject.path,
     runState: activeProject.runState,
+    branchKey: activeProject.branch ?? null,
+    conversationKey: JSON.stringify([activeProject.profile, activeProject.sessionFile ?? null]),
     featureEnabled: t.showChanges ?? true,
-    connected: !!bridge?.isConnected,
-    blocked: !bridge?.isConnected || !activeProject.path || stab.active || plan.mode ||
-      goalUi.mode || !!goalUi.planBlocked ||
-      sessions.some(s => s.id !== planKey && s.path === activeProject.path && window.OMP_TURN_STATUS.isBusyRunState(s.runState)),
+    railVisible,
+    connected: !!bridge?.isConnected && !stab.active,
+    blocked: plan.mode || goalUi.mode || !!goalUi.planBlocked ||
+      window.OMP_TURN_STATUS.busyElsewhere(sessions, planKey, activeProject.path),
   });
 
   // Conversation tree data + actions. A successful "branch here" puts the
@@ -1075,20 +1096,39 @@ function App() {
     <_AL_MdLinkCtx.Provider value={handleChatLinkClick}>
       <div className="app-backdrop" />
       <div className="app">
-        <div className={`window scanlines ${showSplit ? "is-split" : ""}`}>
-          <WindowChrome
-            project={activeProject}
+        {/* `is-running`: the active tab streams; the always-visible loops
+            (status/model dots, activity radar) run only then (styles.css). */}
+        <div className={`window scanlines ${showSplit ? "is-split" : ""}${streaming ? " is-running" : ""}`}>
+          <WindowChrome project={activeProject}
             prStatus={stab.active ? null : prAutomation.statuses[activeSessionId]}
-            onConfigureProject={handleConfigureProject}
-            onCmd={() => setBridgeOpen(true)}
-            profiles={profiles}
-            activeProfileId={activeProfileId}
-            startupProfileId={startupProfileId}
-            onSelectProfile={handleSelectProfile}
-            onCreateProfile={handleCreateProfile}
-            onRenameProfile={handleRenameProfile}
-            onDeleteProfile={handleDeleteProfile}
-            onSetStartupProfile={handleSetStartupProfile}
+            onConfigureProject={handleConfigureProject} />
+          <Toolbar
+            nav={{
+              sidebarOpen: showSidebar, onToggleSidebar: toggleSidebar,
+              onOpenProject: handleNewProject, onHistory: () => setHistoryOpen(true),
+            }}
+            rail={{ open: railVisible, onToggle: toggleRail }}
+            subagents={{ open: showSplit, onToggle: subagentUi.togglePane }}
+            tree={{
+              open: side === "tree", onToggle: () => toggleSide("tree"),
+              onRefresh: convTree.refresh, canRefresh: !convTree.loading && !!convTree.key,
+            }}
+            browser={{
+              open: side === "browser", onToggle: () => toggleSide("browser"),
+              annotate: browser.annotate, canAnnotate: browser.state.status === "running", onAnnotate: browser.setAnnotate,
+              fullView: browser.fullView, onFullView: browser.setFullView,
+            }}
+            terminal={{ open: _TERM_entryOf(terminal.state, planKey).open, onToggle: () => terminal.toggle(planKey) }}
+            onGit={() => setGitOpen({ path: null })}
+            approvals={{ cell: approvalCell, onOpen: () => setRulesOpen(true) }}
+            onStats={() => setStatsOpen(true)}
+            onCommands={() => setBridgeOpen(true)}
+            profile={{
+              profiles, activeId: activeProfileId, startupId: startupProfileId,
+              onSelect: handleSelectProfile, onCreate: handleCreateProfile, onRename: handleRenameProfile,
+              onDelete: handleDeleteProfile, onSetStartup: handleSetStartupProfile,
+            }}
+            settings={{ active: stab.active, onOpen: () => openSettings() }}
           />
           <TabBar
             profiles={profiles}
@@ -1096,26 +1136,14 @@ function App() {
             prStatuses={prAutomation.statuses}
             activeId={stab.active ? null : activeSessionId}
             onSelect={handleSelectTab}
-            onNew={handleNewProject}
-            onNewChat={handleNewChat}
+
             onClose={handleCloseTab}
             onRename={handleRenameTab}
+            onNewChat={handleNewChat}
             onNewInProject={handleNewInProject}
             onConfigureProject={handleConfigureProject}
             onReorder={handleReorder}
-            sidebarOpen={showSidebar}
-            onToggleSidebar={toggleSidebar}
-            onHistory={() => setHistoryOpen(true)}
-            appVersion={updater.version}
-            updateVersion={updater.pillVersion}
-            onUpdate={updater.openModal}
-            onCheckUpdate={updater.check}
-            ambientHidden={!showRail || side !== "rail"}
-            onShowAmbient={() => {
-              setTweak("layout", "rail");
-              setSide("rail");
-              setStab(s => window.OMP_SETTINGS_TAB.selectProject(s));
-            }}
+
             settings={{ open: stab.open, active: stab.active, changed: settingsChanged }}
             onSelectSettings={() => openSettings()}
             onCloseSettings={closeSettings}
@@ -1157,16 +1185,15 @@ function App() {
                 onOpenRecent={handleOpenRecent}
                 onForgetRecent={handleForgetRecent}
                 onOpenFolder={handleNewProject}
-                onHide={toggleSidebar}
                 onReorder={handleReorder}
               />
             )}
             {showSidebar && <ResizeHandle className="at-sidebar" {...panes.handle("sidebar")} />}
             <div ref={stageRef} className={`stage ${side === "browser" ? `with-browser${browserFull ? " browser-full" : ""}` : sideRail ? `with-${sideRail}` : ""}`}>
-              <main className="session" onFocusCapture={prAutomation.refresh}>
+              <main className="session" onFocusCapture={prAutomation.onConversationFocus}>
                 {noTab ? (
                   <>
-                    <EmptyWorkspace notes={workspaceNotes} />
+                    <EmptyWorkspace notes={workspaceNotes} screen={t.startScreen} paused={stab.active} />
                     <div style={{ position: "absolute", top: 24, left: "50%", transform: "translateX(-50%)", display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
                       <button className="btn outlined accent" onClick={handleNewChat}>new chat</button>
                     </div>
@@ -1207,6 +1234,8 @@ function App() {
                     liveVoice={liveVoice}
                     liveError={liveErrors[planKey]}
                     onLiveAction={handleLiveAction}
+                    codexLogin={codexLogin}
+                    voiceSpectrum={voiceSpectrum}
                     dictation={dictation}
                     dictationError={dictationErrors[planKey]}
                     onDictationAction={requestDictationAction}
@@ -1269,7 +1298,6 @@ function App() {
                   onLoadTranscript={id => bridge?.loadSubagentTranscript(id)}
                   onSteer={(id, text) => bridge?.steerSubagent(id, text)}
                   onStop={id => bridge?.cancelSubagent(id)}
-                  onClose={subagentUi.closePane}
                   onJumpToCall={subagentUi.jumpToCall}
                   submitKey={t.submitKey}
                 />
@@ -1282,7 +1310,6 @@ function App() {
                   model={convTree.model} currentFile={convTree.currentFile} error={convTree.error}
                   loading={convTree.loading} treeKey={convTree.key} now={convTree.now} since={convTree.since}
                   streaming={conversationBusy || streaming}
-                  onRefresh={convTree.refresh} onClose={() => setSide("rail")}
                   onBranch={convTree.branch} onFork={convTree.fork} onOpenFile={convTree.openFile}
                 />
               ) : showRail && (
@@ -1293,11 +1320,8 @@ function App() {
                   subagentPaneOpen={showSplit}
                   onOpenSubagent={subagentUi.open}
                   onToggleSubagentPane={subagentUi.togglePane}
-                  onOpenTree={() => setSide("tree")}
                   messages={messages}
                   items={ambientItems} tweaks={t} onChange={setTweak} onSettings={() => openSettings("rail")}
-                  sparklineValues={sparkline}
-                  onClose={() => setTweak("layout", "focus")}
                   hoveredMsgIdx={hoveredMsgIdx}
                   onMinimapHover={setHoveredMsgIdx}
                   onMinimapClick={handleMinimapClick}
@@ -1316,9 +1340,10 @@ function App() {
                       canOpenSubagent={(id, item) => { const agent = window.OMP_SUBAGENTS.getAgent(subagents, id); return !!agent && (!item.sessionFile || !agent.sessionFile || item.sessionFile === agent.sessionFile) && (!item.toolCallId || !agent.parentToolCallId || item.toolCallId === agent.parentToolCallId); }}
                       onOpenTool={id => { const index = messages.findIndex(m => m._toolCallId === id); if (index >= 0) handleMinimapClick(index); }}
                       onOpenSubagent={subagentUi.open} />,
-                    showChanges: <PrAutomationCard key={planKey} automation={prAutomation} bridge={bridge}
-                      available={!!activeProject.path && !!bridge?.isConnected}
-                      onOpenChanges={() => setGitOpen({ path: null, project: gitProject })} />,
+                    showChanges: (!prAutomation.ghMissing || prAutomation.localChanges?.changed > 0) &&
+                      <PrAutomationCard key={planKey} automation={prAutomation} bridge={bridge}
+                        available={!!activeProject.path && !!bridge?.isConnected}
+                        onOpenChanges={() => setGitOpen({ path: null, project: gitProject })} />,
                     showEvidence: <window.EvidenceCard key={evidenceUi.ownerKey} evidence={evidenceUi} />,
                     ...Object.fromEntries(widgets.approvals.map(a => [_widgetTweakKey(a.id),
                       <WidgetBoundary key={`approve:${a.id}`} title={a.title}>
@@ -1353,26 +1378,11 @@ function App() {
           </div>
           {/* Full window width under the workspace: no side column (rail,
               tree, browser panel, subagent split) ever narrows it. */}
-          <StatusBar
-            ctx={liveCtx}
-            todoDone={todoCounts.done}
-            todoTotal={todoCounts.total}
-            onTodo={() => setPlanOpen(true)}
-            onChanges={() => setGitOpen({ path: null })}
-            onRules={() => setRulesOpen(true)}
-            approvalMode={approvalCell}
-            onStats={() => setStatsOpen(true)}
-            onTree={() => toggleSide("tree")}
-            onTerminal={() => terminal.toggle(planKey)}
-            terminalOpen={_TERM_entryOf(terminal.state, planKey).open}
-            onBrowser={() => toggleSide("browser")}
-            browserOpen={side === "browser"}
-            onSettings={() => openSettings()}
-            settingsActive={stab.active}
-            keepAwake={keepAwake}
-            keepAwakeSessionId={keepAwakeSessionId}
-            onKeepAwakeSettings={() => openSettings("session")}
-          />
+          <StatusBar ctx={liveCtx} todoDone={todoCounts.done} todoTotal={todoCounts.total} onTodo={() => setPlanOpen(true)} updater={updater}
+            branch={activeProject.branch} tabId={activeProject.id} bridge={bridge}
+            branchLocked={window.OMP_TURN_STATUS.busyInRepo(sessions, activeProject.repoRoot)}
+            keepAwake={keepAwake} keepAwakeSessionId={keepAwakeSessionId}
+            onKeepAwakeSettings={() => openSettings("session")} />
         </div>
       </div>
 

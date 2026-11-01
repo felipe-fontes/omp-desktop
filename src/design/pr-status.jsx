@@ -11,20 +11,7 @@ function PrStatusGlyph({ glyph }) {
       strokeLinejoin="round"
       aria-hidden="true"
     >
-      {glyph === "merged" ? (
-        <>
-          <circle cx="4" cy="3" r="1.5" />
-          <circle cx="12" cy="3" r="1.5" />
-          <circle cx="4" cy="13" r="1.5" />
-          <path d="M4 4.5v7M12 4.5v1a3 3 0 0 1-3 3H4" />
-        </>
-      ) : glyph === "closed" ? (
-        <>
-          <circle cx="4" cy="3" r="1.5" />
-          <circle cx="4" cy="13" r="1.5" />
-          <path d="M4 4.5v7M9 8l5 5m0-5-5 5" />
-        </>
-      ) : glyph === "draft" ? (
+      {glyph === "draft" ? (
         <>
           <circle cx="4" cy="3" r="1.5" />
           <circle cx="4" cy="13" r="1.5" />
@@ -151,8 +138,7 @@ function PrStatus({ status, model: suppliedModel, mode = "all", onReview }) {
   if (!model) return null;
   const identity = mode !== "badges";
   const badges = mode !== "icon";
-  const failed = badges && model.glyph !== "merged" && model.glyph !== "closed"
-    && (model.checksState === "failure" || model.failedCount > 0);
+  const failed = badges && (model.checksState === "failure" || model.failedCount > 0);
   const descriptive = mode === "badges";
   const bubble = (
     <>

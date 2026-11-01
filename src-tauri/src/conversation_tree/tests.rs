@@ -307,7 +307,7 @@ fn leaf_is_the_last_entry_mapped_to_its_kept_ancestor() {
             ],
         ),
     );
-    let b = fx.put(
+    fx.put(
         "b.jsonl",
         &with_header(
             Some(&a),
@@ -325,7 +325,6 @@ fn leaf_is_the_last_entry_mapped_to_its_kept_ancestor() {
     };
     assert_eq!(leaf("a.jsonl"), Some("a1"));
     assert_eq!(leaf("b.jsonl"), Some("u9"));
-    assert!(b.exists());
 }
 
 #[test]

@@ -153,9 +153,19 @@
   <script src="app/drag-reorder.js"></script>
 
   <!-- Empty-workspace backdrop: pure digital-rain + ASCII logo geometry.
-       Dependency-free IIFE; design/empty-workspace.jsx destructures
+       Dependency-free IIFE; design/backdrops/backdrop.jsx destructures
        window.OMP_MATRIX at top level, so it must load before it. -->
   <script src="app/matrix-rain.js"></script>
+  <!-- Start screens: the screen list, shared math and the next-token rules,
+       then each other screen's rules, added to the same object (so after
+       it). Dependency-free IIFEs; the renderers in design/backdrops/ read
+       window.OMP_BACKDROPS at run time and app/settings-schema.js reads it
+       late (start screen tiles). -->
+  <script src="app/backdrops.js"></script>
+  <script src="app/backdrops-latent.js"></script>
+  <script src="app/backdrops-orbit.js"></script>
+  <script src="app/backdrops-neural.js"></script>
+  <script src="app/backdrops-attention.js"></script>
 
   <!-- Per-tab composer draft + plan-mode state (issue #28): pure map and
        transition helpers. Dependency-free IIFE; design/composer.jsx,
@@ -166,6 +176,10 @@
   <script src="app/live-voice.js"></script>
   <!-- Quoted chat/voice history for each native live connection. -->
   <script src="app/live-context.js"></script>
+  <!-- Voice spectrum: when the microphone analyser runs and the bar
+       physics; dependency-free IIFE, read late by app-live.jsx and
+       design/voice-spectrum.jsx. -->
+  <script src="app/voice-spectrum.js"></script>
   <!-- Accent tokens (#37): the soft/glow/deep shades derived from a picked
        accent. Dependency-free IIFE; app/use-bridge-snapshot.jsx's
        useThemeEffect calls window.OMP_ACCENT at effect time. -->
@@ -186,7 +200,7 @@
   <script src="app/ask-recovery.js"></script>
 
   <!-- Tool approval mode (#57): omp's --approval-mode per project / default,
-       the status-bar cell and which open tabs a change restarts.
+       the toolbar's approvals button and which open tabs a change restarts.
        Dependency-free IIFE (reads window.OMP_TURN_STATUS late-bound, at
        call time); live.js reads window.OMP_APPROVAL_MODE at its top-level
        init, the approvals panel and app-live.jsx inside function bodies. -->
@@ -218,8 +232,6 @@
   <script src="app/goal.js"></script>
   <!-- Lifecycle and feedback presentation shared by the card and navigation. -->
   <script src="app/pr-status.js"></script>
-  <!-- Shared read-only PR discovery queue. -->
-  <script src="app/pr-discovery.js"></script>
   <!-- Per-tab PR feedback deduplication and cancellable monitoring. -->
   <script src="app/pr-automation.js"></script>
 
@@ -317,6 +329,9 @@
        (profile-menu.jsx, tab-group-chip.jsx, thinking-menu.jsx,
        path-setting.jsx's PathPicker). -->
   <script src="design/ui/use-popover-dismiss.js"></script>
+  <!-- A dropdown pick that runs an async action (thinking-menu.jsx,
+       branch-menu.jsx); called at render time. -->
+  <script src="design/ui/use-menu-pick.js"></script>
   <!-- Pointer drag-to-reorder (#40) for the tab bar, the group chip's
        dropdown and the project sidebar: chrome.jsx and project-sidebar.jsx
        call window.useDragReorder at render time, tab-group-chip.jsx gets
@@ -330,6 +345,10 @@
        prompt-history-modal.jsx, update-modal.jsx and confirm-close.jsx
        call window.useModalFocus at render time. -->
   <script src="design/ui/use-modal-focus.js"></script>
+  <!-- Keyboard-driven popup lists: useActiveRowIntoView (composer.jsx's
+       slash menu and mentions, history-modal.jsx, prompt-history-modal.jsx)
+       and useListKeys (the two history modals), called at render time. -->
+  <script src="design/ui/use-list-nav.js"></script>
   <!-- The column resize line (#41); destructures
        window.OMP_LAYOUT_WIDTHS at top level; browser-dock.jsx and
        app-live.jsx destructure ResizeHandle at top level. -->
@@ -388,6 +407,9 @@
   <script type="text/babel" src="design/widgets/widget-blocks.jsx"></script>
   <script type="text/babel" src="design/widgets/widget-card.jsx"></script>
   <script type="text/babel" src="design/pr-status.jsx"></script>
+  <!-- Current-branch PR checks and the portaled action menu. -->
+  <script type="text/babel" src="design/pr-checks.jsx"></script>
+  <script type="text/babel" src="design/pr-automation-menu.jsx"></script>
   <script type="text/babel" src="design/pr-automation-card.jsx"></script>
   <script type="text/babel" src="design/background-tasks.jsx"></script>
   <script type="text/babel" src="design/context-detail.jsx"></script>
@@ -440,8 +462,11 @@
   <!-- Composer's live voice status, controls and ephemeral captions. -->
   <script type="text/babel" src="design/live-voice.jsx"></script>
   <script type="text/babel" src="design/pending-input.jsx"></script>
+  <!-- Composer's microphone equalizer (canvas); reads window.OMP_VOICE_SPECTRUM
+       when it mounts. -->
+  <script type="text/babel" src="design/voice-spectrum.jsx"></script>
   <script type="text/babel" src="design/composer.jsx"></script>
-  <!-- Per-tab profile selector — chrome.jsx destructures window.ProfileMenu
+  <!-- Per-tab profile selector — toolbar.jsx destructures window.ProfileMenu
        at top level, so this must load before it. -->
   <script type="text/babel" src="design/profile-menu.jsx"></script>
   <!-- Inline conversation-name editor (#32) — tab-group-chip.jsx, chrome.jsx
@@ -453,13 +478,40 @@
        so this must load before it. -->
   <script type="text/babel" src="design/tab-group-chip.jsx"></script>
   <script type="text/babel" src="design/keep-awake.jsx"></script>
+  <!-- The status bar's branch pill and picker: chrome.jsx destructures
+       window.BranchMenu at top level, and it destructures OMP_GIT_BROWSER
+       (app/git-browser.js) and calls usePopoverDismiss. -->
+  <script type="text/babel" src="design/branch-menu.jsx"></script>
   <script type="text/babel" src="design/chrome.jsx"></script>
+  <!-- App toolbar between the title bar and the tabs; app-live.jsx
+       destructures window.Toolbar. -->
+  <script type="text/babel" src="design/toolbar.jsx"></script>
   <!-- Project sidebar (#27); reads window.TabRunDot / window.TabLabel
        (tab-group-chip.jsx) and window.OMP_PROJECT_NAV at top level. -->
   <script type="text/babel" src="design/project-sidebar.jsx"></script>
   <script type="text/babel" src="design/chat-workspace.jsx"></script>
-  <!-- Session column with no tab open; destructures window.MarkdownContent
-       and window.OMP_MATRIX at top level. -->
+  <!-- Start screens: art.js (plain IIFE, window.OMP_BACKDROP_ART: the
+       offscreen canvases, halo and env.logo helpers), which the canvas host
+       destructures at top level; one renderer per screen (plain IIFEs
+       registering on window.OMP_BACKDROP_RENDERERS, read when the canvas
+       effect runs; the latent screen's logo lives in latent-logo.js,
+       window.OMP_LATENT_LOGO, which latent.js reads at call time, and the
+       attention screen's in attention-logo.js, window.OMP_ATTENTION_LOGO,
+       read by attention.js the same way), then the canvas host
+       window.Backdrop, which destructures window.OMP_MATRIX and
+       window.OMP_BACKDROP_ART at top level. empty-workspace.jsx
+       destructures window.Backdrop and window.MarkdownContent at top level;
+       settings/controls.jsx reads window.Backdrop at render. -->
+  <script src="design/backdrops/art.js"></script>
+  <script src="design/backdrops/matrix.js"></script>
+  <script src="design/backdrops/latent.js"></script>
+  <script src="design/backdrops/latent-logo.js"></script>
+  <script src="design/backdrops/sampling.js"></script>
+  <script src="design/backdrops/orbit.js"></script>
+  <script src="design/backdrops/neural.js"></script>
+  <script src="design/backdrops/attention.js"></script>
+  <script src="design/backdrops/attention-logo.js"></script>
+  <script type="text/babel" src="design/backdrops/backdrop.jsx"></script>
   <script type="text/babel" src="design/empty-workspace.jsx"></script>
   <script type="text/babel" src="design/panels.jsx"></script>
   <!-- Git browser: the files pane exports window.GitFileTree and
@@ -541,6 +593,10 @@
        reads window.OMP_SESSION_TITLE at its top-level init, so it must
        load before live.js. -->
   <script src="app/session-title.js"></script>
+  <!-- Streaming message rebuilt from omp's delta message_update frames.
+       Dependency-free IIFE; live.js reads window.OMP_STREAM_DELTA at its
+       top-level init, so it must load before live.js. -->
+  <script src="app/stream-delta.js"></script>
   <script src="live.js"></script>
 
   <!-- App root — wired to OMP_BRIDGE, no demo effects -->
@@ -567,6 +623,9 @@
   <!-- Browser panel hook; destructures window.OMP_BROWSER and
        window.OMP_BROWSER_SCREEN at top level. -->
   <script type="text/babel" src="app/use-browser.jsx"></script>
+  <!-- Composer voice spectrum: starts/stops Rust's microphone analyser and
+       keeps its newest frame in a ref; exports useVoiceSpectrum. -->
+  <script type="text/babel" src="app/use-voice-spectrum.jsx"></script>
   <!-- Phone publisher and actions; follows live.js and app/remote-view.js,
        exports useRemote for app-live.jsx. -->
   <script type="text/babel" src="app/use-remote.jsx"></script>

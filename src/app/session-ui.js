@@ -270,7 +270,6 @@
     }
     return next;
   }
-
   window.OMP_SESSION_UI = {
     entryOf, updateEntry, pruneEntries, seedEntries,
     PLAN_IDLE, togglePlan, enterPlan, approvePlan, annotatePlan, markPlanSent,

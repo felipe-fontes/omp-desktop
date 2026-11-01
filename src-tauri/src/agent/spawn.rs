@@ -82,7 +82,13 @@ pub fn omp_output<S: AsRef<OsStr>>(args: &[S]) -> Result<std::process::Output, S
 
 // ── omp version floor ───────────────────────────────────────────────────────
 
-/// First stable release with the draft-only dictation RPC (upstream #17158).
+/// Oldest omp OMP Desktop runs against: the newest release whose RPC
+/// commands, events or state fields the app relies on. Raise it in the change
+/// that starts using a newer omp feature; nothing else has to follow.
+///
+/// 18.13.2 first shipped the dictation RPC and rebuildable `message_update`
+/// frames in `messageUpdates: "delta"` (block on start/end, message on a
+/// restart), so every process streams deltas (`agent::DELTA_EVENT_FILTER`).
 const MIN_OMP_VERSION: [u32; 3] = [18, 13, 2];
 
 /// The binary whose `omp --version` check passed. Only a pass is
@@ -625,13 +631,6 @@ mod tests {
     fn resolved_cwd_is_idempotent_under_double_application() {
         let base = std::env::current_dir().expect("current dir");
         let dir = "child-project";
-
-        // Sanity check on the bug itself: applying the raw relative value
-        // twice (once as an OS chdir, once as omp's own relative --cwd)
-        // nests it one level deeper than intended.
-        let buggy_double_apply = base.join(dir).join(dir);
-        assert_eq!(buggy_double_apply, base.join(dir).join(dir));
-        assert_ne!(buggy_double_apply, base.join(dir));
 
         // The fix: resolve once, and the same absolute value survives a
         // second application unchanged.

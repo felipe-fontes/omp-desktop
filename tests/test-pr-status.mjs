@@ -11,6 +11,7 @@ import { runInNewContext } from "node:vm";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const win = {};
+new Function("window", readFileSync(join(root, "src/app/pr-automation.js"), "utf8"))(win);
 // eslint-disable-next-line no-new-func
 new Function(
   "window",
@@ -30,12 +31,16 @@ function check(label, fn) {
 }
 
 const snapshot = (extra = {}) => ({
-  state: "OPEN",
   isDraft: false,
-  checksState: "none",
   number: 42,
   url: "https://github.com/Owner/Repo/pull/42",
+  title: "PR",
   repository: "Owner/Repo",
+  branch: "feature",
+  head: "abc123",
+  additions: 2,
+  deletions: 1,
+  checks: [],
   failedChecks: [],
   threads: [],
   ...extra,
@@ -47,418 +52,166 @@ const status = (extra = {}, fields = {}) => ({
   ...fields,
 });
 const thread = (id) => ({ id, updatedAt: "2026-10-27T00:00:00Z" });
-const failedCheck = (id) => ({ id, name: id });
+const failedCheck = (id) => ({ id });
+const ci = (state, name = "check") => ({
+  name, state, url: "https://github.com/checks/1",
+});
 
 check("no known PR, including an in-flight lookup, has no indicator", () => {
   assert.equal(P.present(null), null);
-  assert.equal(
-    P.present({ snapshot: null, loading: false, discoveryError: null }),
-    null,
-  );
-  assert.equal(
-    P.present({ snapshot: null, loading: true, discoveryError: null }),
-    null,
-  );
-  assert.equal(P.aggregate([]), null);
+  assert.equal(P.present({ snapshot: null, loading: false }), null);
+  assert.equal(P.present({ snapshot: null, loading: true }), null);
   assert.equal(P.aggregate([null, { snapshot: null, loading: true }]), null);
 });
 
-check("an open PR reports its lifecycle and neutral no-check state", () => {
-  assert.deepEqual(P.present(status()), {
-    glyph: "open",
-    tone: "open",
-    label: "Open",
-    description: "Open pull request #42; No checks",
-    number: 42,
-    repository: "Owner/Repo",
-    lifecycleLabel: "Open",
-    lifecycleDescription: "Open pull request #42 (Owner/Repo)",
-    checksDescription: "No checks",
-    reviewDescription: "0 unresolved review threads",
-    refreshDescription: null,
-    checksState: "none",
-    failedCount: 0,
-    threadCount: 0,
-    stale: false,
-    prCount: 1,
-  });
+check("an open PR reports its identity and no-check state", () => {
+  const model = P.present(status());
+  assert.equal(model.glyph, "open");
+  assert.equal(model.label, "Open");
+  assert.equal(model.checksState, "none");
+  assert.equal(model.description, "Open pull request #42; No checks");
+  assert.equal(model.lifecycleDescription, "Open pull request #42 (Owner/Repo)");
+  assert.equal(model.threadCount, 0);
+});
+
+check("individual checks project pending, completed and failed CI", () => {
+  for (const [checks, expected, description] of [
+    [[ci("queued")], "pending", /Checks pending/],
+    [[ci("running")], "pending", /Checks pending/],
+    [[ci("success")], "success", /Checks passed/],
+    [[ci("neutral")], "unknown", /Check results unknown/],
+  ]) {
+    const model = P.present(status({ checks }));
+    assert.equal(model.checksState, expected);
+    assert.match(model.description, description);
+  }
+  const model = P.present(status({
+    checks: [ci("running", "test"), ci("failure", "lint")],
+    failedChecks: [failedCheck("f")],
+  }));
+  assert.equal(model.checksState, "pending");
+  assert.equal(model.failedCount, 1);
+  assert.equal(model.tone, "failure");
+  assert.match(model.checksDescription, /Checks pending; 1 failed check/);
 });
 
 check("draft and ready PRs retain different shapes when CI fails", () => {
   for (const [isDraft, glyph, label] of [
-    [false, "open", "Open"],
-    [true, "draft", "Draft"],
+    [false, "open", "Open"], [true, "draft", "Draft"],
   ]) {
-    const model = P.present(
-      status({
-        isDraft,
-        checksState: "failure",
-        failedChecks: [failedCheck("c1")],
-      }),
-    );
+    const model = P.present(status({
+      isDraft, checks: [ci("failure")], failedChecks: [failedCheck("c1")],
+    }));
     assert.equal(model.glyph, glyph);
-    assert.equal(model.tone, "failure");
     assert.equal(model.label, label);
+    assert.equal(model.tone, "failure");
     assert.equal(model.failedCount, 1);
     assert.match(model.description, /1 failed check/);
-    assert.doesNotMatch(model.description, /Checks passed/);
   }
 });
 
-check("pending, absent, unknown and successful checks remain distinct", () => {
-  const cases = [
-    ["pending", /Checks pending/],
-    ["none", /No checks/],
-    ["unknown", /Check results unknown/],
-    ["success", /Checks passed/],
-  ];
-  for (const [checksState, description] of cases) {
-    const model = P.present(status({ checksState }));
-    assert.equal(model.checksState, checksState);
-    assert.match(model.description, description);
-    if (checksState !== "success")
-      assert.doesNotMatch(model.description, /Checks passed/);
-    assert.equal(model.tone, "open");
-  }
-});
-
-check(
-  "a failure state remains visible even when no failed-check details are available",
-  () => {
-    const model = P.present(status({ checksState: "failure" }));
-    assert.equal(model.tone, "failure");
-    assert.equal(model.failedCount, 0);
-    assert.match(model.description, /Checks failed/);
-  },
-);
-
-check("only unique unresolved, current review threads are actionable", () => {
-  const threads = [
-    thread("one"),
-    thread("one"),
-    thread("two"),
-    { ...thread("resolved"), isResolved: true },
-    { ...thread("outdated"), isOutdated: true },
-    { ...thread("also-resolved"), resolved: true },
-    { ...thread("also-outdated"), outdated: true },
-    { id: "" },
-    null,
-  ];
-  const model = P.present(status({ threads }));
+check("actionable review thread identities are deduplicated", () => {
+  const model = P.present(status({ threads: [thread("one"), thread("one"), thread("two")] }));
   assert.equal(model.threadCount, 2);
   assert.match(model.description, /2 unresolved review threads/);
   assert.doesNotMatch(P.present(status()).description, /review thread/);
-  assert.match(
-    P.present(status({ threads: [thread("one")] })).description,
-    /1 unresolved review thread(?:;|$)/,
-  );
 });
 
-check(
-  "terminal lifecycle takes precedence over historical failures and hides review attention",
-  () => {
-    for (const [state, glyph, label] of [
-      ["MERGED", "merged", "Merged"],
-      ["CLOSED", "closed", "Closed"],
-    ]) {
-      const model = P.present(
-        status({
-          state,
-          isDraft: true,
-          checksState: "failure",
-          failedChecks: [failedCheck("c1")],
-          threads: [thread("t1")],
-        }),
-      );
-      assert.equal(model.glyph, glyph);
-      assert.equal(model.tone, glyph);
-      assert.equal(model.label, label);
-      assert.equal(model.checksState, "failure");
-      assert.equal(model.failedCount, 1);
-      assert.equal(model.threadCount, 0);
-      assert.match(model.description, /Historical CI: 1 failed check/);
-      assert.doesNotMatch(model.description, /unresolved review thread/);
-    }
-  },
-);
-
-check(
-  "a failed refresh explicitly labels the retained snapshot as stale",
-  () => {
-    const model = P.present(
-      status({ checksState: "success" }, { discoveryError: "GitHub offline" }),
-    );
-    assert.equal(model.glyph, "open");
-    assert.equal(model.stale, true);
-    assert.match(model.description, /Open pull request #42/);
-    assert.match(model.lifecycleDescription, /Last known.*Open pull request #42/);
-    assert.match(model.refreshDescription, /GitHub offline/);
-    assert.match(model.description, /stale/i);
-    assert.match(model.description, /GitHub offline/);
-  },
-);
-
-check("an error without a known snapshot has no PR indicator", () => {
-  const unavailable = {
-    snapshot: null,
-    loading: false,
-    discoveryError: "Branch unavailable",
-  };
-  assert.equal(P.present(unavailable), null);
-  assert.equal(P.aggregate([unavailable, { snapshot: null, discoveryError: "Offline" }]), null);
+check("failed refreshes retain and label the last known PR", () => {
+  const model = P.present(status({ checks: [ci("success")] }, { discoveryError: "GitHub offline" }));
+  assert.equal(model.glyph, "open");
+  assert.equal(model.stale, true);
+  assert.match(model.lifecycleDescription, /Last known.*Open pull request #42/);
+  assert.match(model.refreshDescription, /GitHub offline/);
+  assert.match(model.description, /stale/i);
+  assert.equal(P.present({ snapshot: null, loading: false, discoveryError: "Offline" }), null);
+  assert.equal(P.present(status({ checks: [ci("running")] }, { loading: true })).stale, false);
 });
 
-check("a refresh in progress does not make a known snapshot stale", () => {
-  const model = P.present(
-    status({ checksState: "pending" }, { loading: true }),
-  );
-  assert.equal(model.stale, false);
-  assert.equal(model.checksState, "pending");
+check("duplicate PR reports deduplicate feedback and preserve draft and CI attention", () => {
+  const first = status({
+    repository: "Owner/Repo", checks: [ci("failure", "a"), ci("failure", "b")],
+    failedChecks: [failedCheck("a"), failedCheck("b")],
+    threads: [thread("x"), thread("y")],
+  });
+  const second = status({
+    repository: "owner/repo", isDraft: true, checks: [ci("queued"), ci("failure", "a")],
+    failedChecks: [failedCheck("a")], threads: [thread("x"), thread("y")],
+  });
+  const model = P.aggregate([first, second]);
+  assert.equal(model.prCount, 1);
+  assert.equal(model.glyph, "draft");
+  assert.equal(model.tone, "failure");
+  assert.equal(model.checksState, "failure");
+  assert.equal(model.failedCount, 2);
+  assert.equal(model.threadCount, 2);
+  assert.deepEqual(P.aggregate([second, first]), model);
 });
 
-check(
-  "duplicate repository and PR identities share check and thread counts",
-  () => {
-    const first = status({
-      repository: "Owner/Repo",
-      checksState: "failure",
-      failedChecks: [failedCheck("a"), failedCheck("a"), failedCheck("b")],
-      threads: [thread("x"), thread("y")],
-    });
-    const second = status({
-      repository: "owner/repo",
-      checksState: "failure",
-      failedChecks: [failedCheck("a"), failedCheck("b")],
-      threads: [thread("x"), thread("y"), thread("y")],
-    });
-    const model = P.aggregate([first, second]);
-    assert.equal(model.prCount, 1);
-    assert.equal(model.glyph, "open");
-    assert.equal(model.tone, "failure");
-    assert.equal(model.failedCount, 2);
-    assert.equal(model.threadCount, 2);
-    assert.deepEqual(P.aggregate([second, first]), model);
-  },
-);
+check("fresh duplicates supersede stale feedback while preserving error details", () => {
+  const stale = status({
+    checks: [ci("failure")], failedChecks: [failedCheck("old")], threads: [thread("old")],
+  }, { discoveryError: "Refresh failed" });
+  const fresh = status({ checks: [ci("success")], threads: [thread("current")] });
+  const model = P.aggregate([stale, fresh]);
+  assert.equal(model.tone, "open");
+  assert.equal(model.checksState, "success");
+  assert.equal(model.failedCount, 0);
+  assert.equal(model.threadCount, 1);
+  assert.equal(model.stale, true);
+  assert.match(model.description, /Refresh failed/);
+});
 
-check(
-  "concurrent draft and ready reports preserve failed CI and draft shape",
-  () => {
-    const ready = status({
-      checksState: "failure",
-      failedChecks: [failedCheck("failed")],
-      threads: [thread("review")],
-    });
-    const draft = status({ isDraft: true, checksState: "pending" });
-    const model = P.aggregate([ready, draft]);
-    assert.equal(model.prCount, 1);
-    assert.equal(model.glyph, "draft");
-    assert.equal(model.tone, "failure");
-    assert.equal(model.checksState, "failure");
-    assert.equal(model.failedCount, 1);
-    assert.equal(model.threadCount, 1);
-    assert.deepEqual(P.aggregate([draft, ready]), model);
-  },
-);
-
-check(
-  "fresh duplicates supersede stale feedback without hiding the stale error",
-  () => {
-    const stale = status(
-      {
-        checksState: "failure",
-        failedChecks: [failedCheck("old")],
-        threads: [thread("old")],
-      },
-      { discoveryError: "Refresh failed" },
-    );
-    const fresh = status({
-      checksState: "success",
-      threads: [thread("current")],
-    });
-    const model = P.aggregate([stale, fresh]);
-    assert.equal(model.prCount, 1);
-    assert.equal(model.tone, "open");
-    assert.equal(model.checksState, "success");
-    assert.equal(model.failedCount, 0);
-    assert.equal(model.threadCount, 1);
-    assert.equal(model.stale, true);
-    assert.match(model.description, /Refresh failed/);
-  },
-);
-
-check("different repositories or PR numbers produce a mixed group", () => {
+check("different PRs and settled no-PR members produce mixed groups", () => {
   const ready = status({ number: 42, repository: "owner/repo" });
   const draft = status({ number: 43, repository: "owner/repo", isDraft: true });
-  const otherRepo = status({
-    number: 42,
-    repository: "owner/other",
-    state: "MERGED",
-  });
+  const otherRepo = status({ number: 42, repository: "owner/other" });
   const model = P.aggregate([draft, ready, otherRepo]);
   assert.equal(model.prCount, 3);
   assert.equal(model.glyph, "mixed");
-  assert.equal(model.tone, "mixed");
-  assert.equal(model.label, "Multiple pull requests");
-  assert.equal(model.checksState, "none");
-  assert.equal(model.number, null);
-  assert.equal(model.lifecycleLabel, "Multiple pull requests");
-  assert.match(model.lifecycleDescription, /Multiple pull requests \(3\)/);
   assert.match(model.description, /Draft pull request #43/);
-  assert.match(model.description, /Merged pull request #42/);
   assert.match(model.description, /owner\/other/);
   assert.deepEqual(P.aggregate([otherRepo, ready, draft]), model);
+  const mixed = P.aggregate([ready, { snapshot: null, loading: false, discoveryError: null }]);
+  assert.equal(mixed.glyph, "mixed");
+  assert.equal(mixed.prCount, 1);
+  assert.match(mixed.description, /1 conversation without a pull request/);
 });
 
-check("a settled no-PR member makes a single PR group mixed", () => {
-  const merged = status({
-    state: "MERGED",
-    checksState: "failure",
-    failedChecks: [failedCheck("old")],
+check("unsettled and errored members do not imply no PR", () => {
+  const known = status();
+  const unresolved = [null, undefined, {}, { loading: false }, { snapshot: null },
+    { snapshot: null, loading: true, discoveryError: null }];
+  assert.deepEqual(P.aggregate([known, ...unresolved]), P.present(known));
+  const errored = P.aggregate([known, { snapshot: null, loading: false, discoveryError: "Offline" }]);
+  assert.equal(errored.glyph, "open");
+  assert.equal(errored.stale, true);
+  assert.doesNotMatch(errored.description, /without a pull request/);
+});
+
+check("mixed PR attention combines failures, reviews and stale errors", () => {
+  const failed = status({
+    number: 1, checks: [ci("failure")], failedChecks: [failedCheck("f")],
+    threads: [thread("a"), thread("shared")],
   });
-  const noPr = { snapshot: null, loading: false, discoveryError: null };
-  const model = P.aggregate([merged, noPr]);
-  assert.equal(model.prCount, 1);
+  const pending = status({
+    number: 2, checks: [ci("running")], threads: [thread("shared"), thread("b")],
+  });
+  const model = P.aggregate([pending, failed, { snapshot: null, discoveryError: "Offline" }]);
   assert.equal(model.glyph, "mixed");
-  assert.equal(model.tone, "mixed");
-  assert.equal(model.label, "Mixed pull request status");
-  assert.equal(model.checksState, null);
-  assert.equal(model.failedCount, 0);
-  assert.match(model.description, /Merged pull request #42/);
-  assert.match(model.description, /1 conversation without a pull request/);
-  assert.deepEqual(P.aggregate([noPr, merged]), model);
-
-  const draft = status({
-    isDraft: true,
-    checksState: "failure",
-    failedChecks: [failedCheck("failed")],
-  });
-  const draftGroup = P.aggregate([draft, noPr, noPr]);
-  assert.equal(draftGroup.glyph, "mixed");
-  assert.equal(draftGroup.tone, "failure");
-  assert.equal(draftGroup.prCount, 1);
-  assert.equal(draftGroup.failedCount, 1);
-  assert.match(
-    draftGroup.description,
-    /2 conversations without a pull request/,
-  );
-});
-
-check(
-  "unsettled, absent, loading and errored members do not imply no PR",
-  () => {
-    const merged = status({ state: "MERGED" });
-    const unresolved = [
-      null,
-      undefined,
-      {},
-      { loading: false },
-      { snapshot: null },
-      { snapshot: null, loading: true, discoveryError: null },
-    ];
-    assert.deepEqual(P.aggregate([merged, ...unresolved]), P.present(merged));
-    const errored = P.aggregate([
-      merged,
-      { snapshot: null, loading: false, discoveryError: "Offline" },
-    ]);
-    assert.equal(errored.glyph, "merged");
-    assert.equal(errored.stale, true);
-    assert.doesNotMatch(errored.description, /without a pull request/);
-  },
-);
-
-check(
-  "mixed attention prioritizes failed open CI, then unresolved threads",
-  () => {
-    const failed = status({
-      number: 1,
-      checksState: "failure",
-      failedChecks: [failedCheck("f")],
-      threads: [thread("a")],
-    });
-    const comments = status({
-      number: 2,
-      checksState: "pending",
-      threads: [thread("b"), thread("c")],
-    });
-    const merged = status({
-      number: 3,
-      state: "MERGED",
-      checksState: "failure",
-      failedChecks: [failedCheck("historical")],
-      threads: [thread("old")],
-    });
-    const model = P.aggregate([merged, comments, failed]);
-    assert.equal(model.glyph, "mixed");
-    assert.equal(model.tone, "failure");
-    assert.equal(model.checksState, "failure");
-    assert.equal(model.failedCount, 1);
-    assert.equal(model.threadCount, 3);
-    assert.match(model.description, /Checks pending/);
-    assert.match(model.description, /Historical CI: 1 failed check/);
-    const commentsOnly = P.aggregate([comments, merged]);
-    assert.equal(commentsOnly.glyph, "mixed");
-    assert.equal(commentsOnly.tone, "mixed");
-    assert.equal(commentsOnly.checksState, "pending");
-    assert.equal(commentsOnly.failedCount, 0);
-    assert.equal(commentsOnly.threadCount, 2);
-  },
-);
-
-check("thread identities are not multiplied across distinct PR reports", () => {
-  const model = P.aggregate([
-    status({ number: 1, threads: [thread("shared"), thread("one")] }),
-    status({ number: 2, threads: [thread("shared"), thread("two")] }),
-  ]);
-  assert.equal(model.prCount, 2);
+  assert.equal(model.tone, "failure");
+  assert.equal(model.checksState, "failure");
+  assert.equal(model.failedCount, 1);
   assert.equal(model.threadCount, 3);
-});
-
-check("terminal-only mixed groups never suggest actionable failed CI", () => {
-  const model = P.aggregate([
-    status({
-      number: 1,
-      state: "MERGED",
-      checksState: "failure",
-      failedChecks: [failedCheck("old")],
-      threads: [thread("old")],
-    }),
-    status({
-      number: 2,
-      state: "CLOSED",
-      checksState: "success",
-      threads: [thread("older")],
-    }),
-  ]);
-  assert.equal(model.glyph, "mixed");
-  assert.equal(model.tone, "mixed");
-  assert.equal(model.checksState, null);
-  assert.equal(model.failedCount, 0);
-  assert.equal(model.threadCount, 0);
-  assert.match(model.description, /Historical CI/);
-});
-
-check("mixed groups include errors from tabs without a snapshot", () => {
-  const model = P.aggregate([
-    status({ number: 1 }),
-    status({ number: 2 }),
-    { snapshot: null, discoveryError: "Network unavailable" },
-  ]);
-  assert.equal(model.prCount, 2);
-  assert.equal(model.glyph, "mixed");
   assert.equal(model.stale, true);
-  assert.match(model.description, /stale/i);
-  assert.match(model.description, /Network unavailable/);
+  assert.match(model.description, /Checks pending/);
+  assert.match(model.description, /Offline/);
 });
 
-check("presentation does not mutate status snapshots", () => {
-  const input = [
-    status({
-      checksState: "failure",
-      failedChecks: [failedCheck("c")],
-      threads: [thread("t")],
-    }),
-  ];
+check("presentation does not mutate canonical snapshots", () => {
+  const input = [status({
+    checks: [ci("failure")], failedChecks: [failedCheck("c")], threads: [thread("t")],
+  })];
   const before = structuredClone(input);
   P.present(input[0]);
   P.aggregate(input);
@@ -498,6 +251,8 @@ function uiHarness() {
     OMP_PR_STATUS: P,
     OMP_PROJECT_NAV: { projectPath: (tab) => tab.workspace?.projectPath || tab.path },
     Icon: () => null,
+    PrChecks: () => null,
+    PrAutomationMenu: () => null,
     usePopoverDismiss: () => {},
     innerWidth: 1000,
     innerHeight: 700,
@@ -538,13 +293,13 @@ function byClass(tree, name) {
 }
 const cardStatus = (fields = {}) => ({
   snapshot: null, localChanges: null, localError: null, loading: false,
-  discoveryError: null, enabled: false, canEnable: false, status: "", ...fields,
+  discoveryError: null, enabled: false, status: "", ...fields,
 });
 
 check("identity and feedback modes render separate accessible semantic details", () => {
   const h = uiHarness();
   const model = P.present(status({
-    checksState: "pending", failedChecks: [failedCheck("f")], threads: [thread("one")],
+    checks: [ci("running"), ci("failure")], failedChecks: [failedCheck("f")], threads: [thread("one")],
   }, { discoveryError: "Network down" }));
   const icon = h.render(h.window.PrStatus, { model, mode: "icon" });
   assert.match(text(icon), /#42/);
@@ -557,15 +312,6 @@ check("identity and feedback modes render separate accessible semantic details",
   assert.ok(details.some((node) => /failed check/.test(node.props.text)));
   assert.ok(details.some((node) => /1 unresolved review thread/.test(node.props.text)));
   assert.equal(details.filter((node) => /Network down/.test(node.props.text)).length, 1);
-  for (const checksState of ["pending", "success", "none", "unknown"]) {
-    const conflicting = P.present(status({ checksState, failedChecks: [failedCheck("f")] }));
-    const rendered = h.render(h.window.PrStatus, { model: conflicting, mode: "badges" });
-    const checks = nodes(rendered).filter((node) =>
-      node.type === h.window.StatusDetail && node.props.className?.includes("pr-status-ci"));
-    assert.equal(checks.length, 1);
-    assert.match(checks[0].props.className, /failure/);
-    assert.equal(checks[0].props.text, conflicting.checksDescription);
-  }
   const mixed = P.aggregate([status({ number: 1 }), status({ number: 2 })]);
   assert.match(text(h.render(h.window.PrStatus, { model: mixed })), /2 PRs/);
   assert.equal(h.render(h.window.PrStatus, { status: { snapshot: null, discoveryError: "Offline" } }), null);
@@ -573,8 +319,8 @@ check("identity and feedback modes render separate accessible semantic details",
 
 check("PR identity stays visible without badges for non-failing CI and no review feedback", () => {
   const h = uiHarness();
-  for (const checksState of ["none", "unknown", "pending", "success"]) {
-    const model = P.present(status({ checksState }));
+  for (const checks of [[], [ci("neutral")], [ci("queued")], [ci("running")], [ci("success")]]) {
+    const model = P.present(status({ checks }));
     const full = h.render(h.window.PrStatus, { model });
     assert.ok(byClass(full, "pr-status-identity"));
     assert.equal(byClass(full, "pr-status-ci"), undefined);
@@ -582,17 +328,19 @@ check("PR identity stays visible without badges for non-failing CI and no review
     const badges = h.render(h.window.PrStatus, { model, mode: "badges" });
     assert.equal(nodes(badges).filter(node => node.type === h.window.StatusDetail).length, 0);
     const withReview = h.render(h.window.PrStatus, {
-      model: P.present(status({ checksState, threads: [thread("review")] })),
+      model: P.present(status({ checks, threads: [thread("review")] })),
     });
     assert.equal(byClass(withReview, "pr-status-ci"), undefined);
     assert.ok(byClass(withReview, "pr-status-review"));
   }
 });
 
-check("review detail preserves its button action and terminal PRs hide attention", () => {
+check("review detail preserves its button action", () => {
   const h = uiHarness();
   let opened = 0;
-  const open = P.present(status({ checksState: "failure", threads: [thread("one")] }));
+  const open = P.present(status({
+    checks: [ci("failure")], failedChecks: [failedCheck("f")], threads: [thread("one")],
+  }));
   const tree = h.render(h.window.PrStatus, { model: open, mode: "badges", onReview: () => opened++ });
   const review = byClass(tree, "pr-status-review");
   assert.equal(review.type, "button");
@@ -606,11 +354,6 @@ check("review detail preserves its button action and terminal PRs hide attention
   assert.equal(byClass(action, "pr-status-review").props["aria-describedby"], "status-tooltip");
   byClass(action, "pr-status-review").props.onClick();
   assert.equal(opened, 2);
-  for (const state of ["MERGED", "CLOSED"]) {
-    const terminal = P.present(status({ state, checksState: "failure", threads: [thread("old")] }));
-    const rendered = h.render(h.window.PrStatus, { model: terminal, mode: "badges", onReview: () => opened++ });
-    assert.equal(nodes(rendered).filter((node) => node.type === h.window.StatusDetail).length, 0);
-  }
 });
 
 check("status details show a portal on focus and isolate navigation gestures", () => {
@@ -663,91 +406,41 @@ check("worktree identity names the actual checkout without a branch icon", () =>
   assert.equal(h.render(h.window.WorktreeIndicator, { tab: { path: "/projects/app" } }), null);
 });
 
-check("contextual card stays hidden without known changes or a PR", () => {
-  for (const fields of [
-    {},
-    { loading: true },
-    { discoveryError: "No upstream", localError: "Read failed" },
-    { localChanges: { changed: 0 } },
-  ]) {
-    const h = uiHarness();
-    assert.equal(h.render(h.window.PrAutomationCard, {
-      automation: cardStatus(fields), available: false, bridge: {},
-    }), null);
-  }
-});
-
-check("local-only card opens Git changes without PR or automation warnings", () => {
+check("local-only changes remain available without GitHub", () => {
   const h = uiHarness();
   let opened = 0;
   const tree = h.render(h.window.PrAutomationCard, {
-    automation: cardStatus({
-      localChanges: { changed: 2 }, discoveryError: "No upstream", error: "Auto-fix unavailable",
-    }),
+    automation: cardStatus({ ghMissing: true, localChanges: { changed: 2 } }),
     bridge: {}, onOpenChanges: () => opened++,
   });
   assert.match(text(tree), /2 changed files/);
-  assert.doesNotMatch(text(tree), /PR actions|Auto-fix|No upstream/);
-  assert.equal(nodes(tree).some((node) => node.type === h.window.PrStatus), false);
+  assert.doesNotMatch(text(tree), /No open pull request/);
   byClass(tree, "pr-changes-local-link").props.onClick();
   assert.equal(opened, 1);
   const truncated = h.render(h.window.PrAutomationCard, {
-    automation: cardStatus({ localChanges: { changed: 100, truncated: true } }), bridge: {},
+    automation: cardStatus({ ghMissing: true, localChanges: { changed: 100, truncated: true } }),
+    bridge: {},
   });
   assert.match(text(truncated), /At least 100 changed files/);
 });
 
-check("known PRs remain visible with separate last-known refresh problems", () => {
+check("current PR uses the owner's CI progress component and action menu", () => {
   const h = uiHarness();
-  const tree = h.render(h.window.PrAutomationCard, {
-    automation: cardStatus({
-      snapshot: snapshot({ title: "Change", additions: 2, deletions: 1 }),
-      localChanges: { changed: 1 }, discoveryError: "GitHub offline", localError: "Git offline",
-    }), bridge: {},
-  });
-  assert.match(text(tree), /Change/);
-  assert.match(text(tree), /Last known · Open/);
-  assert.match(text(tree), /Last known · 1 changed file/);
-  assert.match(text(tree), /PR refresh failed: GitHub offline/);
-  assert.match(text(tree), /Local changes refresh failed: Git offline/);
-  assert.equal(nodes(tree).filter((node) => node.type === h.window.PrStatus).length, 2);
-  const clean = h.render(h.window.PrAutomationCard, {
-    automation: cardStatus({ snapshot: snapshot({ title: "Clean PR" }) }), bridge: {},
-  });
-  assert.match(text(clean), /Clean PR/);
-  assert.doesNotMatch(text(clean), /changed files?/);
-});
-
-check("PR actions gate Auto-fix by current open PR enablement", () => {
-  for (const [state, canEnable, available, expected] of [
-    ["OPEN", true, true, false],
-    ["OPEN", false, true, true],
-    ["OPEN", true, false, true],
-    ["MERGED", true, true, null],
-    ["CLOSED", true, true, null],
-  ]) {
-    const h = uiHarness();
-    let toggled = 0;
-    const props = {
-      automation: cardStatus({
-        snapshot: snapshot({ state, title: "PR" }), canEnable, toggle: () => toggled++,
-      }), available, bridge: {},
-    };
-    let tree = h.render(h.window.PrAutomationCard, props);
-    byClass(tree, "pr-changes-more").props.onClick();
-    tree = h.render(h.window.PrAutomationCard, props);
-    const control = byClass(tree, "pr-changes-autofix");
-    if (expected === null) {
-      assert.equal(control, undefined);
-      assert.doesNotMatch(text(tree), /Automation|Auto-fix/);
-    } else {
-      assert.equal(control.props.disabled, expected);
-      if (!expected) {
-        control.props.onClick();
-        assert.equal(toggled, 1);
-      }
-    }
-  }
+  const checks = [{ name: "test", state: "running", url: "https://github.com/checks/1" }];
+  const props = {
+    automation: cardStatus({ snapshot: snapshot({
+      title: "Current PR", additions: 2, deletions: 1, checks,
+    }) }),
+    bridge: {},
+  };
+  let tree = h.render(h.window.PrAutomationCard, props);
+  assert.match(text(tree), /Current PR/);
+  const progress = nodes(tree).find((node) => node.type === h.window.PrChecks);
+  assert.equal(progress.props.checks, checks);
+  byClass(tree, "pr-changes-more").props.onClick();
+  tree = h.render(h.window.PrAutomationCard, props);
+  const menu = nodes(tree).find((node) => node.type === h.window.PrAutomationMenu);
+  assert.equal(menu.props.automation, props.automation);
 });
 
 console.log(`pr-status: ${passed} checks passed`);

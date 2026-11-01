@@ -20,8 +20,6 @@
 .pr-status-glyph { width: 14px; height: 14px; flex: none; }
 .pr-status-open { color: var(--diff-add-fg); }
 .pr-status-draft, .pr-status-mixed { color: var(--pr-neutral); }
-.pr-status-merged { color: var(--lilac); }
-.pr-status-closed { color: var(--diff-rm-fg); }
 .pr-status.is-stale .pr-status-identity { color: var(--pr-neutral); }
 .pr-status-ci, .pr-status-stale {
   display: inline-flex; align-items: center; justify-content: center;

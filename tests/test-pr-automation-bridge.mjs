@@ -19,14 +19,6 @@ const snapshot = (over = {}) => ({
   url: A,
   branch: "feature",
   head: "abc123",
-  state: "OPEN",
-  ...over,
-});
-const changes = (over = {}) => ({
-  snapshot: null,
-  discoveryError: null,
-  localChanges: null,
-  localError: null,
   ...over,
 });
 const permit = () => true;
@@ -36,7 +28,6 @@ function harness() {
     journal = new Map(),
     commands = [],
     reads = [],
-    changesReads = [],
     prompts = [];
   const w = {
     OMP_SLASH: { LOCAL_COMMANDS: [] },
@@ -46,7 +37,7 @@ function harness() {
     },
     OMP_EXT_WIDGETS: { EMPTY: {} },
     OMP_SESSION_PREFS: {
-      fromTweaks: () => ({ autoRetry: true }),
+      fromTweaks: () => ({ autoCompaction: true, autoRetry: true }),
       closeGuardArmed: () => false,
     },
     OMP_TWEAKS_STORE: { read: () => ({}) },
@@ -61,13 +52,17 @@ function harness() {
     "app/prompt-history.js",
     "app/session-title.js",
     "app/turn-status.js",
-    "app/transcript-merge.js",
-    "app/project-nav.js",
     "app/live-voice.js",
+    "app/transcript-merge.js",
+    "app/cache-usage.js",
+    "app/stream-delta.js",
+    "app/project-nav.js",
     "app/live-context.js",
     "app/agent-context.js",
     "app/agent-context-sync.js",
+    "app/background-tasks.js",
     "adapter.js",
+    "app/pr-automation.js",
   ]) {
     new Function("window", source(path))(w);
   }
@@ -76,7 +71,6 @@ function harness() {
     timer.unref();
     return timer;
   };
-  new Function("window", source("app/background-tasks.js"))(w);
   new Function("window", "setTimeout", "clearTimeout", source("live.js"))(
     w,
     timeout,
@@ -84,7 +78,8 @@ function harness() {
   );
   let snapshotResult = null,
     changesResult = null,
-    snapshot;
+    snapshot,
+    promptGate = null;
   function emit(id, frame) {
     const entries = journal.get(id) ?? [];
     const envelope = { seq: entries.length + 1, text: JSON.stringify(frame) };
@@ -104,13 +99,10 @@ function harness() {
   w.__TAURI__ = {
     core: {
       async invoke(command, args) {
-        if (command === "start_session")
-          return {
-            approvalMode: "write",
-            path: args.args.cwd,
-            workspace: null,
-          };
-        if (command === "start_git_watch") return "feature";
+        if (command === "start_session") return {
+          approvalMode: "write", path: args.args.cwd, workspace: null,
+        };
+        if (command === "start_git_watch") return { branch: "feature", root: args.path };
         if (command === "stop_session") {
           journal.delete(args.sessionId);
           return null;
@@ -134,15 +126,14 @@ function harness() {
           reads.push(args.sessionId);
           return snapshotResult;
         }
-        if (command === "changes_snapshot") {
-          changesReads.push(args.sessionId);
-          return changesResult;
-        }
+        if (command === "changes_snapshot") return changesResult;
         if (command === "send_command") {
           const cmd = { ...JSON.parse(args.json), sessionId: args.sessionId };
           commands.push(cmd);
-          if (cmd.type === "prompt")
+          if (cmd.type === "prompt") {
             prompts.push({ sessionId: args.sessionId, text: cmd.message });
+            if (promptGate) await promptGate;
+          }
           if (
             cmd.type === "negotiate_protocol" ||
             cmd.type === "set_ask_dialog"
@@ -163,10 +154,7 @@ function harness() {
     ...w.OMP_BRIDGE,
     async openSession(cwd, profile) {
       const opened = w.OMP_BRIDGE.openSession(cwd, profile);
-      await w.OMP_BRIDGE.startConversationSetup(
-        snapshot.conversationSetup.id,
-        null,
-      );
+      await w.OMP_BRIDGE.startConversationSetup(snapshot.conversationSetup.id, null);
       return opened;
     },
   };
@@ -187,6 +175,7 @@ function harness() {
       goal: w.OMP_GOAL.NONE,
     });
   return {
+    STALE: w.OMP_PR_AUTOMATION.STALE,
     bridge,
     emit,
     reply,
@@ -194,7 +183,6 @@ function harness() {
     clean,
     commands,
     reads,
-    changesReads,
     prompts,
     snapshot: () => snapshot,
     setResult: (value) => {
@@ -202,6 +190,14 @@ function harness() {
     },
     setChangesResult: (value) => {
       changesResult = value;
+    },
+    /** Holds every `prompt` write until the returned release is called. */
+    holdPrompts: () => {
+      let release;
+      promptGate = new Promise((resolve) => {
+        release = resolve;
+      });
+      return release;
     },
   };
 }
@@ -251,13 +247,11 @@ await check(
       snapshot({ url: B }),
       snapshot({ branch: "other" }),
       snapshot({ head: "next" }),
-      snapshot({ state: "MERGED" }),
-      snapshot({ state: "CLOSED" }),
     ]) {
       h.setResult(changed);
       assert.equal(
         await h.bridge.prAutomationSend(id, "stale fixes", expected, permit),
-        null,
+        false,
       );
     }
     assert.deepEqual(h.prompts, []);
@@ -280,26 +274,23 @@ await check(
     );
   },
 );
+
 await check(
-  "a failed final GitHub fetch skips publication without a bubble and can recover",
+  "a prompt omp accepted counts as sent even after switching tabs",
   async () => {
     const h = harness();
-    const id = await h.bridge.openSession("/project");
+    const a = await h.bridge.openSession("/a");
     await flush();
     h.clean();
-    h.setResult(Promise.reject(new Error("gh request timed out")));
-    assert.equal(
-      await h.bridge.prAutomationSend(id, "fix feedback", snapshot(), permit),
-      null,
-    );
-    assert.deepEqual(h.prompts, []);
-    assert.deepEqual(h.bridge.getState().messages, []);
     h.setResult(snapshot());
-    assert.equal(
-      await h.bridge.prAutomationSend(id, "fix feedback", snapshot(), permit),
-      true,
-    );
-    assert.deepEqual(h.prompts, [{ sessionId: id, text: "fix feedback" }]);
+    const release = h.holdPrompts();
+    const sending = h.bridge.prAutomationSend(a, "Fix CI", snapshot(), permit);
+    await flush();
+    assert.deepEqual(h.prompts, [{ sessionId: a, text: "Fix CI" }]);
+    await h.bridge.openSession("/b");
+    await flush();
+    release();
+    assert.equal(await sending, true);
   },
 );
 
@@ -318,11 +309,11 @@ await check(
         snapshot(),
         permit,
       ),
-      null,
+      false,
     );
     assert.equal(
       await h.bridge.prAutomationSend(id, "missing target", undefined, permit),
-      null,
+      false,
     );
     for (const patch of [
       { rpcState: null },
@@ -340,7 +331,7 @@ await check(
       Object.assign(h.bridge.getState(), patch);
       assert.equal(
         await h.bridge.prAutomationSend(id, "must wait", snapshot(), permit),
-        null,
+        false,
         JSON.stringify(patch),
       );
     }
@@ -369,7 +360,7 @@ await check(
     );
     h.setBranch(id, "other");
     release(snapshot());
-    assert.equal(await sending, null);
+    assert.equal(await sending, false);
     assert.deepEqual(h.prompts, []);
   },
 );
@@ -395,7 +386,7 @@ await check(
     );
     Object.assign(h.bridge.getState(), { isStreaming: true });
     release(snapshot());
-    assert.equal(await sending, null);
+    assert.equal(await sending, false);
     assert.deepEqual(h.prompts, []);
   },
 );
@@ -422,7 +413,7 @@ await check(
     );
     allowed = false;
     release(snapshot());
-    assert.equal(await sending, null);
+    assert.equal(await sending, false);
     assert.deepEqual(h.prompts, []);
   },
 );
@@ -442,47 +433,14 @@ await check(
     h.setResult(snapshot());
     assert.equal(
       await h.bridge.prAutomationSend(a, "must wait", snapshot(), permit),
-      null,
-    );
-    assert.deepEqual(h.prompts, []);
-  },
-);
-
-await check(
-  "a conversation reset during prompt publication prevents the handoff",
-  async () => {
-    const h = harness(),
-      id = await h.bridge.openSession("/project");
-    await flush();
-    h.clean();
-    h.setResult(snapshot());
-    let armed = false;
-    const unsubscribe = h.bridge.onUpdate((value) => {
-      if (
-        armed &&
-        value.messages.some((m) => m.kind === "user" && m.text === "stale work")
-      ) {
-        armed = false;
-        h.emit(id, {
-          type: "response",
-          command: "new_session",
-          success: true,
-          data: {},
-        });
-      }
-    });
-    armed = true;
-    assert.equal(
-      await h.bridge.prAutomationSend(id, "stale work", snapshot(), permit),
       false,
     );
-    unsubscribe();
     assert.deepEqual(h.prompts, []);
   },
 );
 
 await check(
-  "tab switches preserve read-only discovery but reject publication to another tab",
+  "tab switches discard in-flight discovery and reject publication to another tab",
   async () => {
     const h = harness(),
       a = await h.bridge.openSession("/a");
@@ -499,16 +457,16 @@ await check(
     await h.bridge.activateSession(a);
     await flush();
     release(snapshot());
-    assert.equal((await stale).state, "OPEN");
+    assert.equal(await stale, h.STALE);
     assert.equal(
       await h.bridge.prAutomationSend(b, "other tab", snapshot(), permit),
-      null,
+      false,
     );
   },
 );
 
 await check(
-  "a tab being left can read status but cannot start automatic fixes",
+  "a tab being left cannot start discovery or automatic fixes",
   async () => {
     const h = harness();
     const a = await h.bridge.openSession("/a");
@@ -518,10 +476,10 @@ await check(
     h.clean();
     h.setResult(snapshot());
     const switching = h.bridge.activateSession(b);
-    assert.equal((await h.bridge.prAutomationSnapshot(a)).state, "OPEN");
+    assert.equal(await h.bridge.prAutomationSnapshot(a), h.STALE);
     assert.equal(
       await h.bridge.prAutomationSend(a, "must wait", snapshot(), permit),
-      null,
+      false,
     );
     await switching;
     assert.deepEqual(h.prompts, []);
@@ -541,7 +499,7 @@ await check("a branch change invalidates in-flight discovery", async () => {
   const stale = h.bridge.prAutomationSnapshot(id);
   h.setBranch(id, "other");
   release(snapshot());
-  assert.equal(await stale, null);
+  assert.equal(await stale, h.STALE);
 });
 
 await check(
@@ -562,7 +520,7 @@ await check(
       h.emit(id, { type: "response", command, success: true, data: {} });
       await flush();
       release(snapshot());
-      assert.equal(await stale, null);
+      assert.equal(await stale, h.STALE);
       const current = snapshot();
       h.setResult(current);
       assert.equal(await h.bridge.prAutomationSnapshot(id), current);
@@ -589,170 +547,27 @@ await check(
     await flush();
     assert.equal(switched.ok, true);
     release(snapshot());
-    assert.equal(await stale, null);
+    assert.equal(await stale, h.STALE);
     const current = snapshot();
     h.setResult(current);
     assert.equal(await h.bridge.prAutomationSnapshot(id), current);
   },
 );
-await check(
-  "inactive tabs can read status without activation or agent prompts",
-  async () => {
-    const h = harness();
-    const a = await h.bridge.openSession("/a");
-    const b = await h.bridge.openSession("/b");
-    await flush();
-    h.setResult(snapshot());
-    assert.equal((await h.bridge.prAutomationSnapshot(a)).state, "OPEN");
-    assert.equal(h.snapshot().activeSessionId, b);
-    assert.deepEqual(h.prompts, []);
-  },
-);
-
-await check("a closed tab cannot accept an in-flight status read", async () => {
-  const h = harness();
-  const a = await h.bridge.openSession("/a");
-  await h.bridge.openSession("/b");
-  await flush();
-  let release;
-  h.setResult(
-    new Promise((resolve) => {
-      release = resolve;
-    }),
-  );
-  const reading = h.bridge.prAutomationSnapshot(a);
-  await h.bridge.closeSession(a);
-  release(snapshot());
-  assert.equal(await reading, null);
-  assert.deepEqual(h.prompts, []);
-});
-
-await check(
-  "terminal and unknown expected lifecycles are rejected before native revalidation",
-  async () => {
-    const h = harness();
-    const id = await h.bridge.openSession("/project");
-    await flush();
-    h.clean();
-    h.setResult(snapshot());
-    for (const state of ["MERGED", "CLOSED", undefined])
-      assert.equal(
-        await h.bridge.prAutomationSend(
-          id,
-          "must not send",
-          snapshot({ state }),
-          permit,
-        ),
-        null,
-      );
-    assert.deepEqual(h.reads, []);
-    assert.deepEqual(h.prompts, []);
-  },
-);
-
-await check(
-  "changes discovery returns independent local and PR results without sending prompts",
-  async () => {
-    const h = harness();
-    const a = await h.bridge.openSession("/a");
-    const b = await h.bridge.openSession("/b");
-    await flush();
-    for (const result of [
-      changes(),
-      changes({ localChanges: { changed: 3, truncated: false } }),
-      changes({
-        discoveryError: "GitHub unavailable",
-        localChanges: { changed: 2, truncated: true },
-      }),
-      changes({ snapshot: snapshot(), localError: "Cannot read status" }),
-    ]) {
-      h.setChangesResult(result);
-      assert.equal(await h.bridge.changesSnapshot(a), result);
-    }
-    assert.equal(h.snapshot().activeSessionId, b);
-    assert.deepEqual(h.changesReads, [a, a, a, a]);
-    assert.deepEqual(h.reads, []);
-    assert.deepEqual(h.prompts, []);
-  },
-);
-
-await check(
-  "changes discovery never replaces fresh PR validation before a fix",
-  async () => {
-    const h = harness();
-    const id = await h.bridge.openSession("/project");
-    await flush();
-    h.clean();
-    const displayed = snapshot();
-    h.setChangesResult(changes({ snapshot: displayed }));
-    assert.equal((await h.bridge.changesSnapshot(id)).snapshot, displayed);
-    h.setResult(snapshot({ state: "MERGED" }));
-    assert.equal(
-      await h.bridge.prAutomationSend(id, "stale fix", displayed, permit),
-      null,
-    );
-    assert.deepEqual(h.changesReads, [id]);
-    assert.deepEqual(h.reads, [id]);
-    assert.deepEqual(h.prompts, []);
-  },
-);
-
-await check("changes discovery is discarded after a branch change", async () => {
+await check("local changes are independent of GitHub and stale on branch change", async () => {
   const h = harness();
   const id = await h.bridge.openSession("/project");
   await flush();
+  const changes = { changed: 2, truncated: false };
+  h.setChangesResult(changes);
+  assert.equal(await h.bridge.changesSnapshot(id), changes);
   let release;
-  h.setChangesResult(new Promise((resolve) => (release = resolve)));
+  h.setChangesResult(new Promise((resolve) => { release = resolve; }));
   const reading = h.bridge.changesSnapshot(id);
   h.setBranch(id, "other");
-  release(changes({ localChanges: { changed: 2, truncated: false } }));
-  assert.equal(await reading, null);
+  release(changes);
+  assert.equal(await reading, h.STALE);
+  assert.deepEqual(h.reads, []);
+  assert.deepEqual(h.prompts, []);
 });
-
-await check(
-  "changes discovery discards reads after replacing the conversation or profile",
-  async () => {
-    for (const replacement of ["new_session", "fork", "profile"]) {
-      const h = harness();
-      if (replacement === "profile") await h.bridge.createProfile("Other");
-      const id = await h.bridge.openSession("/project");
-      await flush();
-      let release;
-      h.setChangesResult(new Promise((resolve) => (release = resolve)));
-      const reading = h.bridge.changesSnapshot(id);
-      if (replacement === "profile") {
-        const switched = await h.bridge.switchSessionProfile(id, "other");
-        assert.equal(switched.ok, true);
-      } else {
-        if (replacement === "new_session") h.bridge.newSession();
-        h.emit(id, { type: "response", command: replacement, success: true, data: {} });
-      }
-      await flush();
-      release(changes({ snapshot: snapshot() }));
-      assert.equal(await reading, null, replacement);
-      const current = changes({ localChanges: { changed: 1, truncated: false } });
-      h.setChangesResult(current);
-      assert.equal(await h.bridge.changesSnapshot(id), current, replacement);
-    }
-  },
-);
-
-await check(
-  "closing a tab discards its pending changes discovery",
-  async () => {
-    const h = harness();
-    const a = await h.bridge.openSession("/a");
-    await h.bridge.openSession("/b");
-    await flush();
-    let release;
-    h.setChangesResult(new Promise((resolve) => (release = resolve)));
-    const reading = h.bridge.changesSnapshot(a);
-    await h.bridge.closeSession(a);
-    release(changes({ localChanges: { changed: 1, truncated: false } }));
-    assert.equal(await reading, null);
-    assert.equal(await h.bridge.changesSnapshot(a), null);
-    assert.deepEqual(h.changesReads, [a]);
-  },
-);
 
 console.log(`pr-automation-bridge: ${passed} checks passed`);

@@ -20,7 +20,7 @@ const _CMP_SEND_HINTS = {
 };
 
 // Thin wrappers around the shared `OMP_KEYMAP.hintFor`/`hintKeyFor` (display
-// logic lives there so chrome.jsx's ⌘K/history hints can reuse it too,
+// logic lives there so toolbar.jsx's ⌘K/history hints can reuse it too,
 // instead of each file re-deriving chord display independently). The guard
 // here is the one thing that can't move: "registry not loaded yet"
 // (`window.OMP_KEYMAP` absent — first render before keymap.js runs, should
@@ -37,7 +37,7 @@ function hintKeyFor(actionId, fallback) {
 // ── The composer (input + plan/steer modes + send) ────────────────────
 // `submitKey` ("enter" | "ctrl+enter") and `pasteCollapseLines` come from the
 // tweaks (Settings › Composer); the defaults match TWEAK_DEFAULTS.
-function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePlan, planBlocked = "", goalMode = false, goalTint = false, onToggleGoal, goalBlocked = "", goalStrip = null, onOpenCmd, onOpenModel, currentModel, thinking, onLoadThinkingLevels, onSetThinking, isStreaming, backgroundWork = false, conversationMoving = false, pendingRequests = [], onOpenPending, onAbort, onApprove, annotationCount = 0, microcopy, onFollowUp, draftInsert, promptHistory = [], promptInsert, targetedDraftInserts = [], onAckDraftInserts, queue, queueSending, onRemoveQueued, onPromoteQueued, onSendQueuedNow, browserChips = [], onRemoveBrowserChip, onBrowserChipClick, submitKey = "enter", pasteCollapseLines = 5, liveVoice, liveError, onLiveAction, dictation, dictationError, onDictationAction, dictationCompleted, onAckDictation }) {
+function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePlan, planBlocked = "", goalMode = false, goalTint = false, onToggleGoal, goalBlocked = "", goalStrip = null, onOpenCmd, onOpenModel, currentModel, thinking, onLoadThinkingLevels, onSetThinking, isStreaming, backgroundWork = false, conversationMoving = false, pendingRequests = [], onOpenPending, onAbort, onApprove, annotationCount = 0, microcopy, onFollowUp, draftInsert, promptHistory = [], promptInsert, targetedDraftInserts = [], onAckDraftInserts, queue, queueSending, onRemoveQueued, onPromoteQueued, onSendQueuedNow, browserChips = [], onRemoveBrowserChip, onBrowserChipClick, submitKey = "enter", pasteCollapseLines = 5, liveVoice, liveError, onLiveAction, codexLogin = null, voiceSpectrum = null, dictation, dictationError, onDictationAction, dictationCompleted, onAckDictation }) {
   // Drafts are per tab (issue #28). The composer stays mounted across tab
   // switches and keeps one draft per session id (app/session-ui.js
   // DRAFT_IDLE): text, pending image attachments (sent alongside the next
@@ -73,13 +73,35 @@ function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePla
   sessionIdRef.current = sessionId;
   React.useEffect(() => { setDrafts(m => pruneDrafts(m, sessionIds)); }, [sessionIds]);
   const consumedDictations = React.useRef(new Set());
+  // A capture stopped with "send on stop" (Settings › Composer): its tab's
+  // draft is sent, as Enter would, once it holds the dictated text — and
+  // only while that tab is shown.
+  const sendDictated = React.useRef(null);
   React.useEffect(() => {
     const items = (dictationCompleted ?? []).filter(item => !consumedDictations.current.has(item.captureId));
     if (!items.length) return;
     for (const item of items) consumedDictations.current.add(item.captureId);
-    setDrafts(m => items.reduce((draftMap, item) => window.OMP_SESSION_UI.appendDictation(draftMap, sessionIdsRef.current ?? [], item), m));
+    const toSend = items.findLast(item => item.send && item.sessionId === sessionIdRef.current && item.text);
+    if (toSend) sendDictated.current = { sessionId: toSend.sessionId, captureId: toSend.captureId, text: toSend.text };
+    setDrafts(m => {
+      let next = items.reduce((draftMap, item) => window.OMP_SESSION_UI.appendDictation(draftMap, sessionIdsRef.current ?? [], item), m);
+      if (toSend && sessionIdsRef.current?.includes(toSend.sessionId)) {
+        next = updateDraftEntry(next, toSend.sessionId, DRAFT_IDLE, d => ({ ...d, dictationSendId: toSend.captureId }));
+      }
+      return next;
+    });
     onAckDictation(items.map(item => item.captureId));
   }, [dictationCompleted]);
+  React.useEffect(() => {
+    const pending = sendDictated.current;
+    if (!pending) return;
+    if (pending.sessionId !== sessionId) { sendDictated.current = null; return; }
+    // Text alone can already be the draft suffix before this capture arrives.
+    // Wait for this capture's append, not an earlier matching draft.
+    if (draft.dictationSendId !== pending.captureId) return;
+    sendDictated.current = null;
+    if (draft.text.endsWith(pending.text)) send();
+  }, [drafts, sessionId]);
   const [activeIdx, setActiveIdx] = React.useState(0);
   const taRef   = React.useRef(null);
   // Prompt-history recall (issues #16, #55, Arrow Up/Down): the recall
@@ -181,19 +203,9 @@ function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePla
   // Keep activeIdx in bounds; auto-select when single result
   const clampedIdx = showSlash ? Math.min(activeIdx, filtered.length - 1) : 0;
 
-  // Scroll active item into view
-  React.useEffect(() => {
-    if (!showSlash || !listRef.current) return;
-    const el = listRef.current.children[clampedIdx];
-    el?.scrollIntoView({ block: "nearest" });
-  }, [clampedIdx, showSlash]);
-
-  // Scroll active mention row into view
-  React.useEffect(() => {
-    if (!showMention || !mentionListRef.current) return;
-    const el = mentionListRef.current.children[mentionActiveIdx];
-    el?.scrollIntoView({ block: "nearest" });
-  }, [mentionActiveIdx, showMention]);
+  // Keep the active slash / mention row in view.
+  window.useActiveRowIntoView(listRef, clampedIdx, showSlash);
+  window.useActiveRowIntoView(mentionListRef, mentionActiveIdx, showMention);
 
   // Grow with the text up to the CSS max-height, then scroll: hidden
   // overflow past it would leave the rest of a long draft unreachable.
@@ -624,7 +636,7 @@ function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePla
       )}
       {/* Goal mode (goal-strip.jsx): built by app-live.jsx, keyed by tab. */}
       {goalStrip}
-      <LiveVoicePanel voice={liveVoice} error={liveError} onAction={onLiveAction} dictationActive={!!dictation?.active} />
+      <LiveVoicePanel voice={liveVoice} error={liveError} onAction={onLiveAction} dictationActive={!!dictation?.active} codexLogin={codexLogin} />
       <DictationPanel dictation={dictation} error={dictationError} onAction={onDictationAction} />
       <PendingInput requests={pendingRequests} concurrentWork={backgroundWork} onOpen={onOpenPending} />
 
@@ -685,6 +697,8 @@ function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePla
       {/* Keyed by tab: an open preview is that tab's, not the next one's. */}
       <PasteStrip key={sessionId} pastes={collapsed} onExpand={expandPaste} />
 
+      {voiceSpectrum && <VoiceSpectrum source={voiceSpectrum} />}
+
       <div className="composer-row">
         <button className="btn icon ghost" title="attach image" onClick={() => fileInputRef.current?.click()}>
           <Icon name="image" size={13} />
@@ -697,7 +711,7 @@ function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePla
           style={{ display: "none" }}
           onChange={(e) => { addFiles(e.target.files); e.target.value = ""; }}
         />
-        <VoiceModeButton key={sessionId} live={liveVoice} dictation={dictation} onLiveAction={onLiveAction} onDictationAction={onDictationAction} />
+        <VoiceModeButton key={sessionId} live={liveVoice} dictation={dictation} codexLogin={codexLogin} onLiveAction={onLiveAction} onDictationAction={onDictationAction} />
         <div className="composer-input">
           <textarea
             ref={taRef}

@@ -304,10 +304,16 @@ mod tests {
         let restored = store.load(|_| false);
         assert_eq!(restored.layout.tabs.len(), 2);
         assert_eq!(restored.layout.tabs[0].path, stale);
-        assert_eq!(restored.layout.tabs[0].scratch_id.as_deref(), Some("chat-a"));
-        assert_eq!(restored.layout.tabs[1].scratch_id.as_deref(), Some("chat-b"));
+        assert_eq!(
+            restored.layout.tabs[0].scratch_id.as_deref(),
+            Some("chat-a")
+        );
+        assert_eq!(
+            restored.layout.tabs[1].scratch_id.as_deref(),
+            Some("chat-b")
+        );
         assert_eq!(restored.layout.active, Some(1));
-        assert!(restored.skipped.is_empty());
+        assert_eq!(restored.skipped, [] as [String; 0]);
     }
 
     #[test]

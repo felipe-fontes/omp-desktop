@@ -14,6 +14,7 @@ use super::approvals::{self, PendingApprovals};
 use super::context_catalog::{self, Catalog, ChunkDecoder};
 use super::evidence_requests::EvidenceReader;
 use super::ext_ui::{self, ExtUiState};
+use super::inflight::{self, InFlight};
 use super::inner::BridgeInner;
 use super::journal::EventJournal;
 
@@ -180,6 +181,9 @@ pub(super) struct StdoutReaderConfig {
     /// This session's extension status lines and widgets, kept up to date
     /// for a tab that comes back with a `dropped` replay.
     pub(super) ext_ui: Arc<Mutex<ExtUiState>>,
+    /// This session's in-flight assistant message, kept whole for a tab
+    /// that comes back with a `dropped` replay.
+    pub(super) inflight: Arc<Mutex<InFlight>>,
     /// This process's open approval prompts, for a grant to bind to.
     pub(super) approvals: Arc<Mutex<PendingApprovals>>,
     pub(super) context_catalog: Arc<Mutex<Catalog>>,
@@ -322,6 +326,7 @@ pub(super) fn spawn_stdout_reader(config: StdoutReaderConfig) {
         gen,
         journal,
         ext_ui,
+        inflight,
         approvals,
         context_catalog,
         evidence,
@@ -432,6 +437,10 @@ pub(super) fn spawn_stdout_reader(config: StdoutReaderConfig) {
                             crate::widgets::notify_turn_end(&app, &sid);
                         }
                     }
+                    // Last use of the parse: the in-flight copy takes its
+                    // blocks. After the journal push like `ext_ui`, so a
+                    // snapshot never names a seq the journal lacks.
+                    inflight::record(&inflight, seq, parsed);
                 }
                 Err(e) => {
                     exit_reason = format!("stdout read error: {e}");

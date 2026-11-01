@@ -52,6 +52,8 @@ function harness(t, { title, autoName = true, isStreaming = false } = {}) {
     "app/extension-widgets.js",
     "app/live-voice.js",
     "app/live-context.js",
+    "app/cache-usage.js",
+    "app/stream-delta.js",
     "app/transcript-merge.js",
     "app/prompt-history.js",
     "app/project-nav.js",
@@ -110,7 +112,7 @@ function harness(t, { title, autoName = true, isStreaming = false } = {}) {
           };
         }
         if (name === "replay_events") return { dropped: false, events: [] };
-        if (name === "start_git_watch") return "feature";
+        if (name === "start_git_watch") return { branch: "feature", root: args.path };
         if (name === "send_command") {
           const command = JSON.parse(args.json),
             id = args.sessionId;

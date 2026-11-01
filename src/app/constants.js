@@ -23,10 +23,11 @@
   // "enter" | "ctrl+enter" for multi-line fields; `pasteCollapseLines` is
   // the line count above which a paste becomes a chip; `restoreTabs`,
   // `confirmBusyClose`, `autoName` drive live.js; `autoRetry` is sent to
-  // every omp process. Compaction policy belongs to omp profiles. Rows:
-  // app/settings-schema.js.
+  // every omp process. Compaction policy belongs to omp profiles; `startScreen`
+  // selects the empty workspace animation. Rows: app/settings-schema.js.
   const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
     "theme": "aurora",
+    "startScreen": "latent",
     "density": "compact",
     "layout": "rail",
     "accent": "#8AF0C8",
@@ -59,6 +60,9 @@
     "browserWidth": 0,
     "browserLocalhostInPanel": true,
     "submitKey": "enter",
+    "dictationSend": false,
+    "dictationAutoStop": 3,
+    "voiceSpectrumBands": 64,
     "pasteCollapseLines": 5,
     "restoreTabs": true,
     "confirmBusyClose": false,

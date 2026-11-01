@@ -63,6 +63,8 @@ function harness({
     "app/extension-widgets.js",
     "app/live-voice.js",
     "app/live-context.js",
+    "app/cache-usage.js",
+    "app/stream-delta.js",
     "app/transcript-merge.js",
     "app/prompt-history.js",
     "app/project-nav.js",
@@ -155,7 +157,7 @@ function harness({
                 payload: watchChangeDuringStart,
               });
             }
-            return branch;
+            return { branch, root: args.path };
           }
           case "replay_events":
             return { dropped: false, events: [] };

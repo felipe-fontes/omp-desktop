@@ -72,6 +72,8 @@ function harness(storage = new Map()) {
     "app/project-nav.js",
     "app/live-voice.js",
     "app/live-context.js",
+    "app/cache-usage.js",
+    "app/stream-delta.js",
     "app/ask-dialog.js",
     "app/background-tasks.js",
     "app/agent-context.js",
@@ -126,7 +128,7 @@ function harness(storage = new Map()) {
           };
         if (name === "replay_events")
           return replays.get(args.sessionId) ?? { dropped: false, events: [] };
-        if (name === "start_git_watch") return "feature";
+        if (name === "start_git_watch") return { branch: "feature", root: args.path };
         if (name === "approval_approve_and_grant") {
           grantCalls.push(args);
           return new Promise((resolve, reject) =>
@@ -319,48 +321,6 @@ test("reopening rebuilds tool cards from the saved branch even when model histor
   assert.equal(messages[1].duration, 80);
 });
 
-test("large saved tool histories are bounded immediately while retaining their newest entries", async () => {
-  const h = harness();
-  const messages = [
-    {
-      role: "user",
-      timestamp: 1,
-      content: [{ type: "text", text: "Inspect the files" }],
-    },
-    {
-      role: "assistant",
-      timestamp: 2,
-      stopReason: "toolUse",
-      content: Array.from({ length: 200 }, (_, i) => ({
-        type: "toolCall",
-        id: `call-${i}`,
-        name: "read",
-        arguments: { path: `src/file-${i}.js` },
-      })),
-    },
-    ...Array.from({ length: 200 }, (_, i) => ({
-      role: "toolResult",
-      timestamp: 3 + i,
-      toolCallId: `call-${i}`,
-      toolName: "read",
-      content: [{ type: "text", text: "contents" }],
-    })),
-  ];
-  h.setHistory([]);
-  h.setEntries(
-    messages.map((message, i) => ({
-      type: "message",
-      id: `m${i}`,
-      parentId: i ? `m${i - 1}` : null,
-      message,
-    })),
-  );
-  await h.reopen();
-  const restored = h.w.OMP_BRIDGE.getState().messages;
-  assert.ok(restored.length <= 169 && restored.length >= 157);
-  assert.equal(restored[0].target, "src/file-38.js");
-  assert.equal(restored.at(-1).target, "src/file-199.js");
-});
 
 test("reopening a saved conversation restores its unanswered question", async () => {
   const h = harness();
@@ -924,42 +884,6 @@ test("an answered request still in replay is not revived as an open callback", a
   );
 });
 
-test("stale replay frames and snapshots cannot resurrect a locally answered trimmed callback", async () => {
-  for (const complete of [true, false]) {
-    const { h, id } = await liveHarness();
-    flushQuestion(h, id, "settled");
-    assert.equal(
-      await h.w.OMP_BRIDGE.answerAskDialog("settled", liveAnswers),
-      true,
-    );
-    for (let i = 0; i < 200; i++)
-      h.w.OMP_BRIDGE.addAssistantMessage(`row ${i}`);
-    h.emit(id, { type: "turn_end", message: {} });
-    assert.equal(
-      h.asks().some((m) => m.id === "settled"),
-      false,
-    );
-    await h.w.OMP_BRIDGE.resumeSession({
-      path: "/saved/other.jsonl",
-      profile_id: "default",
-      cwd: "/other",
-      title: "Other",
-    });
-    h.setReplay(id, {
-      dropped: true,
-      events: [{ seq: 10000, text: JSON.stringify(liveQuestion("settled")) }],
-      pendingRequests: [
-        { seq: 1, text: JSON.stringify(liveQuestion("settled")) },
-      ],
-      pendingRequestsComplete: complete,
-    });
-    await h.w.OMP_BRIDGE.activateSession(id);
-    assert.equal(
-      h.asks().some((m) => m.id === "settled"),
-      false,
-    );
-  }
-});
 
 test("an incomplete pending snapshot cannot close an existing question", async () => {
   const { h, id } = await liveHarness();

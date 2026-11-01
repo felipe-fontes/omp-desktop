@@ -14,7 +14,7 @@ import { dirname, join } from "node:path";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const win = {};
 // The schema loads before the modules it reads bounds from: they are read late.
-for (const f of ["constants.js", "settings-schema.js", "accent.js", "chat-collapse.js", "prompt-history.js", "session-ui.js", "keymap.js"]) {
+for (const f of ["constants.js", "settings-schema.js", "accent.js", "chat-collapse.js", "prompt-history.js", "session-ui.js", "keymap.js", "backdrops.js"]) {
   // eslint-disable-next-line no-new-func
   new Function("window", readFileSync(join(root, "src/app", f), "utf8"))(win);
 }
@@ -54,6 +54,11 @@ check("every tweak row names a TWEAK_DEFAULTS key whose default is valid", () =>
   }
 });
 
+check("custom rows name the renderers the page expects", () => {
+  assert.deepEqual(S.rows().filter(r => r.kind === "custom").map(r => r.type).sort(),
+    ["approvalMode", "approvalRules", "chromium", "contextPolicy", "desktopNotifications", "goalContinue", "keepAwake", "railOrder", "remoteCert", "remoteDevices", "remotePair", "remotePush", "remoteServer", "shell", "shortcuts", "startupProfile", "terminalHeight", "version", "widgets", "widths", "worktrees"]);
+  for (const r of S.rows().filter(r => r.kind === "custom")) for (const k of r.keys ?? []) assert.ok(k in D, k);
+});
 
 check("bounds come from the owning modules", () => {
   assert.equal(row("collapseAfter").min, win.OMP_COLLAPSE.MIN_AFTER);
@@ -64,6 +69,26 @@ check("bounds come from the owning modules", () => {
   assert.equal(row("pasteCollapseLines").max, win.OMP_SESSION_UI.PASTE_LINES_MAX);
   assert.deepEqual(row("foldTools").options.map(o => o.value), [...win.OMP_COLLAPSE.MODES]);
   assert.deepEqual([row("fontSize").min, row("fontSize").max, row("fontSize").step], [75, 150, 5]);
+});
+
+check("a stale stored start screen falls back to the default", () => {
+  const r = row("startScreen");
+  assert.equal(S.clamp(r, "neural"), "neural");
+  assert.equal(S.clamp(r, "starfield"), D.startScreen);
+});
+
+check("voice and Evidence settings coexist with the selected start screen", () => {
+  const v = vals({ startScreen: "neural", dictationSend: true, dictationAutoStop: 0, voiceSpectrumBands: 32, showEvidence: false });
+  assert.equal(S.value(row("startScreen"), v), "neural");
+  assert.equal(S.value(row("dictationSend"), v), true);
+  assert.equal(S.value(row("dictationAutoStop"), v), 0);
+  assert.equal(S.value(row("voiceSpectrumBands"), v), 32);
+  assert.equal(S.value(row("showEvidence"), v), false);
+  assert.deepEqual(S.resetEdits("composer", v), {
+    dictationSend: D.dictationSend, dictationAutoStop: D.dictationAutoStop, voiceSpectrumBands: D.voiceSpectrumBands,
+  });
+  assert.deepEqual(S.resetRow(row("showEvidence"), v), { showEvidence: true });
+  assert.ok(S.search("inspectable proof", v).groups.some(g => g.rows.some(r => r.id === "showEvidence")));
 });
 
 check("clamp keeps values in bounds and on the step", () => {
@@ -166,7 +191,6 @@ check("resetting card order keeps visibility choices; resetting Rail restores bo
   assert.deepEqual(S.resetRow(row("custom:railOrder"), v), { railOrder: null });
   assert.deepEqual(S.resetEdits("rail", v), { railOrder: null, showContext: true, "widget:ext-status": true });
 });
-
 check("resetRows resets only the given rows (the search matches)", () => {
   const v = vals({ fontSize: 120, monoChat: !D.monoChat, showRadar: false });
   const matched = S.search("font", v).groups.flatMap(g => g.rows);
@@ -182,6 +206,7 @@ check("search matches label, desc text and keywords, grouped in page order", () 
   assert.equal(r.bySection.chat, 0);
   assert.deepEqual(r.groups.map(g => [g.sectionId, g.sectionTitle, g.groupName]), [["appearance", "Appearance", "Text"]]);
   assert.equal(S.search("POWERSHELL", vals()).groups[0].src, "terminal.json", "keywords, case-insensitive");
+  assert.equal(S.search("/compact", vals()).total, 1, "desc text with backticks stripped");
   assert.deepEqual(S.search("   ", vals()), { total: 0, bySection: Object.fromEntries(S.SECTIONS.map(s => [s.id, 0])), groups: [] });
 });
 

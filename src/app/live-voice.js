@@ -2,10 +2,13 @@
 // Local actions bracket RPC frames so replayed frames cannot start a call.
 (function () {
   const LIMITS = Object.freeze({ transcripts: 100, text: 8192 });
+  // `resumable`: this call connected (or resumed a paused one), so an
+  // unexpected end pauses it; a call that never connected ends in error.
   const EMPTY = Object.freeze({
     active: false, paused: false, phase: "idle", muted: false, input: 0, output: 0,
-    transcripts: Object.freeze([]), error: null, turnOffset: 0, discardTranscripts: false,
+    transcripts: Object.freeze([]), error: null, turnOffset: 0, discardTranscripts: false, resumable: false,
   });
+  const CONNECTED_PHASES = new Set(["listening", "working", "speaking", "muted"]);
   const PHASES = new Set(["connecting", "listening", "working", "speaking", "muted", "error"]);
   const level = n => typeof n === "number" && Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : 0;
   // RMS amplitude from omp, not sample peaks: this cannot detect clipping.
@@ -37,7 +40,7 @@
         // call beyond all retained turns so existing role+turn keys stay stable.
         const turnOffset = state.transcripts.length ? Math.max(...state.transcripts.map(t => t.turn)) + 1 : 0;
         return { ...state, active: true, paused: false, phase: "connecting", muted: false, input: 0, output: 0,
-          error: null, turnOffset, discardTranscripts: false };
+          error: null, turnOffset, discardTranscripts: false, resumable: state.paused };
       }
       case "stop":
         if (!state.active) return state.paused ? ended(state, null) : state;
@@ -64,12 +67,14 @@
       case "live_end":
         // During an explicit stop omp can report a transport error caused by
         // cancellation. Stop's reply, not that error, decides the outcome.
+        // omp sends this end before its failed `live_start` reply (a missing
+        // Codex login), so a never-connected call must not read as paused.
         if (!state.active || state.phase === "stopping") return state;
-        return ended(state, event.error, true);
+        return ended(state, event.error, state.resumable);
       case "live_phase":
         if (!state.active || state.phase === "stopping" || !PHASES.has(event.phase)) return state;
         return { ...state, phase: event.phase, muted: event.phase === "muted" || state.muted,
-          input: event.phase === "muted" ? 0 : state.input };
+          input: event.phase === "muted" ? 0 : state.input, resumable: state.resumable || CONNECTED_PHASES.has(event.phase) };
       case "live_levels": {
         if (!state.active || state.phase === "stopping") return state;
         const input = state.muted ? 0 : level(event.input);
@@ -93,10 +98,10 @@
           if (old.text === entry.text && old.final === entry.final) return state;
           const transcripts = state.transcripts.slice();
           transcripts[i] = entry;
-          return { ...state, transcripts };
+          return { ...state, transcripts, resumable: state.resumable || state.active };
         }
         const transcripts = [...state.transcripts, entry].slice(-LIMITS.transcripts);
-        return { ...state, transcripts };
+        return { ...state, transcripts, resumable: state.resumable || state.active };
       }
       default:
         return state;
@@ -132,6 +137,32 @@
         return state;
     }
   }
-  const DICTATION = Object.freeze({ EMPTY: DICTATION_EMPTY, apply: applyDictation });
-  window.OMP_LIVE_VOICE = { EMPTY, LIMITS, apply, DICTATION, meterLevel };
+  // "Stop after a pause" (`seconds`, 0 = off): how long after the last text
+  // change a recording capture stops by itself, or null for no timer. omp
+  // sends new text only for sound it takes as speech, so no new text stands
+  // in for silence. Nothing is armed before the first words: a capture you
+  // have not spoken into yet waits for you.
+  function autoStopDelay(dictation, seconds) {
+    if (!dictation?.active || dictation.phase !== "recording" || !dictation.text) return null;
+    return typeof seconds === "number" && seconds > 0 ? Math.round(seconds * 1000) : null;
+  }
+  const DICTATION = Object.freeze({ EMPTY: DICTATION_EMPTY, apply: applyDictation, autoStopDelay });
+  // omp's live voice runs only on its Codex login (`openai-codex`): whether
+  // the tab's profile has one, from `get_login_providers`; null = unknown.
+  function codexLogin(providers) {
+    if (!Array.isArray(providers)) return null;
+    return providers.some(p => p?.id === "openai-codex" && p.authenticated === true);
+  }
+  const CODEX_MISSING = "Live conversation (Codex only): log in with /login → ChatGPT Plus/Pro (Codex Subscription)";
+  // The composer's live-conversation button: its label (also the tooltip) and
+  // whether it is clickable. Without a Codex login no call can start, but a
+  // running one stays stoppable; an unknown login does not block.
+  function liveButton(live, dictating, login) {
+    const calling = !!live?.active;
+    if (!calling && login === false) return { label: CODEX_MISSING, disabled: true };
+    const action = calling ? (live.phase === "connecting" ? "Cancel live conversation" : "Stop live conversation")
+      : live?.paused ? "Resume live conversation" : "Start live conversation";
+    return { label: `${action} (Codex only)`, disabled: !!dictating || (calling && live.phase === "stopping") };
+  }
+  window.OMP_LIVE_VOICE = { EMPTY, LIMITS, CONNECTED_PHASES, apply, DICTATION, meterLevel, codexLogin, liveButton, CODEX_MISSING };
 })();

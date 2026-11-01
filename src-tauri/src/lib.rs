@@ -12,6 +12,7 @@ mod approval;
 mod approval_mode;
 mod browser;
 mod child_path;
+mod child_run;
 mod config_file;
 mod conversation_tree;
 mod conversation_workspace;
@@ -49,6 +50,7 @@ mod terminal;
 mod test_support;
 mod text;
 mod updater;
+mod voice_spectrum;
 mod widgets;
 mod window_chrome;
 mod workspace;
@@ -821,7 +823,7 @@ fn take_pending_open_projects(state: State<'_, OpenProjectState>) -> Vec<String>
 /// Events a session's frontend hasn't seen yet, per its bounded event
 /// journal. Called on tab reactivation (after re-arming the live listener)
 /// to recover state that arrived while no listener was attached — the
-/// journal is in-memory only, capped at 256 lines per session; a caller
+/// journal is in-memory only, capped per session (`agent::EVENT_JOURNAL_CAPACITY` lines, `EVENT_JOURNAL_MAX_BYTES`); a caller
 /// whose `after_seq` predates the ring window gets `dropped: true` and
 /// falls back to its existing full-state refetch for that gap.
 #[tauri::command]
@@ -859,6 +861,18 @@ async fn agent_context_read_skill(
             .context_read_skill(&session_id, &agent_id, &name)
     })
     .await?
+}
+
+/// The assistant message a session is streaming, as far as it got: omp sends
+/// only increments (`agent::inflight`), so a reactivated tab whose replay
+/// came back `dropped` seeds its streaming bubble from this. `None` between
+/// messages and for an unknown or ended session.
+#[tauri::command]
+fn streaming_message(
+    session_id: String,
+    bridge: State<'_, AgentBridge>,
+) -> Option<agent::inflight::Snapshot> {
+    bridge.streaming_message(&session_id)
 }
 
 /// List tool-approval rules currently in effect for a session/project pair.
@@ -1030,26 +1044,38 @@ async fn open_project(app: tauri::AppHandle) -> Result<Option<String>, String> {
     .await?
 }
 
+/// What `start_git_watch` reports for a tab's folder.
+#[derive(serde::Serialize)]
+struct GitWatch {
+    /// The short branch name; `None` outside a repository or on a detached HEAD.
+    branch: Option<String>,
+    /// The repository's work tree, shared by every tab on a folder of it (the
+    /// branch picker's busy lock); `None` outside a repository.
+    root: Option<String>,
+}
+
 /// Watch a session's Git HEAD, index and refs for live UI updates.
 ///
-/// Returns the short branch name at call time, or `None` when `path` is
-/// not inside a git repo or HEAD is detached. The watcher emits the current
-/// optional branch on `git://branch/{session_id}` for Git metadata changes.
-/// Watcher errors are silently ignored — the branch chip simply won't
-/// update live.
+/// Returns the branch and work tree at call time (see `GitWatch`). The watcher
+/// emits the current optional branch on `git://branch/{session_id}` for Git
+/// metadata changes, including `None` on a detached HEAD. Watcher errors are
+/// silently ignored — the branch chip simply won't update live.
 #[tauri::command]
 fn start_git_watch(
     session_id: String,
     path: String,
     watcher: State<'_, GitWatcherState>,
     app: tauri::AppHandle,
-) -> Option<String> {
+) -> GitWatch {
     let p = std::path::Path::new(&path);
-    let (branch, head) = git::probe(p);
-    if let Some(h) = head {
+    let probe = git::probe(p);
+    if let Some(h) = probe.head {
         let _ = watcher.start(&session_id, p, h, app);
     }
-    branch
+    GitWatch {
+        branch: probe.branch,
+        root: probe.root,
+    }
 }
 
 /// Stop the Git metadata watcher for a session. No-op when none is active.
@@ -1120,6 +1146,13 @@ async fn git_browser_commit_file(
     off_ipc(move || git_browser::commit_file(Path::new(&path), &sha, &rel_path)).await?
 }
 
+/// The branches the status bar's picker offers — see `git_browser::branches`.
+/// `async` + `spawn_blocking`: see `git_browser_status`.
+#[tauri::command]
+async fn git_browser_branches(path: String) -> Result<Vec<git_browser::Branch>, String> {
+    off_ipc(move || git_browser::branches(Path::new(&path))).await?
+}
+
 /// A file of the tab's project for the in-app preview — see
 /// `project_file::read`. The folder is the one `start_session` registered
 /// for the tab, never one sent by the webview. `async` + `spawn_blocking`:
@@ -1156,6 +1189,14 @@ async fn workspace_reject(path: String, rel_path: String) -> Result<(), String> 
     off_ipc(move || workspace::reject(Path::new(&path), &rel_path)).await?
 }
 
+/// Switch the project's work tree to a listed branch — see
+/// `workspace::switch_branch`. `async` + `spawn_blocking`: `git switch`
+/// rewrites the work tree.
+#[tauri::command]
+async fn workspace_switch_branch(path: String, name: String, remote: bool) -> Result<(), String> {
+    off_ipc(move || workspace::switch_branch(Path::new(&path), &name, remote)).await?
+}
+
 /// Widget config, approvals, active view and runs — see
 /// `widgets::host::WidgetsSnapshot`. A copy of the host's snapshot; no I/O.
 #[tauri::command]
@@ -1189,6 +1230,34 @@ async fn widgets_approve(
 #[tauri::command]
 fn widgets_set_view(view: widgets::ViewArgs, host: State<'_, Arc<widgets::WidgetHost>>) {
     host.set_view(view);
+}
+
+/// Start the composer's voice spectrum (`voice://spectrum` frames of `bands`
+/// bars from the default microphone) while voice to text or a live
+/// conversation records; already running with that count is fine, another
+/// count restarts it. `async` + `spawn_blocking`: opening the device can
+/// take a moment. Fails when there is no usable microphone or `bands` is
+/// outside 8..=128.
+#[tauri::command]
+async fn voice_spectrum_start(
+    bands: u16,
+    app: AppHandle,
+    spectrum: State<'_, Arc<voice_spectrum::VoiceSpectrum>>,
+) -> Result<(), String> {
+    with_blocking(&spectrum, move |s| s.start(app, bands)).await
+}
+
+/// Stop the voice spectrum, if running. `async` + `spawn_blocking`: closing
+/// the device and joining its thread block.
+#[tauri::command]
+async fn voice_spectrum_stop(
+    spectrum: State<'_, Arc<voice_spectrum::VoiceSpectrum>>,
+) -> Result<(), String> {
+    with_blocking(&spectrum, |s| {
+        s.stop();
+        Ok(())
+    })
+    .await
 }
 
 /// Manual refresh of one card; a malformed id is ignored.
@@ -1754,6 +1823,7 @@ fn with_plugins_and_state(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder
         .manage(OpenProjectState::new())
         .manage(updater::UpdaterState::default())
         .manage(CloseGuard::default())
+        .manage(Arc::new(voice_spectrum::VoiceSpectrum::default()))
 }
 
 /// Run the Tauri application. Panics if the runtime fails to initialise.
@@ -1839,6 +1909,7 @@ pub fn run() {
             evidence::commands::evidence_asset_source,
             evidence::commands::evidence_asset_text,
             evidence::commands::evidence_pick_artifact,
+            streaming_message,
             open_project,
             take_pending_open_projects,
             start_git_watch,
@@ -1868,6 +1939,7 @@ pub fn run() {
             git_browser_status,
             git_browser_file,
             git_browser_log,
+            git_browser_branches,
             git_browser_commit,
             git_browser_commit_file,
             project_file_read,
@@ -1875,11 +1947,14 @@ pub fn run() {
             pr_automation::changes_snapshot,
             workspace_accept,
             workspace_reject,
+            workspace_switch_branch,
             widgets_state,
             widgets_reload,
             widgets_approve,
             widgets_set_view,
             widgets_refresh,
+            voice_spectrum_start,
+            voice_spectrum_stop,
             usage_stats,
             goal_continuation_get,
             goal_continuation_set,

@@ -43,7 +43,7 @@ impl GitWatcherState {
         let repo = repo_path.to_owned();
         let sid = session_id.to_owned();
         let watcher = MetadataWatcher::start(paths, move |change| {
-            let (branch, _) = crate::git::probe(&repo);
+            let branch = crate::git::probe(&repo).branch;
             let _ = app.emit(&format!("git://branch/{sid}"), branch);
             if change.branch {
                 crate::widgets::notify_branch(&app, &sid);
@@ -320,12 +320,12 @@ mod tests {
     type Observation = (Change, Option<String>);
 
     fn watch(path: &Path) -> (MetadataWatcher, mpsc::Receiver<Observation>) {
-        let (_, head) = crate::git::probe(path);
-        let paths = MetadataPaths::discover(path, &head.expect("repository HEAD")).unwrap();
+        let head = crate::git::probe(path).head.expect("repository HEAD");
+        let paths = MetadataPaths::discover(path, &head).unwrap();
         let repo = path.to_owned();
         let (sender, receiver) = mpsc::channel();
         let watcher = MetadataWatcher::start(paths, move |change| {
-            let branch = crate::git::probe(&repo).0;
+            let branch = crate::git::probe(&repo).branch;
             let _ = sender.send((change, branch));
         })
         .unwrap();

@@ -3,6 +3,64 @@
 // are provided by the bridge. No remote feedback bodies enter the prompt.
 (function () {
   const INTERVAL_MS = 30_000;
+  /** Bridge answer for a read the tab could not take right now (mid-switch,
+   *  replay, respawn, conversation or branch change): not "no PR". */
+  const STALE = Object.freeze({ stale: true });
+  /** How soon a STALE read is asked again. */
+  const BUSY_RETRY_MS = 250;
+  /** First wait after a retryable read error (GitHub or the local checkout
+   *  briefly lagging); it doubles per attempt. */
+  const RETRY_BASE_MS = 3_000;
+  /** Retryable errors in a row before one is reported like any other. */
+  const RETRY_MAX = 5;
+  /** How often the card re-reads while a check is queued or running, even
+   *  with Auto-fix off; it stops once every check has finished. */
+  const CI_INTERVAL_MS = 15_000;
+  const CHECK_STATES = ["queued", "running", "success", "failure", "neutral"];
+  /** Up to this many checks get a dot each; more get a proportional bar, so a
+   *  big matrix never overflows the card. */
+  const CHECK_DOTS_MAX = 24;
+  // Expanded list order: what needs attention first, GitHub's order within.
+  const LIST_ORDER = { running: 0, failure: 1, queued: 2, success: 3, neutral: 4 };
+
+  const ciActive = (snapshot) =>
+    !!snapshot?.checks?.some((c) => c.state === "running" || c.state === "queued");
+
+  /** The card's CI line for a snapshot's `checks` (GitHub's order). `state` is
+   *  the run's as a whole (running > queued > failure > success > neutral;
+   *  `none` without checks), `label` the step in progress or the outcome,
+   *  `more` the other running steps (shown apart, so a long step name can't
+   *  ellipsize it away), `done` of `total` finished, `dots` whether one dot
+   *  per check fits, and `list` every check, running and failed first. */
+  function ciSummary(checks) {
+    const count = { queued: 0, running: 0, success: 0, failure: 0, neutral: 0 };
+    for (const c of checks) count[c.state]++;
+    const total = checks.length;
+    const state = !total ? "none"
+      : count.running ? "running"
+      : count.queued ? "queued"
+      : count.failure ? "failure"
+      : count.success ? "success"
+      : "neutral";
+    const label =
+      state === "running" ? checks.find((c) => c.state === "running").name
+      : state === "queued" ? `${count.queued} queued`
+      : state === "failure" ? `${count.failure} failed`
+      : state === "success" ? "All checks passed"
+      : state === "neutral" ? "Checks skipped"
+      : "";
+    const list = checks
+      .map((c, i) => [c, i])
+      .sort(([a, i], [b, j]) => LIST_ORDER[a.state] - LIST_ORDER[b.state] || i - j)
+      .map(([c]) => c);
+    return {
+      state, label, count, total,
+      more: Math.max(0, count.running - 1),
+      done: count.success + count.failure + count.neutral,
+      dots: total <= CHECK_DOTS_MAX,
+      list,
+    };
+  }
 
   function feedbackKey(snapshot, kind, item) {
     // A push changes the head, not an unchanged review comment. Keeping
@@ -17,10 +75,13 @@
     ]);
   }
 
+  /** The items of `snapshot` not in `handled`, and the keys that mark them
+   *  handled once sent. */
   function newFeedback(snapshot, handled) {
     const seen = new Set(handled);
     const checks = [];
     const threads = [];
+    const keys = [];
     for (const [kind, items, out] of [
       ["check", snapshot.failedChecks, checks],
       ["thread", snapshot.threads, threads],
@@ -29,10 +90,11 @@
         const key = feedbackKey(snapshot, kind, item);
         if (seen.has(key)) continue;
         seen.add(key);
+        keys.push(key);
         out.push(item);
       }
     }
-    return { checks, threads };
+    return { checks, threads, keys };
   }
 
   function validateSnapshot(snapshot) {
@@ -51,11 +113,11 @@
       !Number.isSafeInteger(snapshot.deletions) ||
       snapshot.deletions < 0 ||
       typeof snapshot.isDraft !== "boolean" ||
-      !["OPEN", "MERGED", "CLOSED"].includes(snapshot.state) ||
-      !["none", "pending", "success", "failure", "unknown"].includes(
-        snapshot.checksState,
-      ) ||
       !Array.isArray(snapshot.failedChecks) ||
+      !Array.isArray(snapshot.checks) ||
+      !snapshot.checks.every(
+        (c) => c && nonempty(c.name) && CHECK_STATES.includes(c.state) && nonempty(c.url),
+      ) ||
       !Array.isArray(snapshot.threads) ||
       !snapshot.failedChecks.every((c) => c && nonempty(c.id)) ||
       !snapshot.threads.every(
@@ -99,131 +161,331 @@
     return error?.message || "PR automation failed.";
   }
 
-  // Grants are tab-local; discovery below is shared by checkout. A read may
-  // update inactive navigation, but only its captured selected-tab grant may
-  // publish an agent prompt.
+  /** getContext supplies the latest committed tab, bridge and gates, including
+   * optional projectKey (the canonical folder). The clock is injectable so
+   * decisions, races and actual dispatches can be exercised without GitHub. */
   function createController({
     getContext,
     onChange,
     setTimer = setTimeout,
     clearTimer = clearTimeout,
     intervalMs = INTERVAL_MS,
+    ciIntervalMs = CI_INTERVAL_MS,
   }) {
-    const grants = new Map();
-    let active = false,
-      generation = 0,
-      previous = null;
-    const ctx = () => getContext() || {};
-    const session = (c = ctx()) => c.sessions.find((s) => s.id === c.tabId);
-    const stamp = (s) =>
-      JSON.stringify([
-        s.path,
-        s.branch ?? null,
-        s.profile ?? null,
-        s.sessionFile ?? null,
-        s.processStartedAt ?? null,
-        s.conversationVersion ?? 0,
-      ]);
+    const tabs = new Map();
+    let previous = null;
+    let generation = 0;
+    let timer = null;
+    let timerEntry = null;
+    let flight = null;
+    let active = false;
+    let refreshRequested = false;
+    // No GitHub CLI on this machine: the card hides itself. Machine-wide, not
+    // per tab, so a newly opened tab does not show the card until its own
+    // read fails again; any successful read clears it.
+    let ghMissing = false;
+
     const notify = () => {
       if (active) onChange?.();
     };
-    const available = (c) =>
+    const ctx = () => getContext() || {};
+    const open = (c, id) =>
+      !!id && Array.isArray(c.sessionIds) && c.sessionIds.includes(id);
+    const discoverable = (c) =>
+      open(c, c.tabId) &&
       c.featureEnabled !== false &&
+      !!c.projectKey &&
       c.connected !== false &&
       c.bridge?.isConnected !== false &&
-      !!session(c)?.path;
-    const ready = (c = ctx()) =>
-      available(c) &&
+      typeof c.bridge?.prAutomationSnapshot === "function";
+    const ready = (c) =>
+      discoverable(c) &&
       c.blocked === false &&
       c.runState === "idle" &&
       typeof c.bridge?.prAutomationSend === "function";
-    const disable = (e) => {
-      e.enabled = false;
-      e.token++;
-      e.error = null;
-      e.fixing = false;
-      e.seenBusy = false;
-      e.phase = "pending";
-      e.handled.clear();
+    const cancelTimer = () => {
+      if (timer !== null) {
+        clearTimer(timer);
+        timer = null;
+        if (timerEntry) timerEntry.loading = false;
+        timerEntry = null;
+      }
     };
-    const grant = (s) => {
-      if (!s) return null;
-      let e = grants.get(s.id);
-      if (!e || e.stamp !== stamp(s)) {
-        if (e) disable(e);
+    // Voids the read in flight and any pending one.
+    const invalidate = () => {
+      generation++;
+      cancelTimer();
+      if (flight) flight.entry.loading = false;
+    };
+    // The entry belongs to the tab's current project, conversation and branch.
+    const inScope = (e, c) =>
+      e.projectKey === (c.projectKey || null) &&
+      e.conversationKey === (c.conversationKey || null) &&
+      e.branchKey === (c.branchKey || null);
+    const entryFor = (id) => {
+      let e = tabs.get(id);
+      if (!e) {
         e = {
-          stamp: stamp(s),
           enabled: false,
           token: 0,
-          error: null,
+          projectKey: null,
+          handled: new Set(),
           phase: "pending",
+          error: null,
           fixing: false,
           seenBusy: false,
-          handled: new Set(),
+          snapshot: null,
+          loading: false,
+          discoveryError: null,
+          conversationKey: null,
+          branchKey: null,
+          retries: 0,
         };
-        grants.set(s.id, e);
+        tabs.set(id, e);
       }
       return e;
     };
-    const currentGrant = () => {
-      const s = session(),
-        e = s && grants.get(s.id);
-      return e?.stamp === (s && stamp(s)) ? e : null;
+    const disable = (e) => {
+      e.enabled = false;
+      e.token++;
+      e.phase = "pending";
+      e.error = null;
+      e.fixing = false;
+      e.loading = false;
+      e.seenBusy = false;
+      e.handled.clear();
+      e.retries = 0;
     };
 
-    const monitor = window.OMP_PR_DISCOVERY.createMonitor({
-      getContext: () => ({
-        ...ctx(),
-        autoFixActive: !!currentGrant()?.enabled && !currentGrant()?.error,
-      }),
-      onChange: notify,
-      validate: validateSnapshot,
-      setTimer,
-      clearTimer,
-      intervalMs,
-      onBegin: (id) => {
-        const c = ctx(),
-          e = currentGrant();
+    function view() {
+      const c = ctx();
+      const currentEntry = open(c, c.tabId) ? tabs.get(c.tabId) : null;
+      const e =
+        c.featureEnabled !== false && currentEntry && inScope(currentEntry, c)
+          ? currentEntry
+          : null;
+      const discovery = {
+        snapshot: discoverable(c) ? (e?.snapshot ?? null) : null,
+        // A read started for an outdated tab, branch or conversation still
+        // holds the single flight; this view's own read waits behind it.
+        loading: discoverable(c)
+          ? !e ||
+            e.loading ||
+            refreshRequested ||
+            (flight !== null && flight.stamp !== generation)
+          : false,
+        discoveryError: e?.discoveryError ?? null,
+        ghMissing,
+      };
+      if (!e?.enabled)
         return {
-          e,
-          token: e?.token,
-          generation,
-          eligible: id === c.tabId && !!e?.enabled && !e.error && ready(c),
+          enabled: false,
+          status: "Auto-fix is off.",
+          error: null,
+          ...discovery,
         };
-      },
-      onResult: async ({ id, owners, snapshot, error, permission }) => {
-        if (!error && (!snapshot || snapshot.state !== "OPEN")) {
-          for (const owner of owners) {
-            const e = grants.get(owner);
-            if (e?.enabled) disable(e);
-          }
-          notify();
-          return;
+      let status;
+      if (e.error) status = "Paused after an error. Turn off and on to retry.";
+      else if (c.blocked !== false)
+        status = "Paused while another mode or project tab is active.";
+      else if (e.phase === "sending") status = "Sending fix prompt…";
+      else if (c.runState !== "idle")
+        status =
+          e.fixing && c.runState !== "failed"
+            ? "Fix prompt sent; waiting for the agent to be idle."
+            : "Paused while the agent is not idle.";
+      else if (!ready(c)) status = "Paused until the agent is connected.";
+      else if (e.phase === "checking") status = "Checking PR feedback…";
+      else if (e.fixing) status = "Fix prompt sent; awaiting the agent.";
+      else if (e.phase === "inactive")
+        status = "Paused while inactive; waiting to check feedback.";
+      else if (e.phase === "no-pr")
+        status = "No open pull request for the current branch.";
+      else if (e.phase === "clean")
+        status = "No failed checks or unresolved review threads.";
+      else if (e.phase === "handled")
+        status = "Feedback already sent; awaiting new feedback.";
+      else status = "Waiting to check PR feedback.";
+      return {
+        enabled: true,
+        status,
+        error: e.error,
+        ...discovery,
+      };
+    }
+
+    /** `retry`: the bridge was busy (STALE) or a read failed retryably; read
+     *  again after `delay` even with Auto-fix off, and keep the card on
+     *  "Updating…" meanwhile. */
+    function schedule(delay, retry = false) {
+      const c = ctx();
+      if (!active || timer !== null || flight || !discoverable(c)) return;
+      const e = tabs.get(c.tabId);
+      if (!e || (e.enabled && e.error && !refreshRequested)) return;
+      // A card nobody can see reads nothing unless Auto-fix depends on it.
+      if (c.visible === false && !e.enabled) return;
+      const immediate = !retry && (refreshRequested || delay === 0);
+      // Periodic reads need an opt-in, or CI still running on this PR as of
+      // a read that succeeded (a failing one must not poll forever).
+      if (
+        !immediate &&
+        !retry &&
+        !e.enabled &&
+        (e.discoveryError || !ciActive(e.snapshot))
+      )
+        return;
+      timerEntry = e;
+      timer = setTimer(
+        () => {
+          timer = null;
+          timerEntry = null;
+          const forced = refreshRequested;
+          refreshRequested = false;
+          poll(forced);
+        },
+        immediate ? 0 : delay,
+      );
+      if ((immediate || retry) && !e.loading) {
+        e.loading = true;
+        notify();
+      }
+    }
+
+    // Reconcile inputs before scheduling and after every awaited bridge call.
+    // A generation change cancels a stale snapshot even if a tab is revisited.
+    function reconcile() {
+      const c = ctx();
+      const ids = Array.isArray(c.sessionIds) ? c.sessionIds : [];
+      for (const id of tabs.keys()) if (!ids.includes(id)) tabs.delete(id);
+      const next = {
+        tabId: c.tabId,
+        bridge: c.bridge,
+        runState: c.runState,
+        blocked: c.blocked,
+        connected: c.connected,
+        bridgeConnected: c.bridge?.isConnected,
+        projectKey: c.projectKey,
+        conversationKey: c.conversationKey,
+        branchKey: c.branchKey,
+        featureEnabled: c.featureEnabled,
+        visible: c.visible,
+        ids: JSON.stringify(ids),
+      };
+      const changed =
+        !previous || Object.keys(next).some((k) => next[k] !== previous[k]);
+      if (!changed) return false;
+      if (previous && previous.tabId !== c.tabId) {
+        refreshRequested = false;
+        const old = tabs.get(previous.tabId);
+        if (
+          old?.enabled &&
+          !old.error &&
+          !old.fixing &&
+          old.phase !== "sending"
+        )
+          old.phase = "inactive";
+      }
+      previous = next;
+      invalidate();
+      if (c.featureEnabled === false)
+        for (const entry of tabs.values()) disable(entry);
+      const e = open(c, c.tabId) && entryFor(c.tabId);
+      if (e) {
+        if (!inScope(e, c)) {
+          disable(e);
+          e.projectKey = c.projectKey || null;
+          e.conversationKey = c.conversationKey || null;
+          e.branchKey = c.branchKey || null;
+          e.snapshot = null;
+          e.discoveryError = null;
         }
-        const p = permission,
-          e = p?.e;
-        const current = () =>
-          active &&
-          p.generation === generation &&
-          ctx().tabId === id &&
-          currentGrant() === e &&
-          e?.enabled &&
-          e.token === p.token &&
-          ready();
-        const fresh = () => {
-          const status = monitor.statuses()[id];
-          return status?.canEnable && status.snapshot === snapshot;
-        };
-        if (!p?.eligible || !current()) return;
-        if (error) {
-          e.error = error;
+        if (e.enabled && e.fixing && c.runState !== "idle") e.seenBusy = true;
+        if (e.enabled && e.fixing && e.seenBusy && c.runState === "idle") {
           e.fixing = false;
+          e.seenBusy = false;
+          e.phase = "handled";
+        }
+        if (e.phase === "checking") e.phase = "pending";
+      }
+      notify();
+      return true;
+    }
+
+    function sync() {
+      const changed = reconcile();
+      if (changed) schedule(0);
+    }
+
+    async function poll(forced = false) {
+      if (!active || flight || !discoverable(ctx())) return;
+      const c = ctx();
+      const id = c.tabId;
+      const e = tabs.get(id);
+      if (!e || (e.enabled && e.error && !forced)) return;
+      const token = e.token;
+      const stamp = generation;
+      const bridge = c.bridge;
+      const projectKey = c.projectKey;
+      // The entry is still this tab's and the same Auto-fix incarnation.
+      const mine = () => tabs.get(id) === e && e.token === token;
+      // Nothing this read depends on changed since it started.
+      const current = () => {
+        const now = ctx();
+        return (
+          active &&
+          generation === stamp &&
+          mine() &&
+          now.tabId === id &&
+          now.bridge === bridge &&
+          now.projectKey === projectKey &&
+          inScope(e, now) &&
+          discoverable(now)
+        );
+      };
+      // Doubles per retryable error in a row.
+      const backoff = () => RETRY_BASE_MS * 2 ** e.retries++;
+      const dispatchEligible = e.enabled && !e.error && ready(c);
+      const operation = { entry: e, stamp };
+      flight = operation;
+      e.loading = true;
+      if (dispatchEligible) e.phase = "checking";
+      notify();
+      let stale = false;
+      let busy = false;
+      let retryIn = null;
+      let dispatchStarted = false;
+      try {
+        const snapshot = await bridge.prAutomationSnapshot(id);
+        if (!current()) {
+          stale = true;
+          return;
+        }
+        if (snapshot === STALE) {
+          // The tab is mid-switch, -replay or -respawn: no answer yet, which
+          // is not "no PR". Ask again shortly.
+          busy = true;
+          return;
+        }
+        if (snapshot !== null) validateSnapshot(snapshot);
+        if (snapshot && c.branchKey && snapshot.branch !== c.branchKey) {
+          throw new Error("PR snapshot does not match the current branch.");
+        }
+        e.snapshot = snapshot;
+        e.discoveryError = null;
+        e.retries = 0;
+        ghMissing = false;
+        e.loading = false;
+        if (!dispatchEligible) {
           notify();
           return;
         }
-        if (!fresh()) return;
         e.fixing = false;
         e.seenBusy = false;
+        if (snapshot === null) {
+          e.phase = "no-pr";
+          notify();
+          return;
+        }
         const feedback = newFeedback(snapshot, e.handled);
         if (!feedback.checks.length && !feedback.threads.length) {
           e.phase =
@@ -233,227 +495,183 @@
           notify();
           return;
         }
+        // The bridge independently checks active tab and strict idle at the
+        // actual send, closing the gap between this guard and the RPC write.
+        if (!current() || !e.enabled || !ready(ctx())) {
+          stale = true;
+          return;
+        }
         e.phase = "sending";
+        e.fixing = false;
         notify();
-        try {
-          const sent = await ctx().bridge.prAutomationSend(
-            id,
-            makePrompt(snapshot, feedback),
-            snapshot,
-            () => current() && fresh(),
-          );
-          // A handoff already accepted cannot be recalled after a tab switch.
-          if (grants.get(id) !== e || !e.enabled || e.token !== p.token) return;
-          // No prompt was attempted when the final read or readiness check
-          // could not complete. Retry only after the next discovery poll.
-          if (sent === null) {
-            e.phase = "pending";
-            return;
-          }
-          if (!sent)
-            throw new Error(
-              "The agent did not accept the fix prompt. Turn off and on to retry.",
-            );
-          for (const item of feedback.checks)
-            e.handled.add(feedbackKey(snapshot, "check", item));
-          for (const item of feedback.threads)
-            e.handled.add(feedbackKey(snapshot, "thread", item));
+        dispatchStarted = true;
+        const sent = await bridge.prAutomationSend(
+          id,
+          makePrompt(snapshot, feedback),
+          snapshot,
+          () => current() && e.enabled && ready(ctx()),
+        );
+        // A send already handed to the bridge cannot be recalled. Record a
+        // successful dispatch for this enabled incarnation even if the user
+        // switched tabs while its acknowledgement was in flight.
+        if (sent === true && mine() && e.enabled) {
+          for (const key of feedback.keys) e.handled.add(key);
           e.fixing = true;
           e.seenBusy = ctx().tabId === id && ctx().runState !== "idle";
           e.phase = "handled";
-        } catch (error) {
-          if (grants.get(id) === e && e.enabled && e.token === p.token) {
-            e.fixing = false;
-            e.error = errorMessage(error);
+          notify();
+        } else if (sent !== true) {
+          const now = ctx();
+          // Refused because the user left the tab (or opened Settings) mid
+          // send: nothing was delivered and Auto-fix stays on; it checks
+          // again once the tab is back.
+          if (now.tabId !== id || !discoverable(now)) {
+            if (mine() && e.enabled) {
+              e.phase = "inactive";
+              notify();
+            }
+            stale = true;
+            return;
           }
+          throw new Error(
+            "The agent did not accept the fix prompt. Turn off and on to retry.",
+          );
         }
-        notify();
-      },
-    });
-
-    function sync() {
-      const c = ctx();
-      const ids = new Set(c.sessions.map((s) => s.id));
-      for (const id of grants.keys()) if (!ids.has(id)) grants.delete(id);
-      for (const s of c.sessions) grant(s);
-      if (c.featureEnabled === false)
-        for (const e of grants.values()) if (e.enabled) disable(e);
-      const next = JSON.stringify([
-        c.tabId,
-        c.runState,
-        c.blocked,
-        c.connected,
-        c.bridge?.isConnected,
-        c.featureEnabled,
-        c.visible,
-        c.sessions.map((s) => [s.id, stamp(s), s.runState, s.gitRevision ?? 0]),
-      ]);
-      const changed =
-        !previous || previous.value !== next || previous.bridge !== c.bridge;
-      const sessionStates = new Map(
-        c.sessions.map((s) => [
-          s.id,
-          JSON.stringify([stamp(s), s.runState, s.gitRevision ?? 0]),
-        ]),
-      );
-      const changedIds = [...sessionStates]
-        .filter(([id, value]) => previous?.sessionStates.get(id) !== value)
-        .map(([id]) => id);
-      if (changed) {
-        const old = previous && grants.get(previous.tabId);
-        if (
-          previous?.tabId !== c.tabId &&
-          old?.enabled &&
-          !old.error &&
-          !old.fixing &&
-          old.phase !== "sending"
-        )
-          old.phase = "inactive";
-        generation++;
-        previous = {
-          value: next,
-          bridge: c.bridge,
-          tabId: c.tabId,
-          sessionStates,
-        };
-        const e = currentGrant();
-        if (e?.enabled && e.fixing && c.runState !== "idle") e.seenBusy = true;
-        if (e?.enabled && e.fixing && e.seenBusy && c.runState === "idle") {
+      } catch (error) {
+        // GitHub or the checkout lagging (a push not yet visible, HEAD moving
+        // mid-read): not an error yet. The last snapshot stays on the card.
+        const retryable =
+          error?.retryable === true &&
+          !error?.ghMissing &&
+          mine() &&
+          e.retries < RETRY_MAX;
+        // Any answer but "not installed" means gh is there (an error such
+        // as "no upstream" included): the card comes back.
+        if (!error?.ghMissing && ghMissing) {
+          ghMissing = false;
+          notify();
+        }
+        if (error?.ghMissing && mine() && (dispatchStarted || current())) {
+          // A state, not an error: nothing can run until gh is installed,
+          // so an opt-in is revoked and only a refresh (focus) asks again.
+          if (e.enabled) disable(e);
+          e.snapshot = null;
+          e.discoveryError = null;
+          ghMissing = true;
+          notify();
+        } else if (retryable && dispatchStarted && e.enabled) {
+          // The bridge's pre-send read failed: no prompt reached the agent.
           e.fixing = false;
-          e.seenBusy = false;
-          e.phase = "handled";
-        }
+          if (current()) {
+            retryIn = backoff();
+            e.phase = "pending";
+          } else {
+            e.phase = "inactive";
+            stale = true;
+          }
+          notify();
+        } else if (dispatchStarted && mine() && e.enabled) {
+          e.fixing = false;
+          e.retries = 0;
+          e.error = errorMessage(error);
+          e.phase = "error";
+          notify();
+        } else if (current() && (!dispatchEligible || ready(ctx()))) {
+          if (retryable) {
+            retryIn = backoff();
+            if (dispatchEligible) e.phase = "pending";
+          } else {
+            e.retries = 0;
+            e.loading = false;
+            e.discoveryError = errorMessage(error);
+            if (dispatchEligible) {
+              e.fixing = false;
+              e.error = e.discoveryError;
+              e.phase = "error";
+            }
+          }
+          notify();
+        } else stale = true;
+      } finally {
+        e.loading = false;
+        if (flight === operation) flight = null;
+        const changed = reconcile();
+        if (retryIn !== null && !changed) schedule(retryIn, true);
+        else if (busy && !changed) schedule(BUSY_RETRY_MS, true);
+        else if (changed || stale || generation !== stamp) schedule(0);
+        else schedule(ciActive(e.snapshot) ? Math.min(intervalMs, ciIntervalMs) : intervalMs);
       }
-      monitor.sync();
-      if (changed) {
-        for (const id of new Set([c.tabId, ...changedIds]))
-          if (id) monitor.refresh(id);
-        notify();
-      }
-    }
-
-    function view() {
-      const c = ctx(),
-        e = currentGrant(),
-        statuses = monitor.statuses();
-      const discovery = statuses[c.tabId] || {
-        snapshot: null,
-        loading:
-          available(c) &&
-          !session(c)?.preparing &&
-          typeof c.bridge?.changesSnapshot === "function",
-        discoveryError: null,
-        localChanges: null,
-        localError: null,
-        canEnable: false,
-      };
-      const snapshot = discovery.snapshot;
-      let status = "Auto-fix is off.";
-      const enabled = available(c) && !!e?.enabled;
-      if (snapshot?.state === "MERGED") status = "PR merged. Auto-fix is off.";
-      else if (snapshot?.state === "CLOSED")
-        status = "PR closed. Auto-fix is off.";
-      else if (enabled) {
-        if (e.error)
-          status = "Paused after an error. Turn off and on to retry.";
-        else if (c.blocked !== false)
-          status = "Paused while another mode or project tab is active.";
-        else if (e.phase === "sending") status = "Sending fix prompt…";
-        else if (c.runState !== "idle")
-          status =
-            e.fixing && c.runState !== "failed"
-              ? "Fix prompt sent; waiting for the agent to be idle."
-              : "Paused while the agent is not idle.";
-        else if (!ready(c)) status = "Paused until the agent is connected.";
-        else if (e.fixing) status = "Fix prompt sent; awaiting the agent.";
-        else if (e.phase === "inactive")
-          status = "Paused while inactive; waiting to check feedback.";
-        else if (discovery.loading) status = "Checking PR feedback…";
-        else if (e.phase === "clean")
-          status = "No failed checks or unresolved review threads.";
-        else if (e.phase === "handled")
-          status = "Feedback already sent; awaiting new feedback.";
-        else status = "Waiting to check PR feedback.";
-      }
-      return {
-        enabled,
-        status,
-        error: enabled ? e.error : null,
-        number: enabled ? (snapshot?.number ?? null) : null,
-        url: enabled ? (snapshot?.url ?? null) : null,
-        ...discovery,
-        statuses,
-      };
     }
 
     function toggle() {
       if (!active) return;
-      sync();
-      const c = ctx(),
-        s = session(c);
-      if (!available(c)) return;
-      const e = grant(s),
-        discovery = monitor.statuses()[s.id];
+      reconcile();
+      const c = ctx();
+      if (!discoverable(c)) return;
+      const e = entryFor(c.tabId);
+      if (!e.enabled && ghMissing) return;
       if (e.enabled) disable(e);
       else {
-        if (!discovery?.canEnable) return;
-        for (const other of c.sessions) {
-          const old = grants.get(other.id);
-          if (
-            old !== e &&
-            old?.enabled &&
-            window.OMP_PROJECT_NAV.normPath(other.path) ===
-              window.OMP_PROJECT_NAV.normPath(s.path)
-          )
-            disable(old);
-        }
-        e.token++;
+        const key = c.projectKey || null;
+        if (key)
+          for (const other of tabs.values()) {
+            if (other !== e && other.enabled && other.projectKey === key)
+              disable(other);
+          }
+        disable(e); // a fresh incarnation: new token, nothing handled yet
         e.enabled = true;
-        e.error = null;
-        e.handled.clear();
-        e.phase = "pending";
-        e.fixing = false;
-        e.seenBusy = false;
+        e.projectKey = key;
       }
-      generation++;
-      monitor.refresh(c.tabId);
+      invalidate();
       notify();
+      schedule(0);
     }
+
     function pause() {
-      const e = currentGrant();
-      if (!active || !e?.enabled) return;
+      if (!active) return;
+      const c = ctx();
+      const e = open(c, c.tabId) && tabs.get(c.tabId);
+      if (!e?.enabled) return;
       disable(e);
-      generation++;
-      monitor.refresh(ctx().tabId);
+      invalidate();
       notify();
+      schedule(0);
     }
+
     function refresh() {
-      if (active) {
-        sync();
-        generation++;
-        monitor.refresh();
+      if (!active) return;
+      reconcile();
+      if (!discoverable(ctx())) return;
+      // A send already past its guards must not be voided by a focus
+      // refresh; the poll's `finally` runs the requested read afterwards.
+      if (flight?.entry.phase === "sending") {
+        refreshRequested = true;
+        notify();
+        return;
       }
+      invalidate();
+      refreshRequested = true;
+      notify();
+      schedule(0);
     }
+
     function start() {
       active = true;
       previous = null;
       sync();
-      monitor.start();
     }
     function stop() {
       active = false;
-      generation++;
+      invalidate();
+      refreshRequested = false;
       previous = null;
-      monitor.stop();
     }
     return { start, stop, sync, view, toggle, pause, refresh };
   }
 
   window.OMP_PR_AUTOMATION = Object.freeze({
-    INTERVAL_MS,
-    feedbackKey,
-    newFeedback,
-    makePrompt,
+    STALE,
+    ciSummary,
     createController,
   });
 })();

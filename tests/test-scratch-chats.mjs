@@ -22,7 +22,8 @@ function harness({ boot = false } = {}) {
     DEFAULT_PROFILE_ID: "default", INTENT_FRAMING: () => "", timeNow: () => "00:00",
     buildCtx: () => ({}),
   };
-  for (const path of ["src/app/live-voice.js", "src/app/live-context.js", "src/app/approval-mode.js", "src/app/project-nav.js", "src/app/session-title.js"]) new Function("window", source(path))(w);
+  new Function("window", source("src/app/marked-setup.js"))(w);
+  for (const path of ["src/app/live-voice.js", "src/app/live-context.js", "src/app/approval-mode.js", "src/app/project-nav.js", "src/app/session-title.js", "src/app/agent-context.js", "src/app/agent-context-sync.js", "src/app/background-tasks.js", "src/app/cache-usage.js", "src/app/stream-delta.js"]) new Function("window", source(path))(w);
   const timeout = (fn, ms) => { const t = setTimeout(fn, ms); t.unref(); return t; };
   let snapshot;
   function emit(id, frame) {
@@ -81,7 +82,7 @@ function harness({ boot = false } = {}) {
       if (command === "start_session") {
         if (failProject && args.args.cwd === destination) throw new Error("project spawn failed");
         states.set(args.args.sessionId, { sessionFile: args.args.resume });
-        return "write";
+        return { approvalMode: "write", path: args.args.cwd, workspace: null };
       }
       if (command === "replay_events") return { dropped: false, events: journal.get(args.sessionId) || [] };
       if (command === "send_command") {
@@ -234,7 +235,7 @@ await check("retained history from a deleted workspace resumes in a valid replac
   const old = (await h.bridge.listChats())[0];
   await h.bridge.closeSession(tab);
   await h.bridge.deleteChat(old.id);
-  const session = { path: "/default/retained.jsonl", cwd: old.path, title: "Retained history" };
+  const session = { path: "/default/retained.jsonl", cwd: old.path, title: "Retained history", profile_id: "default" };
   const [a, b] = await Promise.all([h.bridge.resumeSession(session), h.bridge.resumeSession(session)]);
   assert.equal(a, b);
   const reopened = h.snapshot().sessions[0];

@@ -96,11 +96,7 @@
    *  were lost (omp adds a message to the context at `message_end`): that
    *  copy takes its place. Any other streaming entry is left out — the
    *  caller re-appends its streaming bubble. */
-  function mergeTranscript(live, persisted, { trimmed = false } = {}) {
-    // Include provisional cards when locating a previously trimmed head,
-    // even if richer raw calls replace them below.
-    const liveKeys = trimmed ? new Set(live.map(messageKey)) : null;
-    let first = Infinity;
+  function mergeTranscript(live, persisted) {
     // A provider can return results alone in completion order. Replace those
     // provisional cards when raw calls restore invocation order and arguments.
     const recoveredCalls = new Set(persisted.filter(m => m._historySource === "call").map(messageKey));
@@ -110,7 +106,6 @@
     persisted.forEach((p, i) => {
       const key = messageKey(p);
       if (!key) return;
-      if (liveKeys?.has(key) && i < first) first = i;
       const queue = slots.get(key);
       if (queue) queue.push(i);
       else slots.set(key, [i]);
@@ -137,7 +132,7 @@
     // Indices into `persisted`, in order, that no live entry stands for.
     const missed = [];
     persisted.forEach((p, i) => {
-      if (!claimed.has(i) && !(trimmed && i < first)) missed.push(i);
+      if (!claimed.has(i)) missed.push(i);
     });
     // For each live position, the copy index of the next matched entry.
     const nextCopy = new Array(live.length);

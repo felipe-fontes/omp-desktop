@@ -21,12 +21,14 @@ pub(super) fn ci(cwd: Option<&str>) -> Value {
     let Some(cwd) = cwd.filter(|path| !path.is_empty()) else {
         return ci_result(Err("No project folder is available".into()));
     };
-    let result = crate::pr_automation::snapshot(Path::new(cwd)).and_then(|snapshot| {
-        snapshot
-            .map(serde_json::to_value)
-            .transpose()
-            .map_err(|error| format!("Could not serialize CI feedback: {error}"))
-    });
+    let result = crate::pr_automation::snapshot(Path::new(cwd))
+        .map_err(|error| error.message)
+        .and_then(|snapshot| {
+            snapshot
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|error| format!("Could not serialize CI feedback: {error}"))
+        });
     ci_result(result)
 }
 
@@ -51,14 +53,8 @@ fn ci_result(result: Result<Option<Value>, String>) -> Value {
                 .get("head")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty() && s.len() <= 128);
-            let checks = snapshot.get("checksState").and_then(Value::as_str);
-            let state = match (head, checks) {
-                (Some(_), Some("none")) => "absent",
-                (Some(_), Some("pending")) => "pending",
-                (Some(_), Some("success")) => "success",
-                (Some(_), Some("failure")) => "failure",
-                _ => "unknown",
-            };
+            let checks_list = snapshot.get("checks").and_then(Value::as_array);
+            let state = ci_state(head, checks_list.map(Vec::as_slice));
             let reason = match state {
                 "absent" => Some("No CI check rollup was reported for this commit"),
                 "pending" => Some("CI checks are still pending"),
@@ -72,20 +68,17 @@ fn ci_result(result: Result<Option<Value>, String>) -> Value {
                     .and_then(Value::as_str)
                     .map(|s| bounded(s, 512))
             };
-            let checks_list = snapshot.get("failedChecks").and_then(Value::as_array);
             let mut truncated = checks_list.is_some_and(|items| {
                 items.len() > 100
                     || items.iter().take(100).any(|check| {
-                        [("id", 256), ("name", 256), ("url", 512)]
-                            .iter()
-                            .any(|(key, limit)| {
-                                check
-                                    .get(*key)
-                                    .and_then(Value::as_str)
-                                    .is_some_and(|s| s.len() > *limit)
-                            })
+                        [("name", 256), ("url", 512)].iter().any(|(key, limit)| {
+                            check
+                                .get(*key)
+                                .and_then(Value::as_str)
+                                .is_some_and(|s| s.len() > *limit)
+                        })
                     })
-            }) || ["url", "repository", "branch", "state"].iter().any(|key| {
+            }) || ["url", "repository", "branch"].iter().any(|key| {
                 snapshot
                     .get(*key)
                     .and_then(Value::as_str)
@@ -95,9 +88,13 @@ fn ci_result(result: Result<Option<Value>, String>) -> Value {
             // serialized size, not just the input text, before retaining it.
             let mut remaining = 96 * 1024;
             let mut failed = Vec::new();
-            for check in checks_list.into_iter().flatten().take(100) {
+            for check in checks_list
+                .into_iter()
+                .flatten()
+                .filter(|check| check.get("state").and_then(Value::as_str) == Some("failure"))
+                .take(100)
+            {
                 let item = json!({
-                    "id": check.get("id").and_then(Value::as_str).map(|s| bounded(s, 256)),
                     "name": check.get("name").and_then(Value::as_str).map(|s| bounded(s, 256)),
                     "url": check.get("url").and_then(Value::as_str).map(|s| bounded(s, 512))
                 });
@@ -123,9 +120,37 @@ fn ci_result(result: Result<Option<Value>, String>) -> Value {
                 "limitations": limitations,
                 "snapshot": {"number": snapshot.get("number").and_then(Value::as_u64), "url": text("url"),
                     "repository": text("repository"), "branch": text("branch"),
-                    "prState": text("state"), "checksState": checks.map(|s| bounded(s, 32)),
+                    "prState": "OPEN", "checksState": state,
                     "failedChecks": failed, "truncated": truncated}
             })
         }
+    }
+}
+
+fn ci_state(head: Option<&str>, checks: Option<&[Value]>) -> &'static str {
+    let (Some(_), Some(checks)) = (head, checks) else {
+        return "unknown";
+    };
+    if checks.is_empty() {
+        return "absent";
+    }
+    let (mut pending, mut failed, mut succeeded, mut unknown) = (false, false, false, false);
+    for check in checks {
+        match check.get("state").and_then(Value::as_str) {
+            Some("queued" | "running") => pending = true,
+            Some("failure") => failed = true,
+            Some("success") => succeeded = true,
+            Some("neutral") => {}
+            _ => unknown = true,
+        }
+    }
+    if pending {
+        "pending"
+    } else if failed {
+        "failure"
+    } else if succeeded && !unknown {
+        "success"
+    } else {
+        "unknown"
     }
 }

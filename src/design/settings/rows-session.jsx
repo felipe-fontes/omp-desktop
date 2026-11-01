@@ -2,9 +2,9 @@
    design/settings/rows-session.jsx — Settings → Session's native keep-awake
    default and `version` rows (window.OMP_SETTINGS_ROWS). The version row
    shows the running app and last update check (ctx.updater), "Check now"
-   (a manual check: opens the update modal, as the tab-bar label does), and
+   (a manual check: opens the update modal, as the status-bar label does), and
    the release skipped from that modal (`skippedUpdate`) with "Clear", so
-   the tab-bar pill offers it again.
+   the status-bar pill offers it again.
    ═════════════════════════════════════════════════════════════════════ */
 
 /** What the last check found, as a short phrase ("" before any). */

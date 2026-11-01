@@ -10,6 +10,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { createRequire } from "node:module";
+import { runInNewContext } from "node:vm";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const win  = {};
@@ -111,7 +113,6 @@ check("queued inserts cannot recreate a closed tab or overwrite the focused tab"
   assert.equal(next.A.text, "pending task ");
   assert.equal(next.B, drafts.B);
 });
-
 check("an update never touches another tab's entry", () => {
   const before = onPlan({}, "B", S.enterPlan);
   const after  = onPlan(before, "A", S.togglePlan);
@@ -407,6 +408,127 @@ check("a null comment removes the annotation without mutating the old plan", () 
   assert.deepEqual(none.annotations, {});
   assert.deepEqual(Object.keys(one.annotations), ["4"]);
   assert.deepEqual(PLAN_IDLE.annotations, {});
+});
+
+// Exercise the real composer with batched state updates and effects. The
+// stand-in deliberately applies updates after all effects from a render.
+function composerHarness() {
+  const slots = [], updates = [];
+  let cursor = 0, effects = [], tree;
+  const React = {
+    Fragment: "fragment",
+    createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+    useState(initial) {
+      const i = cursor++;
+      if (!(i in slots)) slots[i] = typeof initial === "function" ? initial() : initial;
+      return [slots[i], value => updates.push([i, value])];
+    },
+    useRef(initial) {
+      const i = cursor++;
+      if (!(i in slots)) slots[i] = { current: initial };
+      return slots[i];
+    },
+    useMemo: fn => fn(),
+    useEffect(fn, deps) {
+      const i = cursor++, previous = slots[i];
+      if (!previous || !deps || deps.some((value, j) => !Object.is(value, previous[j]))) effects.push(fn);
+      slots[i] = deps;
+    },
+  };
+  React.useLayoutEffect = React.useEffect;
+  const w = {
+    OMP_SESSION_UI: S, OMP_WIDGETS: win.OMP_WIDGETS,
+    OMP_MENTIONS: { parseMentionQuery: () => null },
+    OMP_IMAGES: { MAX_ATTACHMENTS: 4, toDataUrl: image => `data:${image.data}` },
+    OMP_SLASH: { slashMenu: () => [], midPromptSlashToken: () => null },
+    OMP_QUEUE: {}, OMP_BROWSER: { droppedScreenshots: () => 0 },
+    Icon: () => null, useActiveRowIntoView: () => {},
+  };
+  const names = ["LiveVoicePanel", "DictationPanel", "PendingInput", "QueueStrip", "BrowserChips",
+    "PasteStrip", "VoiceSpectrum", "VoiceModeButton", "ThinkingMenu", "TabRunDot", "MentionMenu"];
+  const context = { window: w, React, document: { activeElement: null }, requestAnimationFrame: () => {},
+    setTimeout, clearTimeout, ...Object.fromEntries(names.map(name => [name, () => null])) };
+  const Babel = createRequire(import.meta.url)(join(root, "src/babel.min.js"));
+  const { code } = Babel.transform(readFileSync(join(root, "src/design/composer.jsx"), "utf8"), { presets: ["react"] });
+  runInNewContext(code, context);
+  const sent = [], acknowledged = [], inserts = [];
+  const props = {
+    sessionId: "A", sessionIds: ["A", "B"], targetedDraftInserts: [], dictationCompleted: [],
+    onSend: (text, images) => sent.push({ text, images }), onAckDictation: ids => acknowledged.push(...ids),
+    onAckDraftInserts: ids => inserts.push(...ids), microcopy: {},
+  };
+  function flush() {
+    for (let pass = 0; pass < 30; pass++) {
+      cursor = 0; effects = [];
+      tree = w.Composer(props);
+      for (const effect of effects) effect();
+      let changed = false;
+      for (const [i, value] of updates.splice(0)) {
+        const next = typeof value === "function" ? value(slots[i]) : value;
+        if (!Object.is(next, slots[i])) { slots[i] = next; changed = true; }
+      }
+      if (!changed) return;
+    }
+    throw new Error("composer did not settle");
+  }
+  function find(type) {
+    const visit = node => {
+      if (Array.isArray(node)) return node.map(visit).find(Boolean);
+      if (!node || typeof node !== "object") return null;
+      return node.type === type ? node : visit(node.children);
+    };
+    return visit(tree);
+  }
+  flush();
+  return { props, sent, acknowledged, inserts, flush, find };
+}
+
+check("dictation sends only its appended capture once and leaves hidden-tab text in its draft", () => {
+  const h = composerHarness();
+  h.find("textarea").props.onChange({ target: { value: "echo", selectionStart: 4 } });
+  h.flush();
+  const capture = { sessionId: "A", captureId: "one", text: "echo", send: true };
+  h.props.dictationCompleted = [capture];
+  h.flush();
+  assert.deepEqual(h.sent.map(row => row.text), ["echo echo"]);
+  assert.deepEqual(h.acknowledged, ["one"]);
+  h.props.dictationCompleted = [capture];
+  h.flush();
+  assert.equal(h.sent.length, 1);
+  h.props.dictationCompleted = [{ sessionId: "B", captureId: "two", text: "hidden", send: true }];
+  h.flush();
+  assert.equal(h.sent.length, 1);
+  h.props.sessionId = "B";
+  h.flush();
+  assert.equal(h.find("textarea").props.value, "hidden");
+  assert.equal(h.sent.length, 1);
+  h.props.conversationMoving = true;
+  h.props.dictationCompleted = [{ sessionId: "B", captureId: "three", text: "later", send: true }];
+  h.flush();
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.find("textarea").props.value, "hidden later");
+});
+
+check("queued inserts and image rewinds restore their hidden owning tab", () => {
+  const h = composerHarness();
+  h.props.targetedDraftInserts = [
+    { sessionId: "B", nonce: 1, text: "first" }, { sessionId: "B", nonce: 2, text: "second" },
+  ];
+  h.flush();
+  assert.deepEqual(h.inserts, [1, 2]);
+  assert.equal(h.find("textarea").props.value, "");
+  h.props.sessionId = "B";
+  h.flush();
+  assert.equal(h.find("textarea").props.value, "first second ");
+  h.props.sessionId = "A";
+  h.flush();
+  h.props.promptInsert = { sessionId: "B", nonce: 3, text: "", images: [{ data: "restored" }] };
+  h.flush();
+  assert.equal(h.find("textarea").props.value, "");
+  h.props.sessionId = "B";
+  h.flush();
+  assert.equal(h.find("textarea").props.value, "");
+  assert.equal(h.find("img").props.src, "data:restored");
 });
 
 console.log(`test-session-ui: ${passed} passed`);

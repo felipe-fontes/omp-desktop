@@ -38,7 +38,7 @@ pub struct SavedSession {
 /// and, for sessions resumed over RPC, must never be conflated with a
 /// live `get_state().sessionId` from a different `get_state` call.
 #[derive(Debug, serde::Serialize)]
-pub(crate) struct SessionMetadata {
+pub struct SessionMetadata {
     pub id: String,
     pub title: String,
     pub timestamp: String,
@@ -184,7 +184,7 @@ fn update_last_activity(current: &mut Option<String>, candidate: &str) {
 
 /// Parse a single `.jsonl` session file and extract metadata. Callers outside
 /// this module must first validate the path against the selected profile.
-pub(crate) fn parse_session_file(path: &Path) -> Option<SessionMetadata> {
+pub fn parse_session_file(path: &Path) -> Option<SessionMetadata> {
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
 
