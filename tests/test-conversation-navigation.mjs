@@ -44,8 +44,16 @@ function harness() {
   }
   let readHistory = file => Promise.resolve(histories.get(file) ?? { messages: [], fork: null });
   let moveState = { isStreaming: false, isCompacting: false, isSettled: true };
+  let scratchRow = null;
   ctx.__TAURI__ = {
     core: { async invoke(name, args) {
+      if (name === "scratch_create") return scratchRow = { id: "history-chat", path: "/private/chats/history-chat", profile: args.profile, name: null, sessionFile: null };
+      if (name === "scratch_list") return scratchRow ? [scratchRow] : [];
+      if (name === "scratch_update") {
+        if (args.name != null) scratchRow.name = args.name;
+        if (args.sessionFile) scratchRow.sessionFile = args.sessionFile;
+        return true;
+      }
       if (name === "start_session") return "write";
       if (name === "replay_events") return { dropped: false, events: (journal.get(args.sessionId) ?? []).filter(e => e.seq > args.afterSeq) };
       if (name === "conversation_history") return readHistory(args.sessionFile);
@@ -103,6 +111,31 @@ await check("saved history restores pre-compaction turns and entry IDs without d
   messages = h.snapshot().messages;
   assert.equal(messages.filter(m => m.kind === "compact").length, 1);
   assert.equal(messages.find(m => m.text === "continue").entryId, "u3", "a context refresh keeps the saved action target");
+});
+
+await check("repository-free chats keep history and workspace identity through rewind", async () => {
+  const h = harness();
+  const id = await h.bridge.openChat();
+  const file = "/sessions/scratch.jsonl", child = "/sessions/scratch-rewound.jsonl";
+  const compact = { role: "compactionSummary", summary: "Earlier chat", tokensBefore: 110000, timestamp: 3 };
+  h.histories.set(file, { messages: [user("original chat request", 1, "u1"), answer("original chat answer", 2, "a1"), compact, user("continue", 4, "u2")], fork: null });
+  h.emit(id, { type: "response", command: "get_messages", success: true, data: { messages: [compact, user("continue", 4)] } });
+  h.emit(id, { type: "response", command: "get_state", success: true, data: { sessionFile: file, messageCount: 2 } });
+  await tick();
+  assert.equal(h.snapshot().messages[0].text, "original chat request");
+  assert.equal(h.snapshot().sessions.find(tab => tab.id === id).scratchId, "history-chat");
+  const rewind = h.bridge.branchAt("u1");
+  await tick();
+  h.reply(h.commands.findLast(command => command.type === "branch"), { text: "original chat request" });
+  assert.equal((await rewind).text, "original chat request");
+  h.histories.set(child, { messages: [], fork: { number: 1, parentSession: file } });
+  h.emit(id, { type: "response", command: "get_state", success: true, data: { sessionFile: child, messageCount: 0 } });
+  await tick();
+  const tab = h.snapshot().sessions.find(session => session.id === id);
+  assert.equal(tab.scratchId, "history-chat", "rewind must not turn a repository-free chat into a project tab");
+  assert.equal(tab.path, "/private/chats/history-chat");
+  assert.equal(tab.fork.number, 1);
+  assert.equal(h.snapshot().messages.length, 0);
 });
 
 await check("automatic compaction keeps the earlier transcript and one visible boundary", async () => {

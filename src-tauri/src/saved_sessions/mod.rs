@@ -173,8 +173,9 @@ fn update_last_activity(current: &mut Option<String>, candidate: &str) {
     }
 }
 
-/// Parse a single `.jsonl` session file and extract metadata.
-fn parse_session_file(path: &Path) -> Option<SavedSession> {
+/// Parse a single `.jsonl` session file and extract metadata. Callers outside
+/// this module must first validate the path against the selected profile.
+pub fn parse_session_file(path: &Path) -> Option<SavedSession> {
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
 

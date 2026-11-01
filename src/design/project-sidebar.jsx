@@ -18,8 +18,9 @@ function sidebarHint(actionId, fallback) {
 }
 
 function ProjectSidebar({
-  tabs, activeId, recents, profileLabel,
+  tabs, activeId, recents, profileLabel, chats, chatsLoading, chatsError,
   onSelectTab, onCloseTab, onRenameTab, onNewInProject, onOpenRecent, onForgetRecent, onOpenFolder, onHide, onReorder,
+  onNewChat, onOpenChat, onManageChat,
 }) {
   // Group keys the user folded. Not persisted: tab ids (and so pathless
   // groups' keys) don't survive a restart anyway.
@@ -39,24 +40,73 @@ function ProjectSidebar({
       <Icon name="edit" size={10} />
     </button>
   );
-  const groups = groupTabs(tabs);
+  const groups = groupTabs(tabs.filter(t => !t.scratchId));
+  // Open chats from other profiles remain visible alongside stored chats
+  // for the active profile.
+  const chatRows = new Map(chats.map(chat => [chat.id, chat]));
+  for (const tab of tabs) {
+    if (tab.scratchId && !chatRows.has(tab.scratchId)) {
+      chatRows.set(tab.scratchId, { id: tab.scratchId, path: tab.path, profile: tab.profile, name: tab.name });
+    }
+  }
   // Drag to reorder (#40), the same lists as the tab bar's: projects (a
   // project's rows move as one block), and members within their project.
   const reorder = window.useDragReorder(onReorder);
   const hideHint = sidebarHint("desktop.sidebar.toggle", "Ctrl+B");
 
   return (
-    <aside className="project-sidebar" aria-label="projects">
+    <aside className="project-sidebar" aria-label="Chats and projects">
       <div className="psb-head">
-        <span>projects</span>
+        <span>workspace</span>
         <button className="psb-act" title={`hide sidebar (${hideHint})`} onClick={onHide}>
           <Icon name="sidebar" size={11} />
         </button>
       </div>
 
       <div className="psb-scroll" onPointerDown={reorder.onPointerDown}>
-        <div className="psb-section">open</div>
-        {groups.length === 0 && <div className="psb-empty">no open tabs</div>}
+        <div className="psb-section">chats</div>
+        {chatsLoading && chatRows.size === 0 && <div className="psb-empty">loading chats…</div>}
+        {chatsError && <div className="psb-empty" role="alert">{chatsError}</div>}
+        {!chatsLoading && !chatsError && chatRows.size === 0 && <div className="psb-empty">no saved chats</div>}
+        {[...chatRows.values()].map(chat => {
+          const tab = tabs.find(t => t.scratchId === chat.id);
+          const name = tab?.name || chat.name || "untitled chat";
+          const profile = profileLabel(tab?.profile || chat.profile || window.DEFAULT_PROFILE_ID);
+          return (
+            <div key={chat.id} className={`psb-row ${tab?.id === activeId ? "active" : ""}`}>
+              <span className="psb-chev-spacer" />
+              {tab && renaming === tab.id ? (
+                <div className="psb-main psb-editing">{renameField(tab)}</div>
+              ) : (
+                <button className="psb-main" title={`${name}${tab ? "" : " · closed"}`}
+                  onClick={() => tab ? onSelectTab(tab.id) : onOpenChat(chat)}
+                  onDoubleClick={() => { if (tab) startRename(tab.id); }}>
+                  <Icon name="conversation" size={11} color={tab?.id === activeId ? "var(--accent)" : "var(--fg-4)"} />
+                  <span className="psb-name">{name}</span>
+                  {tab && <TabForkMark fork={tab.fork} />}
+                  {profile && <span className="chip muted tab-profile" title={`profile: ${profile}`}>{profile}</span>}
+                  {tab ? <TabRunDot state={tab.runState} /> : <span className="psb-parent">closed</span>}
+                </button>
+              )}
+              <span className="psb-actions">
+                <button className="psb-act" title="manage chat workspace" aria-label={`Manage ${name} workspace`}
+                  onClick={() => onManageChat(chat)}>
+                  <Icon name="folder" size={10} />
+                </button>
+                {tab && renaming !== tab.id && renameButton(tab)}
+                {tab && (
+                  <button className="psb-act" title="close chat tab (workspace retained)" aria-label={`Close ${name} tab`}
+                    onClick={() => onCloseTab(tab.id)}>
+                    <Icon name="close" size={9} />
+                  </button>
+                )}
+              </span>
+            </div>
+          );
+        })}
+
+        <div className="psb-section">projects · open</div>
+        {groups.length === 0 && <div className="psb-empty">no open projects</div>}
         {groups.map(group => {
           const multi = group.tabs.length > 1;
           const expanded = multi && !collapsed[group.key];
@@ -145,7 +195,7 @@ function ProjectSidebar({
           );
         })}
 
-        <div className="psb-section">recent</div>
+        <div className="psb-section">projects · recent</div>
         {recents.length === 0 && <div className="psb-empty">no recent projects</div>}
         {recents.map(r => (
           <div key={r.path} className="psb-row psb-recent">
@@ -166,6 +216,9 @@ function ProjectSidebar({
         ))}
       </div>
 
+      <button className="psb-foot" onClick={onNewChat}>
+        <Icon name="plus" size={11} />new chat
+      </button>
       <button className="psb-foot" onClick={onOpenFolder}>
         <Icon name="plus" size={11} />open folder…
       </button>
