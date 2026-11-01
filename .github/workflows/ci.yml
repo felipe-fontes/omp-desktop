@@ -1,4 +1,4 @@
-# CI — runs the shared test suite (tests.yml) on every push and PR.
+# CI — runs the shared test suite on main/master pushes and every PR.
 # No bundle build here — that lives in release.yml.
 
 name: CI
