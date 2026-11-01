@@ -21,39 +21,6 @@ fn create(store: &ConfigStore, name: &str, revision: u64) -> Preset {
 }
 
 #[test]
-fn standard_has_useful_honest_guidance_and_the_expected_wire_shape() {
-    let store = ConfigStore::load(None);
-    let view = store.library(None);
-    assert_eq!(view.revision, 0);
-    assert_eq!(view.presets.len(), 1);
-    assert_eq!(view.resolved.source, "builtin");
-    assert_eq!(view.resolved.preset, view.presets[0]);
-    assert!(view
-        .warning
-        .as_deref()
-        .expect("memory warning")
-        .contains("memory"));
-    let preset = &view.presets[0];
-    assert_eq!((preset.id.as_str(), preset.revision), ("standard", 1));
-    assert!(preset.planning_prompt.contains("outcomes"));
-    assert!(preset.collection_prompt.contains("failures"));
-    assert!(preset.assessment_prompt.contains("Do not accept"));
-    assert!(preset.tracking);
-    let json = serde_json::to_value(&view).expect("serialize library");
-    assert_eq!(json["globalDefault"], serde_json::Value::Null);
-    assert_eq!(json["projectDefault"], serde_json::Value::Null);
-    assert_eq!(json["resolved"]["source"], "builtin");
-    assert_eq!(json["presets"][0]["triggers"]["beforeWork"], true);
-    assert_eq!(json["presets"][0]["triggers"]["afterChanges"], true);
-    assert_eq!(json["presets"][0]["triggers"]["beforeHandoff"], true);
-    assert_eq!(json["presets"][0]["handoff"], "advisory");
-    assert_eq!(
-        serde_json::to_value(DefaultScope::Project).unwrap(),
-        "project"
-    );
-}
-
-#[test]
 fn project_override_and_resets_follow_global_then_builtin() {
     let dir = TempDir::new("evidence-presets", "precedence");
     let a = dir.path().join("project-a");

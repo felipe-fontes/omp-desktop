@@ -197,6 +197,111 @@ async function harness(options = {}) {
   };
 }
 
+test("invalid behavioral findings never enter the durable ledger", async () => {
+  const h = await harness();
+  try {
+    const ids = await h.criterion();
+    const record = {
+      title: "Filtered export",
+      kind: "test",
+      result: "passed",
+      summary: "Compared exported rows",
+    };
+    for (const finding of [
+      null,
+      [],
+      {},
+      { expected: "Only matching orders" },
+      { expected: " ", observed: "Two matching rows" },
+      { expected: "é".repeat(1025), observed: "Two matching rows" },
+      { expected: "Only matching orders", observed: "é".repeat(1025) },
+    ]) {
+      const response = await h.call("record", {
+        ...ids,
+        record: { ...record, finding },
+      });
+      assert.equal(typeof response.error, "string");
+      assert.equal(h.view.records.length, 0);
+    }
+    const response = await h.call("record", {
+      ...ids,
+      record: { ...record, reviewRequested: "yes" },
+    });
+    assert.equal(typeof response.error, "string");
+    assert.equal(h.view.records.length, 0);
+    await h.change("record", {
+      ...ids,
+      record: {
+        ...record,
+        finding: { expected: "é".repeat(1024), observed: "Two matching rows" },
+        reviewRequested: true,
+      },
+    });
+    const restored = await h.reopen(h.bootstrap.policy);
+    assert.equal(h.view.records[0].review.decision, "unreviewed");
+    assert.equal(h.view.records[0].reviewRequested, true);
+    assert.equal(Buffer.byteLength(h.view.records[0].finding.expected), 2048);
+    await restored.shutdown();
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("scope removal requires a user reason and preserves its evidence and history", async () => {
+  const h = await harness();
+  try {
+    const ids = await h.criterion();
+    await h.change("record", {
+      ...ids,
+      record: {
+        title: "Earlier failure",
+        kind: "test",
+        result: "failed",
+        summary: "The export failed",
+      },
+    });
+    const recordId = h.view.records[0].id;
+    const before = h.view.history.length;
+    for (const reason of [undefined, " ", "é".repeat(513)]) {
+      const response = await h.call("retire", { ...ids, reason });
+      assert.equal(typeof response.error, "string");
+      assert.equal(h.view.outcomes[0].requirements[0].retired, false);
+      assert.equal(h.view.history.length, before);
+    }
+    await assert.rejects(
+      h.runtime.agentOperation(h.ctx, {
+        op: "retire",
+        ...ids,
+        reason: "The agent wants to skip this",
+      }),
+      /cannot perform/,
+    );
+    const view = await h.change("retire", {
+      ...ids,
+      reason: "The user moved CSV export out of this release",
+    });
+    const criterion = view.outcomes[0].requirements[0];
+    assert.equal(criterion.retired, true);
+    assert.equal(criterion.retirement.actor, "user");
+    assert.equal(
+      criterion.retirement.reason,
+      "The user moved CSV export out of this release",
+    );
+    assert.equal(view.records[0].id, recordId);
+    assert.equal(view.records[0].result, "failed");
+    assert.ok(view.history.at(-1).detail.includes(criterion.retirement.reason));
+    const restored = await h.reopen(h.bootstrap.policy);
+    assert.equal(
+      h.view.outcomes[0].requirements[0].retirement.reason,
+      criterion.retirement.reason,
+    );
+    assert.equal(h.view.records[0].id, recordId);
+    await restored.shutdown();
+  } finally {
+    await h.cleanup();
+  }
+});
+
 test("user-owned criteria, reviews and waivers remain user decisions", async () => {
   const h = await harness();
   try {
@@ -1494,3 +1599,106 @@ test(
     }
   },
 );
+
+test("CI results stay host-controlled and explicit review reaches the goal", async () => {
+  const h = await harness();
+  try {
+    const ids = await h.criterion();
+    await h.change("requirement", {
+      ...ids,
+      requirement: {
+        id: ids.requirementId,
+        text: "CI checks finish successfully",
+        kind: "ci",
+        required: true,
+      },
+    });
+    h.setHost((request) =>
+      JSON.stringify({
+        ok: true,
+        value:
+          request.op === "fingerprint"
+            ? FP()
+            : {
+                state: "failure",
+                sourceSha: "abc",
+                reason: "Lint failed",
+                snapshot: {
+                  checksState: "failure",
+                  failedChecks: [{ name: "lint" }],
+                },
+              },
+      }),
+    );
+    const view = await h.change("capture_ci", {
+      ...ids,
+      record: {
+        title: "Claimed pass",
+        kind: "ci",
+        result: "passed",
+        summary: "Requested summary",
+        finding: {
+          expected: "CI checks succeed",
+          observed: "The lint check failed",
+        },
+        reviewRequested: true,
+      },
+    });
+    const projection = { OMP_EVIDENCE_MODEL: M };
+    new Function(
+      "window",
+      await readFile(
+        new URL("../src/app/evidence-proof.js", import.meta.url),
+        "utf8",
+      ),
+    )(projection);
+    assert.equal(view.records[0].result, "failed");
+    assert.equal(view.records[0].source.type, "ci");
+    assert.equal(
+      projection.OMP_EVIDENCE_PROOF.goal(view, view.outcomes[0]).demonstrated,
+      false,
+    );
+    assert.equal(
+      projection.OMP_EVIDENCE_PROOF.summary(view).reviewRequested,
+      1,
+    );
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("malformed CI findings are refused instead of silently stripped", async () => {
+  const h = await harness();
+  try {
+    const ids = await h.criterion();
+    await h.change("requirement", {
+      ...ids,
+      requirement: {
+        id: ids.requirementId,
+        text: "CI checks succeed",
+        kind: "ci",
+        required: true,
+      },
+    });
+    for (const fields of [
+      { finding: { expected: "Success" } },
+      { finding: { expected: "é".repeat(1025), observed: "Success" } },
+      { reviewRequested: "yes" },
+    ]) {
+      const result = await h.call("capture_ci", {
+        ...ids,
+        record: {
+          title: "CI",
+          kind: "ci",
+          result: "passed",
+          summary: "Claim",
+          ...fields,
+        },
+      });
+      assert.equal(typeof result.error, "string");
+      assert.equal(h.view.records.length, 0);
+    }
+  } finally {
+    await h.cleanup();
+  }
+});

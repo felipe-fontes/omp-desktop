@@ -39,6 +39,33 @@ function useEvidence({
     error: null,
   });
   const pendingRequest = React.useRef(null);
+  const emptyArtifacts = React.useMemo(() => new Set(), []);
+  const [artifactState, setArtifactState] = React.useState(() => ({
+    owner: ownerKey,
+    unavailable: new Set(),
+    refreshVersion: 0,
+  }));
+  const onArtifactAvailability = React.useCallback(
+    (id, available) => {
+      if (!id || latest.current !== ownerKey) return;
+      setArtifactState((previous) => {
+        const current =
+          previous.owner === ownerKey
+            ? previous
+            : {
+                owner: ownerKey,
+                unavailable: new Set(),
+                refreshVersion: 0,
+              };
+        if (current.unavailable.has(id) === !available) return current;
+        const unavailable = new Set(current.unavailable);
+        if (available) unavailable.delete(id);
+        else unavailable.add(id);
+        return { ...current, unavailable };
+      });
+    },
+    [ownerKey],
+  );
   const check = React.useCallback(() => {
     if (
       !tabId ||
@@ -51,8 +78,13 @@ function useEvidence({
     check();
     const result = await bridge.readEvidence();
     check();
+    setArtifactState((previous) =>
+      previous.owner === ownerKey
+        ? { ...previous, refreshVersion: previous.refreshVersion + 1 }
+        : { owner: ownerKey, unavailable: new Set(), refreshVersion: 1 },
+    );
     return result;
-  }, [bridge, check]);
+  }, [bridge, check, ownerKey]);
   const mutate = React.useCallback(
     async (input) => {
       check();
@@ -228,6 +260,13 @@ function useEvidence({
   }, [bridge, check]);
   return {
     ownerKey,
+    unavailableArtifactIds:
+      artifactState.owner === ownerKey
+        ? artifactState.unavailable
+        : emptyArtifacts,
+    assetRefreshVersion:
+      artifactState.owner === ownerKey ? artifactState.refreshVersion : 0,
+    onArtifactAvailability,
     profileId,
     projectPath,
     view,

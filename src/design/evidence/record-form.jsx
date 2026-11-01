@@ -16,15 +16,29 @@
     const [summary, setSummary] = React.useState("");
     const [limitations, setLimitations] = React.useState("");
     const [reason, setReason] = React.useState("");
+    const [expected, setExpected] = React.useState("");
+    const [observed, setObserved] = React.useState("");
+    const [reviewRequested, setReviewRequested] = React.useState(false);
     const [receiptId, setReceiptId] = React.useState("");
     const [artifact, setArtifact] = React.useState(null);
     const [path, setPath] = React.useState("");
     const [url, setUrl] = React.useState("");
     const action = useAction();
     const selected = outcomes.find((o) => o.id === outcomeId);
+    const expectedBytes = new TextEncoder().encode(expected.trim()).length;
+    const observedBytes = new TextEncoder().encode(observed.trim()).length;
+    const findingIncomplete = !!expected.trim() !== !!observed.trim();
+    const findingTooLong = expectedBytes > 2048 || observedBytes > 2048;
     const save = (e) => {
       e.preventDefault();
+      if (findingIncomplete || findingTooLong) return;
       const record = { title, kind, result, summary, limitations, reason };
+      if (expected.trim() && observed.trim())
+        record.finding = {
+          expected: expected.trim(),
+          observed: observed.trim(),
+        };
+      record.reviewRequested = reviewRequested;
       if (receiptId) record.receiptId = receiptId;
       if (artifact) record.artifact = artifact;
       if (path.trim()) record.fileRef = { path: path.trim() };
@@ -111,6 +125,50 @@
               rows="3"
             />
           </Field>
+          <div className="ev-form-grid">
+            <Field label="Expected behavior (optional)">
+              <textarea
+                value={expected}
+                onChange={(e) => setExpected(e.target.value)}
+                rows="3"
+                aria-invalid={
+                  (findingTooLong && expectedBytes > 2048) || findingIncomplete
+                }
+              />
+              <span>{expectedBytes} / 2048 UTF-8 bytes</span>
+            </Field>
+            <Field label="Observed result (optional)">
+              <textarea
+                value={observed}
+                onChange={(e) => setObserved(e.target.value)}
+                rows="3"
+                aria-invalid={
+                  (findingTooLong && observedBytes > 2048) || findingIncomplete
+                }
+              />
+              <span>{observedBytes} / 2048 UTF-8 bytes</span>
+            </Field>
+          </div>
+          <p className="ev-note">
+            Provide both expected and observed behavior, or leave both blank.
+            Each is limited to 2048 UTF-8 bytes.
+          </p>
+          {(findingIncomplete || findingTooLong) && (
+            <p className="ev-error" role="alert">
+              {findingIncomplete
+                ? "Both finding fields are required together. "
+                : ""}
+              {findingTooLong ? "A finding exceeds the byte limit." : ""}
+            </p>
+          )}
+          <label className="ev-check">
+            <input
+              type="checkbox"
+              checked={reviewRequested}
+              onChange={(e) => setReviewRequested(e.target.checked)}
+            />
+            Request human review of this record
+          </label>
           <Field label="Limitations">
             <textarea
               value={limitations}
@@ -175,7 +233,12 @@
           </Field>
           <Error error={action.error} />
           <div className="ev-actions">
-            <button className="btn" disabled={action.busy || !outcomeId}>
+            <button
+              className="btn"
+              disabled={
+                action.busy || !outcomeId || findingIncomplete || findingTooLong
+              }
+            >
               Save record
             </button>
             <button type="button" className="btn ghost" onClick={onDone}>

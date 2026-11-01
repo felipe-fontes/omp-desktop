@@ -484,7 +484,9 @@ impl AgentBridge {
         };
         // Copied out so the reader thread's lock is held only for the copy;
         // the command serialises the copy after the lock is released.
-        ext_ui.lock().map_or_default(|s| s.clone())
+        ext_ui
+            .lock()
+            .map_or_else(|_| ExtUiState::default(), |s| s.clone())
     }
 
     /// `pick` applied to `session_id`'s map entry, holding the `sessions`

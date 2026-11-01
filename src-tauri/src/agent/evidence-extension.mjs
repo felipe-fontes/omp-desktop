@@ -36,7 +36,7 @@ export default function desktopEvidence(api) {
     loadMode: "essential",
     approval: "write",
     description:
-      "Inspect the Evidence ledger, propose outcomes or criteria, record scoped evidence or gaps, attach a file, or capture existing CI. Use view with outcomeId, requirementId, recordId, receiptId or requestId to inspect a specific part of a large ledger. A passed claim is your interpretation, never independent acceptance. You cannot edit user-owned criteria, review, waive, change policies or disable collection. Receipts document execution, not meaning.",
+      "Inspect the Evidence ledger and record goal-oriented proof or explicit gaps. For a behavioral result, include finding.expected and finding.observed and attach relevant screenshots, short video, inspectable output, or a scoped execution receipt. A successful command alone is not feature proof; a passed claim is your interpretation, never independent acceptance. Set reviewRequested only to explicitly ask for human review, not for every record. Use scoped view ids for details. You cannot edit user-owned criteria, review, retire, waive, change policies or disable collection.",
     parameters: z.object({
       op: z.enum(["view", "outcome", "requirement", "record", "capture_ci"]),
       outcomeId: z.string().optional(),
@@ -72,6 +72,10 @@ export default function desktopEvidence(api) {
             "cancelled",
           ]),
           summary: z.string(),
+          finding: z
+            .object({ expected: z.string(), observed: z.string() })
+            .optional(),
+          reviewRequested: z.boolean().optional(),
           limitations: z.string().optional(),
           reason: z.string().optional(),
           receiptId: z.string().optional(),

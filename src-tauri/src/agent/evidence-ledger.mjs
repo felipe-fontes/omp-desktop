@@ -181,6 +181,18 @@ function addRecord(view, req, actor, context) {
     throw new Error(
       "A failed execution receipt cannot support a passed result",
     );
+  let finding;
+  if (input.finding !== undefined) {
+    if (!object(input.finding)) throw new Error("Invalid evidence finding");
+    finding = {
+      expected: text(input.finding.expected, "Expected behavior", 2048, true),
+      observed: text(input.finding.observed, "Observed behavior", 2048, true),
+    };
+  }
+  const reviewRequested =
+    input.reviewRequested === undefined
+      ? false
+      : boolean(input.reviewRequested, "reviewRequested");
   let fileRef;
   if (input.fileRef !== undefined) {
     if (!object(input.fileRef)) throw new Error("Invalid file reference");
@@ -225,6 +237,8 @@ function addRecord(view, req, actor, context) {
     fingerprint: receipt ? receipt.fingerprint : context.fingerprint || null,
     artifact: input.artifact ? artifact(input.artifact, view.sessionId) : null,
     review: { decision: "unreviewed" },
+    reviewRequested,
+    ...(finding ? { finding } : {}),
     ...(receipt
       ? { beforeFingerprint: receipt.beforeFingerprint || null }
       : {}),
@@ -327,10 +341,18 @@ export function reduce(view, req, actor, context = {}) {
     }
     case "retire": {
       const outcome = outcomeOf(view, req.outcomeId);
-      if (req.requirementId)
-        requirementOf(outcome, req.requirementId).retired = true;
-      else outcome.retired = true;
-      audit(view, actor, "retire", req.requirementId || outcome.title);
+      const target = req.requirementId
+        ? requirementOf(outcome, req.requirementId)
+        : outcome;
+      const reason = text(req.reason, "Scope removal reason", 1024, true);
+      target.retired = true;
+      target.retirement = { reason, at: now(), actor: "user" };
+      audit(
+        view,
+        actor,
+        "retire",
+        `${req.requirementId || outcome.title} — ${reason}`,
+      );
       break;
     }
     case "record":

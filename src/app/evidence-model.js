@@ -4,11 +4,11 @@
     preset: {
       id: "standard",
       name: "Standard",
-      revision: 1,
+      revision: 2,
       planningPrompt:
         "Identify the outcomes and acceptance criteria this work needs to prove. Preserve user requirements.",
       collectionPrompt:
-        "Collect inspectable evidence for each outcome; distinguish actual execution from your interpretation and record gaps and limitations.",
+        "Prove the user's goals with the smallest meaningful observation. Record finding.expected and finding.observed, attach screenshots or short recordings for visual behavior and inspectable output for nonvisual work, and disclose gaps. Command success is not feature proof; request human review only when needed.",
       assessmentPrompt:
         "Review the scope and freshness of evidence, retain failures, and describe what remains unverified. Only the user can accept or waive requirements.",
       triggers: { beforeWork: true, afterChanges: true, beforeHandoff: true },
@@ -314,6 +314,17 @@
           `  - Record ${safe(record.id)} (outcome ${safe(record.outcomeId)}, criterion ${safe(record.requirementId || "none")}, criterion revision ${safe(record.requirementRevision ?? "none")}): ${safe(record.title)}: ${safe(record.result)}; ${safe(current.reason)} Source: ${safe(record.source?.type)}${record.source?.toolName ? ` (${safe(record.source.toolName)}, receipt ${safe(record.source.receiptId)})` : ""}. Review: ${safe(record.review?.decision || "unreviewed")}${record.review?.reason ? ` — ${safe(record.review.reason)}` : ""}.`,
           `    ${safe(record.summary)}${record.limitations ? ` Limitations: ${safe(record.limitations)}` : ""}${record.reason ? ` Reason: ${safe(record.reason)}` : ""}`,
         );
+        if (record.finding)
+          lines.push(
+            `    Expected: ${safe(record.finding.expected)} Observed: ${safe(record.finding.observed)}.`,
+          );
+        if (
+          record.reviewRequested &&
+          (!record.review || record.review.decision === "unreviewed")
+        )
+          lines.push(
+            "    Human review was explicitly requested; acceptance remains the user's decision.",
+          );
         lines.push(
           `    Recorded ${safe(record.at)}; source state: ${fingerprintText(record.fingerprint)}.`,
         );
@@ -379,6 +390,8 @@
   }
   (typeof window === "undefined" ? globalThis : window).OMP_EVIDENCE_MODEL = {
     initial,
+    freshness,
+    complete,
     summarize,
     requirementStatus,
     recordStatus,

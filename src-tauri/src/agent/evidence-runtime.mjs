@@ -399,6 +399,8 @@ export function createEvidenceRuntime(
           kind: "ci",
           result,
           summary: `CI state: ${ci.state}${ci.sourceSha ? ` for ${ci.sourceSha}` : ""}`,
+          finding: request.record?.finding,
+          reviewRequested: request.record?.reviewRequested,
           limitations,
           reason: ci.reason || "",
         },

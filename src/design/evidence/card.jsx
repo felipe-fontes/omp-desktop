@@ -7,6 +7,7 @@
   } = window;
   function Card({ evidence }) {
     const [panel, setPanel] = React.useState(null);
+    const [outcomeId, setOutcomeId] = React.useState(null);
     const view = evidence?.view;
     const owner =
       evidence?.ownerKey ||
@@ -16,23 +17,16 @@
       if (priorOwner.current !== owner) {
         priorOwner.current = owner;
         setPanel(null);
+        setOutcomeId(null);
       }
     }, [owner]);
     const action = useAction();
     if (!evidence) return null;
-    const summary = view ? window.OMP_EVIDENCE_MODEL.summarize(view) : null;
-    const outcomes = (view?.outcomes || []).filter((o) => !o.retired);
-    const counts =
-      summary &&
-      [
-        ["collected", "collected"],
-        ["missing", "missing"],
-        ["failed", "failed"],
-        ["blocked", "blocked"],
-        ["stale", "stale"],
-        ["waived", "waived"],
-        ["unreviewed", "unreviewed"],
-      ].filter(([key]) => summary[key] > 0);
+    const options = { unavailableArtifactIds: evidence.unavailableArtifactIds };
+    const summary = view
+      ? window.OMP_EVIDENCE_PROOF.summary(view, options)
+      : null;
+    const goals = view ? window.OMP_EVIDENCE_PROOF.goals(view, options) : [];
     return (
       <>
         <div className="rail-card glass ev-card">
@@ -68,63 +62,50 @@
                 />{" "}
                 Collection {view.tracking ? "on" : "off"}
               </label>
-              {!outcomes.length ? (
+              {!goals.length ? (
                 <p className="ev-card-empty">
-                  Define what this change needs to prove.
+                  What should this work demonstrate? Define a goal to begin.
                 </p>
               ) : (
                 <>
                   <div className="ev-card-counts">
-                    {counts?.length ? (
-                      counts.map(([key, label]) => (
-                        <span key={key}>
-                          <b>{summary[key]}</b> {label}
-                        </span>
-                      ))
-                    ) : (
-                      <span>No criteria recorded</span>
+                    <span>
+                      <b>
+                        {summary.demonstrated} / {summary.total}
+                      </b>{" "}
+                      goals demonstrated
+                    </span>
+                    {summary.attention > 0 && (
+                      <span>{summary.attention} need attention</span>
+                    )}
+                    {summary.reviewRequested > 0 && (
+                      <span>{summary.reviewRequested} request your review</span>
                     )}
                   </div>
                   <div className="ev-card-list">
-                    {outcomes.slice(0, 3).map((outcome) => {
-                      const requirements = (outcome.requirements || []).filter(
-                        (r) => !r.retired,
-                      );
-                      const missing = requirements.filter((r) =>
-                        [
-                          "missing",
-                          "failed",
-                          "blocked",
-                          "stale",
-                          "rejected",
-                        ].includes(
-                          window.OMP_EVIDENCE_MODEL.requirementStatus(
-                            view,
-                            outcome,
-                            r,
-                          ).state,
-                        ),
-                      ).length;
-                      return (
-                        <button
-                          key={outcome.id}
-                          onClick={() => setPanel("outcomes")}
-                          title={outcome.title}
-                        >
-                          <span>{outcome.title}</span>
-                          <small>
-                            {missing
-                              ? `${missing} gap${missing === 1 ? "" : "s"}`
-                              : requirements.length
-                                ? `${requirements.length} criteria`
-                                : "no criteria"}
-                          </small>
-                        </button>
-                      );
-                    })}
+                    {goals.slice(0, 3).map((goal) => (
+                      <button
+                        key={goal.outcome.id}
+                        onClick={() => {
+                          setOutcomeId(goal.outcome.id);
+                          setPanel("goals");
+                        }}
+                        title={goal.outcome.title}
+                      >
+                        <span>{goal.outcome.title}</span>
+                        <small>{goal.label}</small>
+                      </button>
+                    ))}
                   </div>
-                  {outcomes.length > 3 && (
-                    <span className="ev-meta">+{outcomes.length - 3} more</span>
+                  {goals.length > 3 && (
+                    <span className="ev-meta">
+                      +{goals.length - 3} more goals
+                    </span>
+                  )}
+                  {!summary.reviewRequested && (
+                    <p className="ev-card-empty">
+                      No review requested. Collection does not mean acceptance.
+                    </p>
                   )}
                 </>
               )}
@@ -134,9 +115,12 @@
           <div className="ev-card-actions">
             <button
               className="btn ghost outlined"
-              onClick={() => setPanel("outcomes")}
+              onClick={() => {
+                setOutcomeId(null);
+                setPanel("goals");
+              }}
             >
-              Review evidence
+              See proof
             </button>
             <button className="btn ghost" onClick={() => setPanel("requests")}>
               Request
@@ -149,6 +133,7 @@
             evidence={evidence}
             onClose={() => setPanel(null)}
             initialPanel={panel}
+            initialOutcomeId={outcomeId}
           />
         )}
       </>

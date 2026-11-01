@@ -4,130 +4,21 @@
     EvidenceField: Field,
     EvidenceError: Error,
     EvidenceStatus: Status,
-    EvidenceWhen: When,
-    EvidenceArtifact: Artifact,
     EvidenceRecordForm: RecordForm,
+    EvidenceReceipt: Receipt,
+    EvidenceProofRecord: ProofRecord,
     useEvidenceAction: useAction,
   } = window;
-  function ReceiptFingerprint({ label, fingerprint }) {
-    if (!fingerprint) return <p className="ev-meta">{label}: unavailable.</p>;
-    return (
-      <p className="ev-meta ev-break">
-        {label}: {fingerprint.head || "unknown revision"} ·{" "}
-        {fingerprint.complete
-          ? fingerprint.dirtyDigest
-            ? `working tree ${fingerprint.dirtyDigest}`
-            : "clean working tree"
-          : `incomplete: ${fingerprint.reason || "unknown reason"}`}
-      </p>
-    );
-  }
-  function Receipt({ evidence, receipt }) {
-    return (
-      <details className="ev-receipt">
-        <summary>
-          {receipt.toolName} ·{" "}
-          {receipt.isError ? "tool error" : "tool returned"}{" "}
-          <When at={receipt.at} />
-        </summary>
-        <p className="ev-note">
-          Execution receipt only; a successful tool call does not verify the
-          outcome.
-        </p>
-        {receipt.command && <pre className="selectable">{receipt.command}</pre>}
-        {receipt.exitCode != null && (
-          <p className="ev-meta">Exit code: {receipt.exitCode}</p>
-        )}
-        <ReceiptFingerprint
-          label="Source before execution"
-          fingerprint={receipt.beforeFingerprint}
-        />
-        <ReceiptFingerprint
-          label="Source after execution"
-          fingerprint={receipt.fingerprint}
-        />
-        {receipt.preview && <pre className="selectable">{receipt.preview}</pre>}
-        {receipt.truncated && (
-          <p className="ev-note">Receipt preview truncated.</p>
-        )}
-        {receipt.artifact && (
-          <Artifact evidence={evidence} artifact={receipt.artifact} />
-        )}
-      </details>
-    );
-  }
-  function CI({ ci }) {
-    const snapshot = ci.snapshot;
-    return (
-      <details className="ev-receipt">
-        <summary>CI details · {ci.state || "unknown"}</summary>
-        {ci.sourceSha && (
-          <p className="ev-break">
-            <strong>Source commit:</strong> {ci.sourceSha}
-          </p>
-        )}
-        {snapshot ? (
-          <>
-            <p>
-              <strong>Repository:</strong>{" "}
-              {snapshot.repository || "unavailable"} · <strong>Branch:</strong>{" "}
-              {snapshot.branch || "unavailable"}
-            </p>
-            <p>
-              <strong>Pull request:</strong> {snapshot.number ?? "unavailable"}{" "}
-              · {snapshot.prState || "unknown"} · <strong>Checks:</strong>{" "}
-              {snapshot.checksState || "unknown"}
-            </p>
-            {snapshot.url && (
-              <p className="ev-break">
-                <strong>PR URL:</strong> {snapshot.url}
-              </p>
-            )}
-            {!!snapshot.failedChecks?.length && (
-              <>
-                <strong>Failed checks</strong>
-                <ul>
-                  {snapshot.failedChecks.map((check, i) => (
-                    <li key={i}>
-                      {check.name || "Unnamed check"}
-                      {check.url ? ` — ${check.url}` : ""}
-                    </li>
-                  ))}
-                </ul>
-              </>
-            )}
-          </>
-        ) : (
-          <p className="ev-note">No CI snapshot is available.</p>
-        )}
-        {ci.reason && (
-          <p>
-            <strong>Reason:</strong> {ci.reason}
-          </p>
-        )}
-        {ci.limitations && (
-          <p>
-            <strong>Limitations:</strong> {ci.limitations}
-          </p>
-        )}
-      </details>
-    );
-  }
   function Record({ evidence, record }) {
-    const [reviewing, setReviewing] = React.useState("");
-    const [reason, setReason] = React.useState("");
-    const action = useAction();
-    const view = evidence.view;
-    const outcome = (view.outcomes || []).find(
-      (o) => o.id === record.outcomeId,
+    const outcome = (evidence.view?.outcomes || []).find(
+      (item) => item.id === record.outcomeId,
     );
     const requirement = outcome?.requirements?.find(
-      (r) => r.id === record.requirementId,
+      (item) => item.id === record.requirementId,
     );
-    const receipt = (view.receipts || []).find(
-      (r) => r.id === record.source?.receiptId,
-    );
-    const status = window.OMP_EVIDENCE_MODEL.recordStatus(view, record);
+    const status = window.OMP_EVIDENCE_PROOF.record(evidence.view, record, {
+      unavailableArtifactIds: evidence.unavailableArtifactIds,
+    });
     return (
       <article className="ev-record">
         <div className="ev-row">
@@ -136,136 +27,14 @@
         </div>
         <div className="ev-meta">
           {outcome?.title || "Unknown outcome"}
-          {requirement ? ` · ${requirement.text}` : ""} · {record.kind} ·{" "}
-          {record.result} · {record.source?.type || "unknown source"} ·{" "}
-          <When at={record.at} />
+          {requirement ? ` · ${requirement.text}` : ""}
         </div>
-        {record.source?.type === "agent" && (
-          <p className="ev-note">
-            Agent interpretation, not independent verification.
-          </p>
-        )}
-        {status.reason && <p className="ev-note">{status.reason}</p>}
-        <p>{record.summary}</p>
-        {record.limitations && (
-          <p>
-            <strong>Limitations:</strong> {record.limitations}
-          </p>
-        )}
-        {record.reason && (
-          <p>
-            <strong>Reason:</strong> {record.reason}
-          </p>
-        )}
-        {record.fileRef?.path && (
-          <p className="ev-break">
-            <strong>File reference:</strong> {record.fileRef.path}
-            {record.fileRef.from != null ? `:${record.fileRef.from}` : ""}
-            {record.fileRef.to != null ? `–${record.fileRef.to}` : ""}
-          </p>
-        )}
-        {record.url && (
-          <p className="ev-break">
-            <strong>URL reference:</strong> {record.url}
-          </p>
-        )}
-        {record.fingerprint ? (
-          <p className="ev-meta ev-break">
-            Source: {record.fingerprint.head || "unknown revision"} ·{" "}
-            {record.fingerprint.complete
-              ? record.source?.type === "ci"
-                ? "CI commit only"
-                : record.fingerprint.dirtyDigest
-                  ? `working tree ${record.fingerprint.dirtyDigest}`
-                  : "clean working tree"
-              : `incomplete: ${record.fingerprint.reason || "unknown reason"}`}
-          </p>
-        ) : (
-          <p className="ev-meta">Source freshness not verified.</p>
-        )}
-        {record.artifact && (
-          <Artifact evidence={evidence} artifact={record.artifact} />
-        )}
-        {record.ci && <CI ci={record.ci} />}
-        {receipt ? (
-          <Receipt evidence={evidence} receipt={receipt} />
-        ) : (
-          record.source?.receiptId && (
-            <p className="ev-note">
-              Linked receipt unavailable in the current window.
-            </p>
-          )
-        )}
-        <div className="ev-review">
-          <strong>
-            Human review: {record.review?.decision || "unreviewed"}
-          </strong>
-          {record.review?.reason && <span> · {record.review.reason}</span>}
-        </div>
-        <div className="ev-actions">
-          <button
-            className="btn ghost"
-            disabled={action.busy}
-            onClick={() => setReviewing("accepted")}
-          >
-            Accept
-          </button>
-          <button
-            className="btn ghost"
-            disabled={action.busy}
-            onClick={() => setReviewing("rejected")}
-          >
-            Reject
-          </button>
-        </div>
-        {reviewing && (
-          <form
-            className="ev-form"
-            onSubmit={(e) => {
-              e.preventDefault();
-              action.run(
-                () =>
-                  evidence.mutate({
-                    op: "review",
-                    recordId: record.id,
-                    decision: reviewing,
-                    reason,
-                  }),
-                () => {
-                  setReviewing("");
-                  setReason("");
-                },
-              );
-            }}
-          >
-            <fieldset className="ev-fields" disabled={action.busy}>
-              <Field
-                label={`Reason for ${reviewing === "accepted" ? "accepting" : "rejecting"}${reviewing === "accepted" ? " (optional)" : ""}`}
-              >
-                <textarea
-                  value={reason}
-                  onChange={(e) => setReason(e.target.value)}
-                  required={reviewing === "rejected"}
-                  rows="2"
-                />
-              </Field>
-              <div className="ev-actions">
-                <button className="btn" disabled={action.busy}>
-                  Confirm{" "}
-                  {reviewing === "accepted" ? "acceptance" : "rejection"}
-                </button>
-                <button
-                  type="button"
-                  className="btn ghost"
-                  onClick={() => setReviewing("")}
-                >
-                  Cancel
-                </button>
-              </div>
-            </fieldset>
-          </form>
-        )}
-        <Error error={action.error} />
+        <ProofRecord
+          evidence={evidence}
+          record={record}
+          showTitle={false}
+          onAvailabilityChange={evidence.onArtifactAvailability}
+        />
       </article>
     );
   }
@@ -373,7 +142,12 @@
         </p>
         {!receipts.length && <p className="ev-empty">No captured receipts.</p>}
         {receipts.map((receipt) => (
-          <Receipt key={receipt.id} evidence={evidence} receipt={receipt} />
+          <Receipt
+            key={receipt.id}
+            evidence={evidence}
+            receipt={receipt}
+            onAvailabilityChange={evidence.onArtifactAvailability}
+          />
         ))}
       </section>
     );

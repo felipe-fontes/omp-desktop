@@ -1,7 +1,8 @@
-/* Modal inspector; panels stay mounted while navigating so drafts survive. */
+/* Visited panels stay mounted while navigating so drafts survive. */
 (function () {
   const {
     EvidenceOutcomes: Outcomes,
+    EvidenceGoals: Goals,
     EvidenceRecords: Records,
     EvidenceRequests: Requests,
     EvidencePresets: Presets,
@@ -10,14 +11,29 @@
     useEvidenceAction: useAction,
   } = window;
   const panels = [
-    ["outcomes", "Outcomes"],
-    ["records", "Records"],
-    ["requests", "Requests"],
-    ["presets", "Presets"],
+    ["goals", "Proof"],
+    ["requests", "Ask for proof"],
+  ];
+  const management = [
+    ["outcomes", "Goals & criteria"],
+    ["records", "All evidence & checks"],
+    ["presets", "Collection settings"],
     ["history", "History & report"],
   ];
-  function Inspector({ evidence, onClose, initialPanel = "outcomes" }) {
+  function Inspector({
+    evidence,
+    onClose,
+    initialPanel = "goals",
+    initialOutcomeId = null,
+  }) {
     const [panel, setPanel] = React.useState(initialPanel);
+    const [visited, setVisited] = React.useState(() => new Set([initialPanel]));
+    const navigate = (next) => {
+      setVisited((current) =>
+        current.has(next) ? current : new Set([...current, next]),
+      );
+      setPanel(next);
+    };
     const refresh = useAction();
     const modalRef = React.useRef(null);
     const closeRef = React.useRef(onClose);
@@ -25,18 +41,31 @@
     window.useModalLayer(modalRef);
     React.useEffect(() => {
       const onKey = (e) => {
+        const layers = document.querySelectorAll("[data-evidence-layer]");
+        if (
+          e.defaultPrevented ||
+          (layers.length && layers[layers.length - 1] !== modalRef.current)
+        )
+          return;
         if (e.key === "Escape") {
           e.preventDefault();
           e.stopPropagation();
+          const menu = modalRef.current?.querySelector(".ev-nav-manage[open]");
+          if (menu) {
+            menu.open = false;
+            menu.querySelector("summary")?.focus();
+            return;
+          }
           closeRef.current();
           return;
         }
         if (e.key !== "Tab") return;
+        e.stopPropagation();
         const root = modalRef.current;
         if (!root) return;
         const nodes = [
           ...root.querySelectorAll(
-            'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [tabindex]:not([tabindex="-1"])',
+            'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], summary, video[controls], [tabindex]:not([tabindex="-1"])',
           ),
         ].filter((el) => el.getClientRects().length);
         if (!nodes.length) {
@@ -75,6 +104,8 @@
       >
         <div
           className="ev-dialog"
+          data-evidence-layer="inspector"
+          onKeyDown={(event) => event.stopPropagation()}
           ref={modalRef}
           tabIndex={-1}
           role="dialog"
@@ -84,7 +115,7 @@
           <header className="ev-dialog-head">
             <div>
               <span className="ev-eyebrow">Conversation evidence</span>
-              <h1 id="evidence-title">Evidence inspector</h1>
+              <h1 id="evidence-title">Proof of your goals</h1>
             </div>
             <div className="ev-actions">
               <button
@@ -109,11 +140,31 @@
                 key={key}
                 type="button"
                 aria-current={panel === key ? "page" : undefined}
-                onClick={() => setPanel(key)}
+                onClick={() => navigate(key)}
               >
                 {label}
               </button>
             ))}
+            <details className="ev-nav-manage">
+              <summary>
+                {management.find(([key]) => key === panel)?.[1] || "Manage"}
+              </summary>
+              <div className="ev-nav-menu">
+                {management.map(([key, label]) => (
+                  <button
+                    key={key}
+                    type="button"
+                    aria-current={panel === key ? "page" : undefined}
+                    onClick={(event) => {
+                      navigate(key);
+                      event.currentTarget.closest("details").open = false;
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </details>
           </nav>
           <div className="ev-dialog-body">
             {evidence.loading && !evidence.view && (
@@ -133,25 +184,43 @@
                 Evidence is not supported in this conversation.
               </p>
             )}
-            {(evidence.view?.warnings || []).map((warning, index) => (
-              <p className="ev-note" key={index}>
-                {warning}
-              </p>
-            ))}
+            {!!evidence.view?.warnings?.length && (
+              <details className="ev-collection-notices">
+                <summary>
+                  {evidence.view.warnings.length} collection{" "}
+                  {evidence.view.warnings.length === 1 ? "notice" : "notices"}
+                </summary>
+                {evidence.view.warnings.map((warning, index) => (
+                  <p className="ev-note" key={index}>
+                    {warning}
+                  </p>
+                ))}
+              </details>
+            )}
+            <div hidden={panel !== "goals"}>
+              {visited.has("goals") && (
+                <Goals
+                  evidence={evidence}
+                  active={panel === "goals"}
+                  focusOutcomeId={initialOutcomeId}
+                  onNavigate={navigate}
+                />
+              )}
+            </div>
             <div hidden={panel !== "outcomes"}>
-              <Outcomes evidence={evidence} />
+              {visited.has("outcomes") && <Outcomes evidence={evidence} />}
             </div>
             <div hidden={panel !== "records"}>
-              <Records evidence={evidence} />
+              {visited.has("records") && <Records evidence={evidence} />}
             </div>
             <div hidden={panel !== "requests"}>
-              <Requests evidence={evidence} />
+              {visited.has("requests") && <Requests evidence={evidence} />}
             </div>
             <div hidden={panel !== "presets"}>
-              <Presets evidence={evidence} />
+              {visited.has("presets") && <Presets evidence={evidence} />}
             </div>
             <div hidden={panel !== "history"}>
-              <History evidence={evidence} />
+              {visited.has("history") && <History evidence={evidence} />}
             </div>
           </div>
         </div>

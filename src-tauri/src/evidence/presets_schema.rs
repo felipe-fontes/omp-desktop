@@ -85,9 +85,9 @@ pub(super) fn standard() -> Preset {
     Preset {
         id: STANDARD_ID.to_owned(),
         name: "Standard".to_owned(),
-        revision: 1,
+        revision: 2,
         planning_prompt: "Identify the user's intended outcomes and concrete acceptance criteria before work. Use the Evidence tool to record relevant outcomes and requirements; preserve user-owned requirements and ask when success is unclear. Keep evidence proportional to the change.".to_owned(),
-        collection_prompt: "Collect inspectable evidence for each relevant requirement: observations, source references, test or execution receipts, screenshots, video, build/runtime output, or CI where available. Record what actually happened, its source and authorship, including failures and blocked or unavailable checks. A successful command receipt alone does not prove its output satisfies the requirement; do not invent evidence or capabilities.".to_owned(),
+        collection_prompt: "Prove each business goal with the smallest meaningful observation. Record finding.expected and finding.observed, attach screenshots or short recordings for visual behavior and inspectable output for nonvisual work, and retain failures and explicit gaps. A successful command receipt alone is not feature proof. Keep technical logs as supporting details and set reviewRequested only when human judgment is needed. Use evidence gaps to guide the next discovery or verification step; do not invent evidence or capabilities.".to_owned(),
         assessment_prompt: "Assess each requirement against the recorded evidence and its source revision. Explain missing, stale, failed, blocked, or unreviewed evidence and limitations honestly. Do not accept or reject evidence, waive requirements, or weaken user-owned requirements on the user's behalf, and do not claim independent verification or production readiness without it.".to_owned(),
         triggers: Triggers {
             before_work: true,

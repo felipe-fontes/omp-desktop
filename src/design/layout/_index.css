@@ -16,6 +16,8 @@
 @import "./context-policy.css";
 @import "./context-policy-ring.css";
 @import "./evidence.css";
+@import "./evidence-goals.css";
+@import "./evidence-media.css";
 @import "./pr-status.css";
 @import "./browser.css";
 @import "./widgets.css";

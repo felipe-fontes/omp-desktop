@@ -133,32 +133,133 @@
       </form>
     );
   }
+  function ScopeDecision({ evidence, outcome, requirement, decision, onDone }) {
+    const [reason, setReason] = React.useState("");
+    const [confirmed, setConfirmed] = React.useState(false);
+    const action = useAction();
+    const removing = decision === "retire";
+    const target = requirement ? "criterion" : "goal";
+    const validReason =
+      reason.trim() && new TextEncoder().encode(reason.trim()).length <= 1024;
+    return (
+      <form
+        className="ev-form"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (!validReason || !confirmed) return;
+          action.run(
+            () =>
+              evidence.mutate({
+                op: decision,
+                outcomeId: outcome.id,
+                ...(requirement ? { requirementId: requirement.id } : {}),
+                reason: reason.trim(),
+              }),
+            onDone,
+          );
+        }}
+      >
+        <fieldset className="ev-fields" disabled={action.busy}>
+          <strong>
+            {removing ? `Remove ${target} from scope` : "Accept exception"}
+          </strong>
+          <p className="ev-note">
+            {removing
+              ? `This ${target} will no longer count toward active scope. Its evidence and history remain available.`
+              : "This criterion remains unmet; accepting an exception records your decision and reason, not proof that it passed."}
+          </p>
+          <Field
+            label={
+              removing
+                ? "Reason for removing from scope"
+                : "Reason for accepting the exception"
+            }
+          >
+            <textarea
+              required
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              rows="2"
+            />
+          </Field>
+          {reason.trim() && !validReason && (
+            <p className="ev-error" role="alert">
+              Reason must be at most 1024 UTF-8 bytes.
+            </p>
+          )}
+          <label className="ev-check">
+            <input
+              type="checkbox"
+              checked={confirmed}
+              onChange={(e) => setConfirmed(e.target.checked)}
+            />
+            {removing
+              ? `I confirm removing this ${target} from scope.`
+              : "I confirm accepting this unmet criterion as an exception."}
+          </label>
+          <Error error={action.error} />
+          <div className="ev-actions">
+            <button className="btn" disabled={!validReason || !confirmed}>
+              {removing ? "Confirm removal" : "Confirm exception"}
+            </button>
+            <button type="button" className="btn ghost" onClick={onDone}>
+              Cancel
+            </button>
+          </div>
+        </fieldset>
+      </form>
+    );
+  }
+  function RetirementNote({ item }) {
+    if (!item.retired) return null;
+    return (
+      <p className="ev-note">
+        Removed from scope by user.{" "}
+        {item.retirement?.reason
+          ? `Reason: ${item.retirement.reason}`
+          : "Historical removal reason unavailable."}
+      </p>
+    );
+  }
   function Criterion({ evidence, outcome, requirement }) {
     const [editing, setEditing] = React.useState(false);
-    const [waiving, setWaiving] = React.useState(false);
-    const [reason, setReason] = React.useState("");
+    const [decision, setDecision] = React.useState(null);
     const action = useAction();
     const status = window.OMP_EVIDENCE_MODEL.requirementStatus(
       evidence.view,
       outcome,
       requirement,
     );
+    const displayStatus = requirement.retired
+      ? { state: "retired", label: "Removed from scope" }
+      : outcome.retired
+        ? { state: "retired", label: "Goal removed from scope" }
+        : requirement.waiver
+          ? { ...status, label: "Exception accepted" }
+          : status;
     return (
       <div className="ev-criterion">
         <div className="ev-row">
           <strong>{requirement.text}</strong>
-          <Status status={status} />
+          <Status status={displayStatus} />
         </div>
         <div className="ev-meta">
           {requirement.kind} · {requirement.required ? "required" : "optional"}{" "}
           · created by {requirement.author} · controlled by{" "}
           {requirement.owner || requirement.author} · revision{" "}
           {requirement.revision}
-          {requirement.retired ? " · retired" : ""}
+          {requirement.retired ? " · removed from scope" : ""}
         </div>
-        {status.reason && <p className="ev-note">{status.reason}</p>}
+        {!requirement.retired &&
+          !outcome.retired &&
+          !requirement.waiver &&
+          status.reason && <p className="ev-note">{status.reason}</p>}
+        <RetirementNote item={requirement} />
         {requirement.waiver && (
-          <p className="ev-note">Waived by user: {requirement.waiver.reason}</p>
+          <p className="ev-note">
+            Exception accepted by user: {requirement.waiver.reason}. This
+            criterion remains unmet.
+          </p>
         )}
         {editing ? (
           <RequirementEditor
@@ -168,7 +269,9 @@
             onDone={() => setEditing(false)}
           />
         ) : (
-          !requirement.retired && (
+          !outcome.retired &&
+          !requirement.retired &&
+          !decision && (
             <div className="ev-actions">
               <button className="btn ghost" onClick={() => setEditing(true)}>
                 Edit
@@ -176,17 +279,9 @@
               <button
                 className="btn ghost"
                 disabled={action.busy}
-                onClick={() =>
-                  action.run(() =>
-                    evidence.mutate({
-                      op: "retire",
-                      outcomeId: outcome.id,
-                      requirementId: requirement.id,
-                    }),
-                  )
-                }
+                onClick={() => setDecision("retire")}
               >
-                Retire
+                Remove from scope
               </button>
               {requirement.waiver ? (
                 <button
@@ -202,53 +297,28 @@
                     )
                   }
                 >
-                  Remove waiver
+                  Remove exception
                 </button>
               ) : (
                 <button
                   className="btn ghost"
                   disabled={action.busy}
-                  onClick={() => setWaiving(!waiving)}
+                  onClick={() => setDecision("waive")}
                 >
-                  Waive
+                  Accept exception
                 </button>
               )}
             </div>
           )
         )}
-        {waiving && !requirement.waiver && (
-          <form
-            className="ev-form"
-            onSubmit={(e) => {
-              e.preventDefault();
-              action.run(
-                () =>
-                  evidence.mutate({
-                    op: "waive",
-                    outcomeId: outcome.id,
-                    requirementId: requirement.id,
-                    reason,
-                  }),
-                () => {
-                  setReason("");
-                  setWaiving(false);
-                },
-              );
-            }}
-          >
-            <Field label="Reason for waiver">
-              <textarea
-                required
-                disabled={action.busy}
-                value={reason}
-                onChange={(e) => setReason(e.target.value)}
-                rows="2"
-              />
-            </Field>
-            <button className="btn" disabled={action.busy}>
-              Confirm waiver
-            </button>
-          </form>
+        {decision && !outcome.retired && !requirement.retired && (
+          <ScopeDecision
+            evidence={evidence}
+            outcome={outcome}
+            requirement={requirement}
+            decision={decision}
+            onDone={() => setDecision(null)}
+          />
         )}
         <Error error={action.error} />
       </div>
@@ -257,7 +327,7 @@
   function Outcome({ evidence, outcome }) {
     const [editing, setEditing] = React.useState(false);
     const [adding, setAdding] = React.useState(false);
-    const action = useAction();
+    const [removing, setRemoving] = React.useState(false);
     return (
       <article className="ev-outcome">
         {editing ? (
@@ -273,30 +343,23 @@
               <span className="ev-meta">
                 created by {outcome.author} · controlled by{" "}
                 {outcome.owner || outcome.author}
-                {outcome.retired ? " · retired" : ""}
+                {outcome.retired ? " · removed from scope" : ""}
               </span>
             </div>
             {outcome.description && <p>{outcome.description}</p>}
+            <RetirementNote item={outcome} />
             {!!outcome.todoRefs?.length && (
               <p className="ev-meta">
                 Todo references: {outcome.todoRefs.join(" · ")}
               </p>
             )}
-            {!outcome.retired && (
+            {!outcome.retired && !removing && (
               <div className="ev-actions">
                 <button className="btn ghost" onClick={() => setEditing(true)}>
                   Edit outcome
                 </button>
-                <button
-                  className="btn ghost"
-                  disabled={action.busy}
-                  onClick={() =>
-                    action.run(() =>
-                      evidence.mutate({ op: "retire", outcomeId: outcome.id }),
-                    )
-                  }
-                >
-                  Retire outcome
+                <button className="btn ghost" onClick={() => setRemoving(true)}>
+                  Remove goal from scope
                 </button>
                 <button className="btn ghost" onClick={() => setAdding(true)}>
                   Add criterion
@@ -305,7 +368,14 @@
             )}
           </>
         )}
-        <Error error={action.error} />
+        {removing && !outcome.retired && (
+          <ScopeDecision
+            evidence={evidence}
+            outcome={outcome}
+            decision="retire"
+            onDone={() => setRemoving(false)}
+          />
+        )}
         {(outcome.requirements || []).map((requirement) => (
           <Criterion
             key={requirement.id}
@@ -314,7 +384,7 @@
             requirement={requirement}
           />
         ))}
-        {adding && (
+        {adding && !outcome.retired && (
           <RequirementEditor
             evidence={evidence}
             outcome={outcome}
@@ -331,10 +401,11 @@
       <section className="ev-stack">
         <div className="ev-section-head">
           <div>
-            <h2>Outcomes & criteria</h2>
+            <h2>Manage goals &amp; criteria</h2>
             <p>
-              Define what this change needs to prove. Pinned criteria remain
-              user-owned.
+              Define what this change needs to prove. Removed goals and criteria
+              remain here with their history; only you can change scope or
+              accept an exception.
             </p>
           </div>
           <button className="btn" onClick={() => setAdding(true)}>
