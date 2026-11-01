@@ -143,6 +143,13 @@
   const sessionRegistry = new Map();
   const sessionSnapshots = new Map(); // id -> saved state + volatile vars
   const respawnVoice = new Map(); // same-conversation voice awaiting a fresh process activation
+  // Scratch metadata follows the ordinary session file; serialize writes so
+  // closing immediately after a title/state frame cannot lose that update.
+  const _scratchKeys = new Map();
+  const _scratchOperations = new Set();
+  const _scratchOpenings = new Map();
+  const _historyOpenings = new Map();
+  let _scratchWrites = Promise.resolve();
   const gitListeners = new Map();  // session_id → Tauri unlisten fn for git://branch/{id}
   // Prompt history — one list per tab, newest-first, in memory only. Never
   // persisted to disk/localStorage: filled as the user sends (_recordPrompt)
@@ -718,6 +725,169 @@
     window.OMP_DATA.activity  = state.activity;
 
     _persistLayout();
+    for (const entry of sessionRegistry.values()) {
+      if (entry.scratchId && !_scratchOperations.has(entry.scratchId)) _persistScratch(entry);
+    }
+  }
+
+  function _persistScratch(entry) {
+    const args = { id: entry.scratchId, sessionFile: entry.sessionFile || null, name: entry.name };
+    const key = JSON.stringify(args);
+    if (_scratchKeys.get(args.id) === key) return _scratchWrites;
+    _scratchKeys.set(args.id, key);
+    const write = _scratchWrites.then(async () => {
+      const saved = await window.__TAURI__.core.invoke("scratch_update", args);
+      if (saved === false && _scratchKeys.get(args.id) === key) _scratchKeys.delete(args.id);
+    });
+    _scratchWrites = write.catch(error => {
+      if (_scratchKeys.get(args.id) === key) _scratchKeys.delete(args.id);
+      console.error("[live] could not save chat workspace metadata:", error);
+    });
+    return write;
+  }
+
+  async function _switchScratchProfile(entry, profile) {
+    const source = entry.scratchId;
+    if (_scratchOperations.has(source) || _scratchOpenings.has(source) || _respawning.has(entry.id)) return { ok: false, error: "Chat workspace is being managed" };
+    _scratchOperations.add(source);
+    let target;
+    let targetLocked = false;
+    try {
+      await _persistScratch(entry);
+      target = await window.__TAURI__.core.invoke("scratch_for_profile", { id: source, profile });
+      if (_scratchOperations.has(target.id)) return { ok: false, error: "The target profile's chat is being managed" };
+      const pending = _scratchOpenings.get(target.id);
+      if (pending) {
+        const tabId = await pending;
+        await window.OMP_BRIDGE.activateSession(tabId);
+        return { ok: true };
+      }
+      const open = [...sessionRegistry.values()].find(tab => tab.scratchId === target.id);
+      if (open) {
+        await window.OMP_BRIDGE.activateSession(open.id);
+        return { ok: true };
+      }
+      _scratchOperations.add(target.id);
+      targetLocked = true;
+      const current = sessionRegistry.get(entry.id);
+      if (!current) return { ok: false, error: "Tab closed" };
+      sessionRegistry.set(entry.id, {
+        ...current, ..._freshConversationFields(current), scratchId: target.id,
+        name: target.name || "New chat", sessionFile: target.sessionFile || null,
+        autoRenameArmed: !target.sessionFile,
+      });
+      const switched = await _respawnSession(entry.id, { profile, resume: target.sessionFile, reason: "Profile switch" });
+      if (!switched.ok && sessionRegistry.has(entry.id)) {
+        sessionRegistry.set(entry.id, entry);
+        const restored = await _respawnSession(entry.id, { profile: entry.profile, resume: entry.sessionFile, reason: "Chat restoration" });
+        return { ok: false, error: `${switched.error}${restored.ok ? "" : `; restoring original profile failed: ${restored.error}`}` };
+      }
+      const updated = sessionRegistry.get(entry.id);
+      if (updated) await _persistScratch(updated);
+      return switched;
+    } catch (error) {
+      return { ok: false, error: String(error?.message ?? error) };
+    } finally {
+      _scratchOperations.delete(source);
+      if (targetLocked) _scratchOperations.delete(target.id);
+      notify();
+    }
+  }
+
+  // Keep the registry identity while writers are temporarily stopped: React
+  // drafts, attachments and plan state are keyed by this id, not the process.
+  async function _manageScratch(id, promote) {
+    if (_scratchOperations.has(id) || _scratchOpenings.has(id)) throw new Error("Chat workspace is already being opened or managed");
+    _scratchOperations.add(id);
+    let original = null, temporary = false, stopped = false, forked = false;
+    const restore = async () => {
+      _scratchOperations.delete(id);
+      if (!original || !sessionRegistry.has(original.id)) return;
+      sessionRegistry.set(original.id, original);
+      if (temporary) {
+        await window.OMP_BRIDGE.closeSession(original.id, true);
+      } else if (stopped || forked) {
+        const restored = await _respawnSession(original.id, { profile: original.profile, resume: original.sessionFile, reason: "Chat restoration" });
+        if (!restored.ok) throw new Error(restored.error);
+        if (activeSessionId === null) await window.OMP_BRIDGE.activateSession(original.id);
+      }
+    };
+    try {
+      const assertIdle = () => {
+        for (const tab of _sessionsView().filter(t => t.scratchId === id)) {
+          const voice = tab.id === activeSessionId ? state : sessionSnapshots.get(tab.id);
+          if (TURN.isBusyRunState(tab.runState) || voice?.liveVoice?.active || voice?.dictation?.active || _respawning.has(tab.id)) {
+            throw new Error("Stop this chat's running work and voice capture first");
+          }
+        }
+      };
+      assertIdle();
+      let owner = [...sessionRegistry.values()].find(t => t.scratchId === id);
+      const profile = owner?.profile || _activeProfileId();
+      await _scratchWrites;
+      let row = (await window.__TAURI__.core.invoke("scratch_list", { profile })).find(r => r.id === id);
+      if (!row) throw new Error("Chat workspace no longer exists");
+      if (!promote) {
+        assertIdle();
+        for (const tab of _sessionsView().filter(t => t.scratchId === id)) {
+          if (!await window.OMP_BRIDGE.closeSession(tab.id, true)) throw new Error("Chat could not be closed");
+        }
+        await window.__TAURI__.core.invoke("scratch_delete", { id });
+        _scratchKeys.delete(id);
+        return null;
+      }
+      // Canceling the native picker changes neither process nor tab identity.
+      if (!await window.__TAURI__.core.invoke("scratch_pick_project", { id })) return null;
+      if (!owner && row.sessionFile) {
+        const tabId = await _openReported(row.path, { profile, scratchId: id, resume: row.sessionFile, name: row.name, managing: true });
+        owner = sessionRegistry.get(tabId);
+        temporary = true;
+      }
+      let snapshot = null;
+      if (owner) {
+        original = { ...sessionRegistry.get(owner.id) };
+        await window.OMP_BRIDGE.activateSession(owner.id);
+        if (activeSessionId !== owner.id) throw new Error("Activate this chat before promoting its workspace");
+        const current = await _sendWithResponse({ type: "get_state" }, QUICK_CMD_TIMEOUT_MS);
+        _applyRpcState(current);
+        assertIdle();
+        original = { ...sessionRegistry.get(owner.id) };
+        await _persistScratch(original);
+        row = (await window.__TAURI__.core.invoke("scratch_list", { profile })).find(r => r.id === id);
+        if (row.sessionFile) {
+          // Native unpack relocates all same-UUID local copies. Give it a
+          // disposable native fork, never the only original conversation.
+          const result = await _sendWithResponse({ type: "fork" });
+          if (result.cancelled) throw new Error("Chat could not be snapshotted for promotion");
+          forked = true;
+          snapshot = (await _sendWithResponse({ type: "get_state" }, QUICK_CMD_TIMEOUT_MS)).sessionFile;
+          if (!snapshot || snapshot === row.sessionFile) throw new Error("omp did not create an independent promotion snapshot");
+        }
+        await _closeTab(owner.id, true);
+        stopped = true;
+        original = { ...original, resourcesVersion: (original.resourcesVersion || 0) + 1 };
+        if (activeSessionId === owner.id) await _detachActiveSession();
+        sessionRegistry.set(owner.id, original);
+      }
+      const destination = await window.__TAURI__.core.invoke("scratch_promote", { id, snapshot });
+      const resume = await window.__TAURI__.core.invoke("scratch_promote_session", { id, destination });
+      _scratchOperations.delete(id);
+      if (original) {
+        sessionRegistry.set(original.id, { ...original, path: destination, scratchId: null, sessionFile: resume, branch: null });
+        const started = await _respawnSession(original.id, { profile, resume, reason: "Project promotion" });
+        if (!started.ok) throw new Error(started.error);
+        if (activeSessionId === null) await window.OMP_BRIDGE.activateSession(original.id);
+        void _touchRecent(destination, profile);
+        return original.id;
+      }
+      return await _openReported(destination, { profile, name: row.name, resume });
+    } catch (error) {
+      try { await restore(); }
+      catch (restoreError) { throw new Error(`${error}; restoring the original chat also failed: ${restoreError}`); }
+      throw error;
+    } finally {
+      _scratchOperations.delete(id);
+    }
   }
 
   function _layoutNow() {
@@ -1282,7 +1452,7 @@
    *  watcher, widget state and terminal shell) and drop its JS-side bindings.
    *  Every path that removes a tab from `sessionRegistry` goes through here;
    *  a respawn uses `_killSessionProcess`, which keeps the browser and shell. */
-  function _closeTab(id) {
+  function _closeTab(id, strict = false) {
     if (id === activeSessionId) {
       _cancelLiveRequests();
       state.liveVoice = LIVE.EMPTY;
@@ -1290,7 +1460,9 @@
       state.dictation = DICTATION.EMPTY;
     }
     _dictationCompleted = _dictationCompleted.filter(item => item.sessionId !== id);
-    const closed = _invokeSafe("close_tab", { sessionId: id });
+    const closed = strict
+      ? window.__TAURI__.core.invoke("close_tab", { sessionId: id })
+      : _invokeSafe("close_tab", { sessionId: id });
     _dropGitListener(id);
     respawnVoice.delete(id);
     sessionSnapshots.delete(id);
@@ -1359,7 +1531,7 @@
    *  Shared by in-process `new_session` and a profile switch's respawn. */
   function _freshConversationFields(entry) {
     return {
-      name: _tabNameFor(entry.path, "new session"),
+      name: entry.scratchId ? "New chat" : _tabNameFor(entry.path, "new session"),
       sessionFile: null,
       autoRenameArmed: true,
       autoRenameInFlight: false,
@@ -1381,11 +1553,11 @@
    *  The dictation-before-restart ordering is covered by the fake IPC bridge
    *  in test-live-voice.mjs; the remaining ordering relies on the comments
    *  at each await and the pure profile/approval-mode decisions. */
-  async function _respawnSession(id, { profile, resume = null, fresh = false }) {
+  async function _respawnSession(id, { profile, resume = null, fresh = false, reason = null }) {
     if (!window.__TAURI__) return { ok: false, error: "not connected" };
     const entry = sessionRegistry.get(id);
     if (!entry) return { ok: false, error: "unknown tab" };
-    const what = fresh ? "Profile switch" : "Approval mode change";
+    const what = reason || (fresh ? "Profile switch" : "Approval mode change");
     // Re-entrancy: this call spans two awaits, and a second respawn of the
     // same tab would read `wasActive` as false (call 1 already nulled the
     // active slot), so it would never re-activate or `_initFetch` the
@@ -1404,7 +1576,7 @@
       }
       // Only a resumed coding conversation can retain its tab-local voice
       // history. Killing the process itself closes its native transport.
-      let savedVoice = !fresh && resume ? (id === activeSessionId ? state.liveVoice : sessionSnapshots.get(id)?.liveVoice) : null;
+      let savedVoice = !fresh && resume && profile === entry.profile ? (id === activeSessionId ? state.liveVoice : sessionSnapshots.get(id)?.liveVoice) : null;
       if (savedVoice?.active) {
         savedVoice = LIVE.apply(LIVE.apply(savedVoice, { type: "stop" }), { type: "stop_success", paused: true });
       }
@@ -1446,7 +1618,7 @@
         // Same conversation: name, file and auto-rename budget carry over;
         // only an in-flight `/rename` dies with the process (its note can
         // never arrive, so the flag would block every later refresh).
-        : { ...current, approvalMode: null, autoRenameInFlight: false });
+        : { ...current, profile, approvalMode: null, autoRenameInFlight: false });
       if (wasActive) await _detachActiveSession();
       // After the detach, which nulls `activeSessionId` synchronously — so no
       // later `_saveCurrentSession` can re-add it. A resurrected snapshot
@@ -1512,7 +1684,7 @@
       }
       // The folder is now open under `profile`, so it belongs in that
       // profile's recents (a mode restart keeps the profile: nothing new).
-      if (fresh && !spawnError && entry.path) void _touchRecent(entry.path, profile);
+      if (fresh && !spawnError && entry.path && !entry.scratchId) void _touchRecent(entry.path, profile);
 
       if (wasActive && activeSessionId === null) {
         // Reclaim focus only if nothing else took the active slot while the
@@ -1661,7 +1833,7 @@
     if (!activeSessionId || !sessionRegistry.has(activeSessionId)) return;
     const entry = sessionRegistry.get(activeSessionId);
     if (!entry.autoRenameInFlight) return;
-    const untitledLabel = _tabNameFor(entry.path, "new session");
+    const untitledLabel = entry.scratchId ? "New chat" : _tabNameFor(entry.path, "new session");
     const rearm = STITLE.shouldRearmAfterAbort(state.rpcState, entry.name, untitledLabel);
     sessionRegistry.set(activeSessionId, {
       ...entry,
@@ -1669,6 +1841,31 @@
       ...(rearm ? { autoRenameArmed: true } : {}),
     });
     if (rearm) _send({ type: "get_state" });
+  }
+
+  // Every scratch entry point (restore, sidebar and temporary promotion
+  // opens) claims ownership here before its first IPC round-trip.
+  async function _startProjectSession(cwd, opts) {
+    const scratchId = opts.scratchId;
+    if (!scratchId) return _startSession(cwd, opts);
+    if (_scratchOperations.has(scratchId) && !opts.managing) throw new Error("Chat workspace is being managed");
+    let opening = _scratchOpenings.get(scratchId);
+    if (!opening) {
+      const existing = [...sessionRegistry.values()].find(tab => tab.scratchId === scratchId);
+      if (existing) {
+        if (opts.activate !== false) await window.OMP_BRIDGE.activateSession(existing.id);
+        return existing.id;
+      }
+      opening = _startSession(cwd, opts);
+      _scratchOpenings.set(scratchId, opening);
+    }
+    try {
+      const id = await opening;
+      if (opts.activate !== false) await window.OMP_BRIDGE.activateSession(id);
+      return id;
+    } finally {
+      if (_scratchOpenings.get(scratchId) === opening) _scratchOpenings.delete(scratchId);
+    }
   }
 
   /** Spawn omp for `cwd` (optionally resuming a saved session), register the
@@ -1683,12 +1880,21 @@
    *  conversation is styled cyan and, unnamed, falls back to "resumed"
    *  rather than "new session" when it has no folder.
    *
-   *  This function is side-effectful (Tauri IPC invoke, event listeners) and
-   *  not unit-tested directly; its one pure decision (the `tabName`
-   *  derivation) now lives in, and is proven by, `_tabNameFor`. */
-  async function _startProjectSession(cwd, {
-    resume = null, name = null, profile, activate = true, remember = true,
+   *  Its public scratch ownership and startup races are exercised by the
+   *  fake-IPC bridge in test-scratch-chats.mjs; the label derivation lives
+   *  in `_tabNameFor`. */
+  async function _startSession(cwd, {
+    resume = null, name = null, profile, activate = true, remember = true, scratchId = null, managing = false,
   }) {
+    if (scratchId) {
+      const row = (await window.__TAURI__.core.invoke("scratch_list", { profile })).find(r => r.id === scratchId);
+      if (!row) throw new Error("Chat workspace no longer exists");
+      if (_scratchOperations.has(scratchId) && !managing) throw new Error("Chat workspace is being managed");
+      cwd = row.path; // The Rust-owned identity, never an open-tabs.json path.
+      name ||= row.name || "New chat";
+      remember = false;
+      resume ||= row.sessionFile || null;
+    }
     _lastSessionMs = Math.max(Date.now(), _lastSessionMs + 1);
     const id = `session-${_lastSessionMs}`;
     const tabName = name || _tabNameFor(cwd, resume ? "resumed" : "new session");
@@ -1696,7 +1902,7 @@
     // Register in tab list before starting omp so the tab shows immediately.
     // Register with null branch — chip hidden until git resolves.
     sessionRegistry.set(id, {
-      id, name: tabName, path: cwd ?? "", color, branch: null, profile,
+      id, name: tabName, path: cwd ?? "", color, branch: null, profile, scratchId,
       // The approval mode `start_session` spawned this tab's current omp
       // with (set by `_spawnSession`); null while no process runs it.
       approvalMode: null,
@@ -1750,7 +1956,7 @@
       throw e;
     }
     // Only a folder that actually spawned is remembered.
-    if (cwd && remember) void _touchRecent(cwd, profile);
+    if (cwd && remember && !scratchId) void _touchRecent(cwd, profile);
     if (activate) await _switchToSession(id);
     else notify(); // tab list changed
     return id;
@@ -2993,6 +3199,10 @@
   // The `send_command` hand-off to the active tab, shared by `_send` and
   // `_sendWithResponse`; callers check the connection and handle failure.
   function _invokeSend(cmd) {
+    const scratchId = sessionRegistry.get(activeSessionId)?.scratchId;
+    if (scratchId && _scratchOperations.has(scratchId) && ["prompt", "steer", "follow_up", "new_session"].includes(cmd.type)) {
+      return Promise.reject(new Error("Chat workspace is being managed"));
+    }
     return window.__TAURI__.core
       .invoke("send_command", { sessionId: activeSessionId, json: JSON.stringify(cmd) });
   }
@@ -4503,6 +4713,37 @@
       return _openReported(cwd, { profile });
     },
 
+    async openChat(profile = _activeProfileId()) {
+      if (!window.__TAURI__) throw new Error("New chats require the desktop app");
+      const row = await window.__TAURI__.core.invoke("scratch_create", { profile });
+      return _openReported(row.path, { profile, scratchId: row.id, name: "New chat" });
+    },
+
+    async listChats() {
+      if (!window.__TAURI__) return [];
+      await _scratchWrites;
+      return window.__TAURI__.core.invoke("scratch_list", { profile: _activeProfileId() });
+    },
+
+    async openScratchChat(row) {
+      return _openReported("", {
+        profile: row.profile || DEFAULT_PROFILE_ID, scratchId: row.id,
+        name: row.name || null, resume: row.sessionFile || null,
+      });
+    },
+
+    scratchFiles(id) { return window.__TAURI__.core.invoke("scratch_files", { id }); },
+    scratchUsage(id) { return window.__TAURI__.core.invoke("scratch_usage", { id }); },
+    exportScratchFile(id, path) { return window.__TAURI__.core.invoke("scratch_export", { id, path }); },
+
+    async promoteChat(id) {
+      return _manageScratch(id, true);
+    },
+
+    async deleteChat(id) {
+      await _manageScratch(id, false);
+    },
+
     /** Open project folder `path` (a recent-projects row) under the active
      *  profile: focus an open tab on it when there is one — the active tab
      *  if it qualifies, else the newest — and spawn a tab only otherwise.
@@ -4596,9 +4837,16 @@
         await window.OMP_BRIDGE.activateSession(open);
         return open;
       }
-      return _openReported(session.cwd || "", {
-        resume: session.path, name: session.title, profile,
-      });
+      const key = `${profile}|${session.path}`;
+      if (_historyOpenings.has(key)) return _historyOpenings.get(key);
+      const opening = (async () => {
+        const chat = await window.__TAURI__.core.invoke("scratch_restore_history", { sessionFile: session.path, profile });
+        if (chat) return window.OMP_BRIDGE.openScratchChat({ ...chat, profile });
+        return _openReported(session.cwd || "", { resume: session.path, name: session.title, profile });
+      })();
+      _historyOpenings.set(key, opening);
+      try { return await opening; }
+      finally { _historyOpenings.delete(key); }
     },
 
     // ── Conversation tree (prompt-cache navigator) ───────────────────────────
@@ -4713,6 +4961,7 @@
         console.warn(`[live] ${error} — ignoring switch`);
         return { ok: false, error };
       }
+      if (entry.scratchId) return _switchScratchProfile(entry, profileId);
       return _respawnSession(id, { profile: profileId, resume: null, fresh: true });
     },
 
@@ -4735,7 +4984,7 @@
 
     /** Close a tab after stopping its microphone; a failed stop leaves the
      *  tab visible so the user can retry. */
-    async closeSession(id) {
+    async closeSession(id, strict = false) {
       if (!sessionRegistry.has(id) || _closingVoiceTabs.has(id)) return false;
       _closingVoiceTabs.add(id);
       try {
@@ -4744,7 +4993,9 @@
           if (!stopped.ok && id === activeSessionId && (state.dictation.active || state.liveVoice.active)) return false;
           if (!sessionRegistry.has(id)) return false;
         }
-      _closeTab(id);
+      const entry = sessionRegistry.get(id);
+      if (entry?.scratchId) await _persistScratch(entry);
+      await _closeTab(id, strict);
       sessionRegistry.delete(id);
       promptHistories.delete(id);
       _modeRestartMissed.delete(id);

@@ -32,7 +32,7 @@ const {
   EMPTY: _UT_EMPTY, openPanel: _UT_open, closePanel: _UT_close, togglePanel: _UT_toggle,
   applyStatus: _UT_applyStatus, applyExit: _UT_applyExit, spawnFailed: _UT_spawnFailed,
   needsSpawn: _UT_needsSpawn, shellLive: _UT_shellLive, canRestart: _UT_canRestart,
-  entryOf: _UT_entryOf,
+  entryOf: _UT_entryOf, resetShell: _UT_resetShell,
 } = window.OMP_TERMINAL;
 const { pruneEntries: _UT_pruneEntries } = window.OMP_SESSION_UI;
 const {
@@ -47,7 +47,7 @@ const {
 
 const _UT_FONT_PX = 13;
 
-function useTerminal({ bridge, activeSessionId, sessionIds, tweaks, setTweak }) {
+function useTerminal({ bridge, activeSessionId, sessionIds, tweaks, setTweak, resetKey = 0 }) {
   const [state, setState] = React.useState(_UT_EMPTY);
   const stateRef = React.useRef(state);
   stateRef.current = state;
@@ -62,6 +62,7 @@ function useTerminal({ bridge, activeSessionId, sessionIds, tweaks, setTweak }) 
   // sid → stable ref callback for the panel's mount node.
   const recs = React.useRef(new Map());
   const mountRefs = React.useRef(new Map());
+  const resourceKeys = React.useRef(new Map());
 
   const fontSize = Math.round((_UT_FONT_PX * (tweaks.fontSize ?? 100)) / 100);
   // Read by `create`, whose ref callback outlives the render that made it.
@@ -267,6 +268,19 @@ function useTerminal({ bridge, activeSessionId, sessionIds, tweaks, setTweak }) 
     return mountRefs.current.get(sid);
   }, [bridge, create, fit]);
 
+  // Promotion keeps the tab id (and composer draft), but Rust has ended its
+  // shell. Dispose the old rec so late replies cannot revive that instance.
+  React.useEffect(() => {
+    if (!activeSessionId) return;
+    const previous = resourceKeys.current.get(activeSessionId);
+    resourceKeys.current.set(activeSessionId, resetKey);
+    if (previous === undefined || previous === resetKey) return;
+    const node = recs.current.get(activeSessionId)?.term.element?.parentElement;
+    dispose(activeSessionId);
+    setState(s => _UT_resetShell(s, activeSessionId));
+    if (node) mountFor(activeSessionId)(node);
+  }, [activeSessionId, resetKey, dispose, mountFor]);
+
   /** Right-click on a selection copies it; true when it did (no menu then). */
   const copySelection = React.useCallback((sid) => {
     const term = recs.current.get(sid)?.term;
@@ -324,6 +338,7 @@ function useTerminal({ bridge, activeSessionId, sessionIds, tweaks, setTweak }) 
       return next;
     });
     for (const sid of [...recs.current.keys()]) if (!sessionIds.includes(sid)) dispose(sid);
+    for (const sid of resourceKeys.current.keys()) if (!sessionIds.includes(sid)) resourceKeys.current.delete(sid);
   }, [idsKey, dispose]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Theme, font and scrollback follow the tweaks for every instance.

@@ -50,6 +50,9 @@ pub struct OpenTab {
     /// Tab label at save time, shown until omp reports the session's title.
     #[serde(default)]
     pub name: Option<String>,
+    /// App-private chat workspace identity, absent for ordinary projects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch_id: Option<String>,
 }
 
 /// The persisted layout: tabs in order plus the active tab's index.
@@ -226,6 +229,7 @@ mod tests {
             profile: Some("work".to_owned()),
             session_file: session_file.map(str::to_owned),
             name: Some("label".to_owned()),
+            scratch_id: None,
         }
     }
 
@@ -362,6 +366,7 @@ mod tests {
                 profile: Some(String::new()),
                 session_file: Some(String::new()),
                 name: Some(String::new()),
+                scratch_id: None,
             }],
             active: Some(0),
         });

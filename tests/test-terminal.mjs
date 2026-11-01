@@ -119,6 +119,17 @@ check("applyStatus moves forward within an instance and to a newer one", () => {
   assert.deepEqual(T.entryOf(s, "a").status, St(7, "running", null, "/bin/bash"));
 });
 
+check("replacing workspace resources clears the dead shell but preserves panel visibility", () => {
+  const live = T.applyStatus(opened(), "a", St(4));
+  const failed = T.spawnFailed(live, "a", "old shell failed");
+  const reset = T.resetShell(failed, "a");
+  assert.equal(T.entryOf(reset, "a").open, true);
+  assert.equal(T.needsSpawn(T.entryOf(reset, "a")), true);
+  assert.equal(T.entryOf(reset, "a").status, null);
+  assert.equal(T.entryOf(reset, "a").error, null);
+  assert.equal(T.resetShell(T.EMPTY, "gone"), T.EMPTY);
+});
+
 check("applyExit marks only the current instance exited, with its code", () => {
   const s = T.applyStatus(opened(), "a", St(4));
   assert.equal(T.applyExit(s, "a", 3, 0), s, "older instance ignored");
