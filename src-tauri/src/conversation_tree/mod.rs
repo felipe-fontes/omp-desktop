@@ -16,6 +16,8 @@
 //! - [`tests`] — behaviour tests against temp directories.
 
 mod family;
+mod history;
+mod images;
 mod parse;
 
 use std::collections::HashSet;
@@ -224,6 +226,20 @@ pub fn load(
     let root = crate::saved_sessions::sessions_root_dir(app, profile)
         .ok_or_else(|| "home directory unavailable".to_string())?;
     build(&root, Path::new(session_file))
+}
+
+pub use history::ConversationHistory;
+
+/// Read the active persisted transcript for a profile without dropping
+/// messages that preceded compaction.
+pub fn load_history(
+    app: &AppHandle,
+    session_file: &str,
+    profile: Option<&str>,
+) -> Result<ConversationHistory, String> {
+    let root = crate::saved_sessions::sessions_root_dir(app, profile)
+        .ok_or_else(|| "home directory unavailable".to_string())?;
+    history::build(&root, Path::new(session_file))
 }
 
 #[cfg(test)]

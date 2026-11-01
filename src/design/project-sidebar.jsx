@@ -9,7 +9,7 @@
    are real buttons, so every action is keyboard-reachable.
    ═════════════════════════════════════════════════════════════════════ */
 
-const { Icon, TabRunDot, TabLabel, RenameField } = window;
+const { Icon, TabRunDot, TabLabel, TabForkMark, RenameField } = window;
 const { groupTabs, groupRunState, groupTarget, membersNewestFirst, basename, parentName } = window.OMP_PROJECT_NAV;
 
 // Same guard as chrome.jsx's copy: the registry may not be loaded.
@@ -83,6 +83,7 @@ function ProjectSidebar({
                   onDoubleClick={() => { if (tab) startRename(tab.id); }}>
                   <Icon name="conversation" size={11} color={tab?.id === activeId ? "var(--accent)" : "var(--fg-4)"} />
                   <span className="psb-name">{name}</span>
+                  {tab && <TabForkMark fork={tab.fork} />}
                   {profile && <span className="chip muted tab-profile" title={`profile: ${profile}`}>{profile}</span>}
                   {tab ? <TabRunDot state={tab.runState} /> : <span className="psb-parent">closed</span>}
                 </button>
@@ -178,6 +179,7 @@ function ProjectSidebar({
                     <button className="psb-main" title={t.name} onClick={() => onSelectTab(t.id)}
                       onDoubleClick={() => startRename(t.id)}>
                       <span className="psb-name">{t.name}</span>
+                      <TabForkMark fork={t.fork} />
                       <TabRunDot state={t.runState} />
                     </button>
                   )}

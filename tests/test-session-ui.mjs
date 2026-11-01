@@ -15,7 +15,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const win  = {};
 // session-ui.js is dependency-free; prompt-history.js supplies the real
 // `step` its recall helper is handed in composer.jsx.
-for (const file of ["src/app/session-ui.js", "src/app/prompt-history.js"]) {
+for (const file of ["src/app/session-ui.js", "src/app/prompt-history.js", "src/app/widgets.js"]) {
   // eslint-disable-next-line no-new-func
   new Function("window", readFileSync(join(root, file), "utf8"))(win);
 }
@@ -324,6 +324,25 @@ check("pasted text is inserted literally, never re-scanned or read as a replacem
   const d = collapse(typed(""), tricky, 0, 0).draft;
   assert.equal(S.expandPastes(d.text, d.pastes), tricky);
   assert.equal(S.inlinePaste(d, "1").patch.text, tricky);
+});
+
+check("rewind replaces a targeted draft and restores image-only prompts without stale pastes", () => {
+  const image = { id: "restored", image: { data: "base64-image" } };
+  const old = { ...DRAFT_IDLE, text: "unrelated draft", attachments: [{ id: "old" }],
+    pastes: { 1: "old paste" }, pasteCounter: 1, pendingImages: 2, historyNav: 0 };
+  const restored = S.insertPromptDraft(old, { text: "", images: [image.image] }, [image], 2, win.OMP_WIDGETS.appendToDraft);
+  assert.equal(restored.text, "");
+  assert.deepEqual(restored.attachments, [image]);
+  assert.deepEqual(restored.pastes, {});
+  assert.equal(restored.historyNav, null);
+  assert.equal(restored.pendingImages, 2);
+  assert.equal(old.text, "unrelated draft");
+  const textOnly = S.insertPromptDraft(old, { text: "selected prompt", images: [] }, [], 2, win.OMP_WIDGETS.appendToDraft);
+  assert.equal(textOnly.text, "selected prompt");
+  assert.deepEqual(textOnly.attachments, []);
+  const appended = S.insertPromptDraft(old, { text: "widget", append: true }, [], 2, win.OMP_WIDGETS.appendToDraft);
+  assert.ok(appended.text.startsWith("unrelated draft") && appended.text.trimEnd().endsWith("widget"));
+  assert.equal(appended.attachments, old.attachments);
 });
 
 // ── Plan transitions (same semantics as before the per-tab split) ────────

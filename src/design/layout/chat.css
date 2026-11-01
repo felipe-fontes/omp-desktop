@@ -13,30 +13,22 @@
   background: var(--bg-window);
 }
 
-/* Shown only while unpinned from the bottom (issue #20) — an explicit,
-   deliberate way back to the live tail instead of every update yanking
-   the view there regardless of what the user is reading. */
-.chat-jump-latest {
-  position: absolute;
-  left: 50%;
-  bottom: 16px;
-  transform: translateX(-50%);
-  display: flex; align-items: center; gap: 6px;
-  padding: 7px 14px;
-  border-radius: var(--r-pill);
-  border: 1px solid var(--line-bright);
-  background: var(--bg-elevated);
-  color: var(--fg);
-  font-size: 12.5px; font-weight: 600;
-  cursor: pointer;
-  box-shadow: var(--shadow-pop);
-  animation: chat-jump-in 0.15s var(--ease-out);
+/* Explicit navigation never discards history or pulls a reader to live output. */
+.chat-jump-controls {
+  position: absolute; left: 16px; right: 16px; bottom: 12px;
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; pointer-events: none;
 }
-.chat-jump-latest:hover { border-color: var(--accent); color: var(--accent); }
-@keyframes chat-jump-in {
-  from { opacity: 0; transform: translateX(-50%) translateY(6px); }
-  to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+.chat-jump-user, .chat-jump-latest {
+  display: flex; align-items: center; gap: 6px; padding: 7px 12px;
+  border-radius: var(--r-pill); border: 1px solid var(--line-bright);
+  background: var(--bg-elevated); color: var(--fg-2); font-size: 11px;
+  cursor: pointer; box-shadow: var(--shadow-pop); pointer-events: auto;
 }
+.chat-jump-latest { margin-left: auto; color: var(--fg); font-weight: 600; }
+.chat-jump-user:hover, .chat-jump-latest:hover { border-color: var(--accent); color: var(--accent); }
+.chat-history-page { display: flex; align-items: center; justify-content: space-between; gap: 6px; color: var(--fg-4); font-size: 10px; }
+.chat-history-page .btn { font-size: 10px; padding: 5px 8px; }
+.chat-history-more { align-self: center; }
 .chat-pad {
   max-width: none;
   margin: 0;
@@ -156,6 +148,27 @@
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* Saved-message controls are separate from the selectable message text. */
+.message-actions { margin-top: 8px; font-size: var(--d-text-xs); user-select: none; }
+.message-actions-buttons { display: flex; flex-wrap: wrap; gap: 4px; }
+.message-action {
+  display: inline-flex; align-items: center; gap: 4px;
+  min-height: 26px; padding: 3px 7px;
+  border: 1px solid transparent; border-radius: var(--r-1);
+  background: transparent; color: var(--fg-3); font: inherit; cursor: pointer;
+}
+.message-action:hover:not(:disabled) { background: var(--bg-hover); color: var(--fg); border-color: var(--line); }
+.message-action:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.message-action:disabled { opacity: 0.5; cursor: default; }
+.message-action-confirm {
+  display: flex; flex-direction: column; gap: 8px; margin-top: 6px; padding: 9px 10px;
+  border: 1px solid var(--line-bright); border-radius: var(--r-1);
+  background: var(--bg-surface); color: var(--fg-2); line-height: 1.45;
+}
+.message-action-confirm-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+.message-action-notice { margin-top: 5px; color: var(--fg-2); overflow-wrap: anywhere; }
+.message-action-notice.error { color: var(--rose); }
 
 /* ── Inline plan (assistant's first reply) ──────────────────────────── */
 .inline-plan {

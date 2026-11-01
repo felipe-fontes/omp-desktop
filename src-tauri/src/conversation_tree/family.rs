@@ -40,6 +40,11 @@ struct Header {
     parent: Option<String>,
 }
 
+struct Family {
+    names: Vec<String>,
+    headers: HashMap<String, Header>,
+}
+
 /// File name (last component, either separator) of a `parentSession` path.
 fn base_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
@@ -91,6 +96,33 @@ fn resolve<'a>(
 /// # Errors
 /// Returns the I/O error when `dir` cannot be listed.
 pub fn family_of(dir: &Path, current: &str) -> io::Result<Vec<String>> {
+    family_with_limit(dir, current, MAX_FAMILY_FILES).map(|family| family.names)
+}
+
+/// Rank this fork among every fork in its connected family, oldest filename
+/// first. Unlike the graph navigator, numbering must not depend on which file
+/// was chosen as current, so it cannot use the navigator's 32-file cap.
+pub fn fork_number(dir: &Path, current: &str) -> io::Result<usize> {
+    let Family { mut names, headers } = family_with_limit(dir, current, usize::MAX)?;
+    names.sort_unstable();
+    let mut rank = 0;
+    for name in names {
+        if headers
+            .get(&name)
+            .is_some_and(|head| head.parent.as_deref().is_some_and(|p| !p.is_empty()))
+        {
+            rank += 1;
+        }
+        if name == current {
+            // A symlink within the sessions root is validated by the caller,
+            // but does not appear among the regular files scanned above.
+            return Ok(rank.max(1));
+        }
+    }
+    Ok(1)
+}
+
+fn family_with_limit(dir: &Path, current: &str, limit: usize) -> io::Result<Family> {
     let mut files: HashMap<String, Header> = HashMap::new();
     for item in fs::read_dir(dir)? {
         let Ok(item) = item else { continue };
@@ -140,7 +172,7 @@ pub fn family_of(dir: &Path, current: &str) -> io::Result<Vec<String>> {
     let mut queue = VecDeque::from([current]);
     while let Some(name) = queue.pop_front() {
         for &next in links.get(name).into_iter().flatten() {
-            if seen.len() < MAX_FAMILY_FILES && seen.insert(next) {
+            if seen.len() < limit && seen.insert(next) {
                 queue.push_back(next);
             }
         }
@@ -149,5 +181,8 @@ pub fn family_of(dir: &Path, current: &str) -> io::Result<Vec<String>> {
     let mut rest: Vec<String> = seen.into_iter().map(str::to_string).collect();
     rest.sort_unstable();
     rest.insert(0, current.to_string());
-    Ok(rest)
+    Ok(Family {
+        names: rest,
+        headers: files,
+    })
 }
