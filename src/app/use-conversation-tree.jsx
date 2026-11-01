@@ -70,7 +70,7 @@ function useConversationTree({ bridge, open, sessionId, sessionFile, profileId, 
   // tab's session file, which refetches by itself once `get_state` names it.
   const branch = React.useCallback(async entryId => {
     const res = await bridge.branchAt(entryId);
-    if (res.ok) textRef.current?.(res.text);
+    if (res.ok) textRef.current?.(res.text, res.sessionId, res.images);
     return res;
   }, [bridge]);
   const fork = React.useCallback(entryId => bridge.forkAt(entryId), [bridge]);

@@ -38,6 +38,7 @@
    *  persisted call/result pair by call id. Desktop-only notes and rows
    *  have neither key and stay in place. */
   function messageKey(m) {
+    if (m?.kind === "compact" && m.status === "done" && m.summary) return `compact:${m.firstKeptEntryId ?? ""}:${m.summary}`;
     if (m?.kind === "tool" && m._toolCallId) return `tool:${m._toolCallId}`;
     if (m?.kind !== "user" && m?.kind !== "assistant") return null;
     return Number.isFinite(m.ts) ? `${m.kind}:${m.ts}` : null;
@@ -55,9 +56,11 @@
   function _withLiveFields(copy, live) {
     // Preserve completed live timing/streamed details. A later model-context
     // result without its call must not erase arguments recovered from raw entries.
-    if (live.kind === "tool" && live.status !== "running" &&
-        (!live._historySource || (live._historySource === "call" && copy._historySource === "result"))) return live;
+    if (live.kind === "tool" && live.status !== "running" && !live.historyOmittedOutput &&
+        (copy.historyOmittedOutput || !live._historySource ||
+         (live._historySource === "call" && copy._historySource === "result"))) return live;
     let out = live._id == null ? copy : { ...copy, _id: live._id };
+    if (live.entryId && !out.entryId) out = { ...out, entryId: live.entryId };
     const verdict = live.failure?.retryable;
     if (typeof verdict === "boolean" && copy.failure && copy.failure.retryable !== verdict) {
       out = { ...out, failure: { ...copy.failure, retryable: verdict } };
@@ -87,9 +90,8 @@
    *  context (it keeps its `ts`), and leftovers before a trailing prompt
    *  still in flight. omp's order, not `ts`: a steer or follow-up carries
    *  the time it was sent but joins the context when it is delivered,
-   *  after replies stamped later. With `trimmed` (`_trimMessages` cut the
-   *  live transcript's head), entries before the first message both sides
-   *  share stay out.
+   *  after replies stamped later. Earlier history is never evicted merely
+   *  because it is outside the chat's current rendered page.
    *  A streaming entry has a copy only if its message ended while its frames
    *  were lost (omp adds a message to the context at `message_end`): that
    *  copy takes its place. Any other streaming entry is left out — the
@@ -104,6 +106,7 @@
     const recoveredCalls = new Set(persisted.filter(m => m._historySource === "call").map(messageKey));
     live = live.filter(m => m._historySource !== "result" || !recoveredCalls.has(messageKey(m)));
     const slots = new Map(); // key → indices into `persisted`, in omp's order
+    const compactSlots = new Map();
     persisted.forEach((p, i) => {
       const key = messageKey(p);
       if (!key) return;
@@ -111,9 +114,26 @@
       const queue = slots.get(key);
       if (queue) queue.push(i);
       else slots.set(key, [i]);
+      if (p.kind === "compact" && p.status === "done" && p.summary) {
+        const sameSummary = compactSlots.get(p.summary);
+        if (sameSummary) sameSummary.push(i);
+        else compactSlots.set(p.summary, [i]);
+      }
     });
-    const copyOf = live.map(m => slots.get(messageKey(m))?.shift() ?? -1);
-    const claimed = new Set(copyOf);
+    const claimed = new Set();
+    const copyOf = live.map(m => {
+      const queue = slots.get(messageKey(m));
+      while (queue?.length && claimed.has(queue[0])) queue.shift();
+      let i = queue?.shift() ?? -1;
+      // Some RPC compaction events omit the retained-entry id. Reconcile
+      // them with their saved boundary without merging distinct known ids.
+      if (i === -1 && m.kind === "compact" && m.status === "done" && m.summary) {
+        i = compactSlots.get(m.summary)?.find(index =>
+          !claimed.has(index) && (!m.firstKeptEntryId || !persisted[index].firstKeptEntryId)) ?? -1;
+      }
+      if (i !== -1) claimed.add(i);
+      return i;
+    });
     // Indices into `persisted`, in order, that no live entry stands for.
     const missed = [];
     persisted.forEach((p, i) => {

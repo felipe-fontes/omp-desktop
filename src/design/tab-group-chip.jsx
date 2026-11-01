@@ -36,6 +36,18 @@ function WorktreeIndicator({ tab, showLabel = false }) {
   </window.StatusDetail>;
 }
 
+/** A saved fork's number is presentation only, never part of its title. */
+function TabForkMark({ fork }) {
+  if (!Number.isInteger(fork?.number) || fork.number < 1 || !fork.parentSession) return null;
+  const description = `Fork #${fork.number} from ${fork.parentSession}`;
+  return (
+    <span className="tab-fork" title={description} aria-label={description}>
+      <Icon name="branch" size={10} aria-hidden="true" />
+      <span>#{fork.number}</span>
+    </span>
+  );
+}
+
 /** Name of a tab shown on its own (#46): `folder · title` once the title
  *  is no longer the folder name, the folder truncating first. Shared by the
  *  tab bar and the project sidebar; `className` is the caller's name class. */
@@ -43,14 +55,15 @@ function TabLabel({ tab, className, title }) {
   const { prefix, title: name } = tabLabel(tab);
   const detail = [title, tab.path, tab.branch && `branch: ${tab.branch}`,
     tab.workspace?.worktree && `worktree from ${tab.workspace.baseRef || "an unrecorded base"}`].filter(Boolean).join("\n");
-  if (!prefix) return <span className={className} title={detail}>{name}</span>;
+  if (!prefix && !tab.fork) return <span className={className} title={detail}>{name}</span>;
   return (
     <span className={`${className} tab-label`} title={detail}>
       {/* A few letters of the folder stay visible however long the title;
           a shorter folder keeps its own width, not a padded 4ch box. */}
-      <span className="tab-prefix" style={{ minWidth: `${Math.min(4, prefix.length)}ch` }}>{prefix}</span>
-      <span className="tab-sep">·</span>
+      {prefix && <><span className="tab-prefix" style={{ minWidth: `${Math.min(4, prefix.length)}ch` }}>{prefix}</span>
+      <span className="tab-sep">·</span></>}
       <span className="tab-title">{name}</span>
+      <TabForkMark fork={tab.fork} />
     </span>
   );
 }
@@ -134,6 +147,7 @@ function TabGroupChip({ group, activeId, profileLabel, prStatuses = {}, onSelect
                   onClick={() => { onSelect(t.id); close(); }}>
                   <span className="tab-group-dot"><TabRunDot state={t.runState} /></span>
                   <span className="tab-name">{window.OMP_PROJECT_NAV.memberLabel(t)}</span>
+                  <TabForkMark fork={t.fork} />
                 </button>
               )}
               <WorktreeIndicator tab={t} />
@@ -170,4 +184,4 @@ function TabGroupChip({ group, activeId, profileLabel, prStatuses = {}, onSelect
   );
 }
 
-Object.assign(window, { TabGroupChip, TabRunDot, TabLabel, WorktreeIndicator });
+Object.assign(window, { TabGroupChip, TabRunDot, TabLabel, TabForkMark, WorktreeIndicator });

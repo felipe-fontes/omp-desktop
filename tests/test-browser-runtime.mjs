@@ -458,6 +458,34 @@ test("hook: a stale open completion cannot release the newer tab's queued resize
   assert.deepEqual(closed, ["old", "new"]);
 });
 
+test("hook: replacing workspace resources reconnects the same tab and ignores its old channel", async () => {
+  const { React, render, unmount } = fakeReact();
+  const channels = [];
+  const window = { OMP_BROWSER_SCREEN: { createScreen: () => ({ frame() {}, destroy() {}, size: () => ({ width: 400, height: 300, dpr: 1 }) }) } };
+  loadHelpers(window);
+  const useBrowser = runInNewContext(source("src/app/use-browser.jsx") + "\nuseBrowser", { window, React });
+  const bridge = {
+    browserOpenPanel(_sid, _w, _h, _dpr, onMessage) { channels.push(onMessage); return Promise.resolve(); },
+    browserClosePanel() {}, browserAnnotate() {}, browserFrameAck() {},
+  };
+  const show = (resetKey, open = true) => render(() => useBrowser({
+    bridge, activeSessionId: "same-tab", sessionIds: ["same-tab"], tweaks: {}, setOpen() {}, open, resetKey,
+  }));
+  let ui = show(0, false);
+  ui.canvasRef.current = {}; ui.viewRef.current = {}; ui.sinkRef.current = {};
+  show(0); await flush();
+  channels[0]({ type: "state", value: { status: "old-workspace" } });
+  ui = show(0);
+  assert.equal(ui.state.status, "old-workspace");
+  show(1); await flush();
+  assert.equal(channels.length, 2);
+  channels[1]({ type: "state", value: { status: "new-workspace" } });
+  channels[0]({ type: "state", value: { status: "stale-old-workspace" } });
+  ui = show(1);
+  assert.equal(ui.state.status, "new-workspace", "the old resource channel cannot change the promoted tab");
+  unmount();
+});
+
 test("hook: a localhost chat link opens in the panel; a modifier click goes to the system browser", () => {
   const { React, render } = fakeReact();
   const window = { OMP_BROWSER_SCREEN: { createScreen: () => ({ frame() {}, destroy() {}, size: () => ({ width: 1, height: 1, dpr: 1 }) }) } };

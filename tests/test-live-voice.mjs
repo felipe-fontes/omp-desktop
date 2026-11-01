@@ -264,6 +264,7 @@ function bridgeHarness() {
           else waiters.push(waiter);
         }
         if (cmd.type === "negotiate_protocol" || cmd.type === "set_ask_dialog") queueMicrotask(() => reply(cmd));
+        if (cmd.type === "get_state" && cmd.id?.startsWith("conversation-state-")) queueMicrotask(() => reply(cmd, true, { isStreaming: false, isSettled: true }));
         if (cmd.type === "get_messages" && cmd.id?.startsWith("live-history-") && !holdHistory) {
           queueMicrotask(() => reply(cmd, true, { messages: histories.get(cmd.sessionId) ?? [] }));
         }

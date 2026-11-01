@@ -16,7 +16,7 @@ const _UB_NO_TABS = Object.freeze([]);
 const _UB_LOG_EVERY_MS = 60_000;
 let _ubChipSeq = 0;
 
-function useBrowser({ bridge, activeSessionId, sessionIds, open: shown, setOpen, tweaks, setTweak }) {
+function useBrowser({ bridge, activeSessionId, sessionIds, open: shown, setOpen, tweaks, setTweak, resetKey = 0 }) {
   const sid = activeSessionId || null;
   // precedent:ignore — hook state declarations, alike in every component
   const [fullView, setFullView] = React.useState(false);
@@ -165,7 +165,7 @@ function useBrowser({ bridge, activeSessionId, sessionIds, open: shown, setOpen,
       bridge.browserClosePanel(sid);
       showAnnotate(false);
     };
-  }, [bridge, sid, open, setAnnotate, showAnnotate]);
+  }, [bridge, sid, open, setAnnotate, showAnnotate, resetKey]);
 
   const close = React.useCallback(() => setOpen(false), [setOpen]);
   // Show `url` (already normalised) in the panel, opening it first if needed.

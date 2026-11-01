@@ -186,7 +186,7 @@ pub fn canonical_folder(path: &Path) -> Result<String, String> {
 /// Not `#[cfg(windows)]`, and applied unconditionally: it is pure string
 /// work, no canonical POSIX path can start with `\\?\` (they start with `/`),
 /// and one code path means the CI Linux/macOS runs cover it too.
-fn strip_verbatim(mut path: String) -> String {
+pub fn strip_verbatim(mut path: String) -> String {
     if let Some(share) = path.strip_prefix(r"\\?\UNC\") {
         return format!(r"\\{share}");
     }

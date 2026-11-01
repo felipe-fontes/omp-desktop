@@ -212,7 +212,11 @@ function ToolCard({ msg, idx, highlighted, onInspectSubagent, onOpenFile, onPrev
           </span>
           <span className="tool-title selectable">{msg.title}</span>
           <div className="tool-card-spacer" />
-          {running ? (
+          {msg.historyOmittedOutput ? (
+            <span className="chip muted" style={msg.isError ? { color: "var(--rose)" } : undefined}>
+              {msg.status === "unknown" ? "no saved result" : msg.isError ? "failed" : "recorded"}
+            </span>
+          ) : running ? (
             <span className="chip accent" style={{ animation: "pulseDot 1.4s infinite" }}>
               <span className="dot live" /> running
             </span>
@@ -228,6 +232,10 @@ function ToolCard({ msg, idx, highlighted, onInspectSubagent, onOpenFile, onPrev
         </div>
 
         <div className={collapsed ? `collapse-clip${msg.tool === "bash" ? " from-end" : ""}` : undefined}>
+          {msg.historyOmittedOutput && <div className="tool-foot mono">
+            {msg.tool === "edit" && msg.targets?.length > 0 && <DiffPaths msg={msg} onOpenFile={onOpenFile} />}
+            <span style={{ color: "var(--fg-4)" }}>Tool output is not restored from saved history.</span>
+          </div>}
           {msg.tool === "search" && msg.preview && (
             <div className="tool-search">
               {msg.preview.map((p, i) => (
@@ -251,7 +259,7 @@ function ToolCard({ msg, idx, highlighted, onInspectSubagent, onOpenFile, onPrev
           )}
 
           {msg.tool === "edit" && msg.diff && <ScrubbableDiff msg={msg} onOpenFile={onOpenFile} />}
-          {msg.tool === "edit" && !msg.diff && (
+          {msg.tool === "edit" && !msg.diff && !msg.historyOmittedOutput && (
             <div className="tool-foot mono">
               <span style={{ color: "var(--fg-3)" }}>↳</span>
               <DiffPaths msg={msg} onOpenFile={onOpenFile} />

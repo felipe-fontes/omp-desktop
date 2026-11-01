@@ -59,6 +59,7 @@
   const state = {
     messages:       [],
     askRecovery:    null,
+    historyError:   null,
     isStreaming:    false,
     model:          null,
     thinkingLevel:  null,
@@ -79,8 +80,6 @@
     // `hasPendingAsyncWork` (agent_end always asks for one), cleared by
     // `session_settled`. Drives the "background" run state.
     asyncPending:   false,
-    // `_trimMessages` cut the transcript's head (see the get_messages merge).
-    trimmed:        false,
     // Subagent manager (src/app/subagents.js). Terminal agents are kept here
     // for the life of the session — omp's own registry forgets them.
     subagents:           SUB.emptySubagents(),
@@ -190,9 +189,8 @@
     return window.__TAURI__.core.invoke(command, fields);
   }
 
-  // ── Minimap / message-history trim ───────────────────────────────────────
-  const MINIMAP_COLS = 13;
-  const MINIMAP_MAX  = MINIMAP_COLS * MINIMAP_COLS; // 169 — one full 13×13 grid
+  let _historyRead = null; // latest saved-history request for this activation
+  const _movingConversations = new Set();
 
   // ── Session registry ───────────────────────────────────────────────────────
   // Tracks all open tabs. The tab list in the UI is derived from this.
@@ -210,6 +208,13 @@
   // Queue rather than replace: OS opens and widget insertions await their own tab.
   const conversationSetups = [];
   let _lastSetupId = 0;
+  // Scratch metadata follows the ordinary session file; serialize writes so
+  // closing immediately after a title/state frame cannot lose that update.
+  const _scratchKeys = new Map();
+  const _scratchOperations = new Set();
+  const _scratchOpenings = new Map();
+  const _historyOpenings = new Map();
+  let _scratchWrites = Promise.resolve();
   const gitListeners = new Map();  // session_id → Tauri unlisten fn for git://branch/{id}
   // Prompt history — one list per tab, newest-first, in memory only. Never
   // persisted to disk/localStorage: filled as the user sends (_recordPrompt)
@@ -380,35 +385,6 @@
   // ── Subscriber system ─────────────────────────────────────────────────────
   const subscribers = new Set();
 
-  // Keep open questions and the latest row of cancellation outcomes even
-  // when parallel work makes the transcript idle. The cap remains soft
-  // when more than a screenful of callbacks are still open.
-  function _trimMessages() {
-    if (state.isStreaming || state.messages.length <= MINIMAP_MAX) return;
-    let remaining = Math.ceil((state.messages.length - MINIMAP_MAX) / MINIMAP_COLS) * MINIMAP_COLS;
-    const kept = [];
-    const indices = new Map();
-    const recentClosures = new Set();
-    for (let i = state.messages.length - 1; i >= 0 && recentClosures.size < MINIMAP_COLS; i--) {
-      if (state.messages[i].kind === "ask" && state.messages[i].cancelled) recentClosures.add(i);
-    }
-    for (let i = 0; i < state.messages.length; i++) {
-      const m = state.messages[i];
-      if (remaining > 0 && !(m.kind === "ask" && !m.answered && !m.cancelled) && !recentClosures.has(i)) {
-        remaining--;
-      } else {
-        indices.set(i, kept.length);
-        kept.push(m);
-      }
-    }
-    if (kept.length === state.messages.length) return;
-    state.messages = kept;
-    state.trimmed = true;
-    for (const [id, idx] of activeToolCards) {
-      if (indices.has(idx)) activeToolCards.set(id, indices.get(idx));
-      else activeToolCards.delete(id);
-    }
-  }
 
   // Memo for a session's run state (`TURN.runStateOf`, app/turn-status.js),
   // keyed on the messages array's identity.
@@ -422,11 +398,8 @@
   // the same array replayed under changing isStreaming/exitReason, which a
   // naive key-on-array-only memo gets wrong — `asyncPending` is part of
   // the key for the same reason).
-  // A backgrounded tab's array is frozen for as long as it
-  // stays backgrounded, so those tabs become a map lookup; only the active
-  // tab, whose array is replaced as it streams, still scans — and that scan
-  // is bounded by MINIMAP_MAX. A WeakMap means a closed tab's cached entry
-  // is collected with its messages.
+  // Background tabs retain their transcript unchanged, so their run state is
+  // a map lookup. A WeakMap releases closed tabs together with their messages.
   const _runStateMemo = new WeakMap();
   // Shared so a never-activated tab keys the memo stably instead of
   // allocating a fresh (always-missing) array on every notify.
@@ -447,6 +420,9 @@
   function _buildSnapshot() {
     return {
       messages:        state.messages,
+      historyError:    state.historyError,
+      conversationBusy: _conversationBusy(),
+      conversationMoving: _movingConversations.has(activeSessionId),
       isStreaming:     state.isStreaming,
       asyncPending:    state.asyncPending,
       model:           state.model,
@@ -527,6 +503,65 @@
     } catch (err) {
       return { ok: false, error: String(err?.message ?? err) };
     }
+  }
+
+  // RPC refreshes the current context; the saved file also supplies earlier
+  // compaction epochs and persistent action targets. Both use the same merge.
+  function _mergeMessages(apiMessages, savedHistory = false) {
+    state.backgroundTasks = TASKS.mergeMessages(state.backgroundTasks, apiMessages);
+    const completed = window.adaptAgentMessages(apiMessages, { savedHistory });
+    const merged = mergeTranscript(state.messages, completed);
+    activeToolCards = new Map();
+    for (let i = 0; i < merged.length; i++) {
+      const m = merged[i];
+      if (m.kind === "tool" && m.status === "running" && m._toolCallId) activeToolCards.set(m._toolCallId, i);
+    }
+    const streamingTs = streamingBubble?.ts;
+    if (streamingTs != null && apiMessages.some(m => m?.role === "assistant" && m.timestamp === streamingTs)) streamingBubble = null;
+    state.messages = streamingBubble ? [...merged, streamingBubble] : merged;
+    if (!savedHistory) state.ctx = { ...state.ctx, cacheUsage: CACHE.fromMessages(apiMessages) };
+    if (activeSessionId) {
+      const prior = window.OMP_PROMPT_HISTORY.promptsFromMessages(merged, PROMPT_NORMALIZE);
+      promptHistories.set(activeSessionId, window.OMP_PROMPT_HISTORY.mergeOlder(
+        promptHistories.get(activeSessionId) ?? [], prior, promptHistoryLimit,
+      ));
+    }
+  }
+
+  async function _refreshConversationHistory(force = false) {
+    const id = activeSessionId;
+    const entry = sessionRegistry.get(id);
+    if (!entry?.sessionFile) return;
+    // Load once even when activating a busy tab; subsequent deltas wait for
+    // an idle state instead of rereading the entire saved file each step.
+    if (!force && state.isStreaming && _historyRead?.gen === _switchGen) return;
+    const file = entry.sessionFile;
+    const key = `${id}\0${file}\0${state.rpcState?.messageCount ?? ""}`;
+    const gen = _switchGen;
+    if (!force && _historyRead?.key === key && _historyRead.gen === gen) return;
+    const request = { key, gen };
+    _historyRead = request;
+    const result = await _invokeResult("conversation_history", { sessionFile: file, profile: entry.profile });
+    if (_historyRead !== request || activeSessionId !== id || _switchGen !== gen || sessionRegistry.get(id)?.sessionFile !== file) return;
+    if (!result.ok || !Array.isArray(result.value?.messages)) {
+      state.historyError = result.error || "Saved conversation history is unavailable.";
+    } else {
+      state.historyError = null;
+      _mergeMessages(result.value.messages, true);
+      const current = sessionRegistry.get(id);
+      sessionRegistry.set(id, { ...current, fork: result.value.fork ?? null });
+    }
+    notify();
+  }
+
+  function _rpcConversationBusy(rpc) {
+    return !!(rpc?.isStreaming || rpc?.isCompacting || rpc?.hasPendingAsyncWork
+      || rpc?.isSettled === false || rpc?.queuedMessageCount > 0);
+  }
+  function _conversationBusy() {
+    return _movingConversations.has(activeSessionId) || state.isStreaming || state.asyncPending
+      || _rpcConversationBusy(state.rpcState)
+      || state.messages.some(m => m.kind === "compact" && m.status === "pending");
   }
 
   // Git browser reads: `cmd` for the active tab's project folder, as
@@ -912,10 +947,9 @@
   }
 
   function notify() {
-    _trimMessages();
-    // Stamp stable IDs on any message that doesn't have one yet (new pushes,
-    // restored sessions, or messages from get_messages). O(N) but N ≤ 169 and
-    // is a no-op for already-stamped entries — essentially free.
+    // History belongs to the conversation, not the minimap grid. Only the
+    // rendered chat page is bounded; every retained entry stays navigable.
+    // Stamp new messages with stable React identities.
     for (const m of state.messages) {
       if (!m._id) m._id = ++_msgSeq;
     }
@@ -932,6 +966,170 @@
     window.OMP_DATA.activity  = state.activity;
 
     _persistLayout();
+    for (const entry of sessionRegistry.values()) {
+      if (entry.scratchId && !_scratchOperations.has(entry.scratchId)) _persistScratch(entry);
+    }
+  }
+
+  function _persistScratch(entry) {
+    const args = { id: entry.scratchId, sessionFile: entry.sessionFile || null, name: entry.name };
+    const key = JSON.stringify(args);
+    if (_scratchKeys.get(args.id) === key) return _scratchWrites;
+    _scratchKeys.set(args.id, key);
+    const write = _scratchWrites.then(async () => {
+      const saved = await window.__TAURI__.core.invoke("scratch_update", args);
+      if (saved === false && _scratchKeys.get(args.id) === key) _scratchKeys.delete(args.id);
+    });
+    _scratchWrites = write.catch(error => {
+      if (_scratchKeys.get(args.id) === key) _scratchKeys.delete(args.id);
+      console.error("[live] could not save chat workspace metadata:", error);
+    });
+    return write;
+  }
+
+  async function _switchScratchProfile(entry, profile) {
+    const source = entry.scratchId;
+    if (_scratchOperations.has(source) || _scratchOpenings.has(source) || _respawning.has(entry.id)) return { ok: false, error: "Chat workspace is being managed" };
+    _scratchOperations.add(source);
+    let target;
+    let targetLocked = false;
+    try {
+      await _persistScratch(entry);
+      target = await window.__TAURI__.core.invoke("scratch_for_profile", { id: source, profile });
+      if (_scratchOperations.has(target.id)) return { ok: false, error: "The target profile's chat is being managed" };
+      const pending = _scratchOpenings.get(target.id);
+      if (pending) {
+        const tabId = await pending;
+        await window.OMP_BRIDGE.activateSession(tabId);
+        return { ok: true };
+      }
+      const open = [...sessionRegistry.values()].find(tab => tab.scratchId === target.id);
+      if (open) {
+        await window.OMP_BRIDGE.activateSession(open.id);
+        return { ok: true };
+      }
+      _scratchOperations.add(target.id);
+      targetLocked = true;
+      const current = sessionRegistry.get(entry.id);
+      if (!current) return { ok: false, error: "Tab closed" };
+      sessionRegistry.set(entry.id, {
+        ...current, ..._freshConversationFields(current), scratchId: target.id,
+        name: target.name || "New chat", sessionFile: target.sessionFile || null,
+        autoRenameArmed: !target.sessionFile,
+      });
+      const switched = await _respawnSession(entry.id, { profile, resume: target.sessionFile, reason: "Profile switch" });
+      if (!switched.ok && sessionRegistry.has(entry.id)) {
+        sessionRegistry.set(entry.id, entry);
+        const restored = await _respawnSession(entry.id, { profile: entry.profile, resume: entry.sessionFile, reason: "Chat restoration" });
+        return { ok: false, error: `${switched.error}${restored.ok ? "" : `; restoring original profile failed: ${restored.error}`}` };
+      }
+      const updated = sessionRegistry.get(entry.id);
+      if (updated) await _persistScratch(updated);
+      return switched;
+    } catch (error) {
+      return { ok: false, error: String(error?.message ?? error) };
+    } finally {
+      _scratchOperations.delete(source);
+      if (targetLocked) _scratchOperations.delete(target.id);
+      notify();
+    }
+  }
+
+  // Keep the registry identity while writers are temporarily stopped: React
+  // drafts, attachments and plan state are keyed by this id, not the process.
+  async function _manageScratch(id, promote) {
+    if (_scratchOperations.has(id) || _scratchOpenings.has(id)) throw new Error("Chat workspace is already being opened or managed");
+    _scratchOperations.add(id);
+    let original = null, temporary = false, stopped = false, forked = false;
+    const restore = async () => {
+      _scratchOperations.delete(id);
+      if (!original || !sessionRegistry.has(original.id)) return;
+      sessionRegistry.set(original.id, original);
+      if (temporary) {
+        if (!await window.OMP_BRIDGE.closeSession(original.id)) throw new Error("Temporary chat could not be closed");
+      } else if (stopped || forked) {
+        const restored = await _respawnSession(original.id, { profile: original.profile, resume: original.sessionFile, reason: "Chat restoration" });
+        if (!restored.ok) throw new Error(restored.error);
+        if (activeSessionId === null) await window.OMP_BRIDGE.activateSession(original.id);
+      }
+    };
+    try {
+      const assertIdle = () => {
+        for (const tab of _sessionsView().filter(t => t.scratchId === id)) {
+          const voice = tab.id === activeSessionId ? state : sessionSnapshots.get(tab.id);
+          if (TURN.isBusyRunState(tab.runState) || voice?.liveVoice?.active || voice?.dictation?.active || _respawning.has(tab.id)) {
+            throw new Error("Stop this chat's running work and voice capture first");
+          }
+        }
+      };
+      assertIdle();
+      let owner = [...sessionRegistry.values()].find(t => t.scratchId === id);
+      const profile = owner?.profile || _activeProfileId();
+      await _scratchWrites;
+      let row = (await window.__TAURI__.core.invoke("scratch_list", { profile })).find(r => r.id === id);
+      if (!row) throw new Error("Chat workspace no longer exists");
+      if (!promote) {
+        assertIdle();
+        for (const tab of _sessionsView().filter(t => t.scratchId === id)) {
+          if (!await window.OMP_BRIDGE.closeSession(tab.id)) throw new Error("Chat could not be closed");
+        }
+        await window.__TAURI__.core.invoke("scratch_delete", { id });
+        _scratchKeys.delete(id);
+        return null;
+      }
+      // Canceling the native picker changes neither process nor tab identity.
+      if (!await window.__TAURI__.core.invoke("scratch_pick_project", { id })) return null;
+      if (!owner && row.sessionFile) {
+        const tabId = await _openReported(row.path, { profile, scratchId: id, resume: row.sessionFile, name: row.name, managing: true });
+        owner = sessionRegistry.get(tabId);
+        temporary = true;
+      }
+      let snapshot = null;
+      if (owner) {
+        original = { ...sessionRegistry.get(owner.id) };
+        await window.OMP_BRIDGE.activateSession(owner.id);
+        if (activeSessionId !== owner.id) throw new Error("Activate this chat before promoting its workspace");
+        const current = await _sendWithResponse({ type: "get_state" }, QUICK_CMD_TIMEOUT_MS);
+        _applyRpcState(current);
+        assertIdle();
+        original = { ...sessionRegistry.get(owner.id) };
+        await _persistScratch(original);
+        row = (await window.__TAURI__.core.invoke("scratch_list", { profile })).find(r => r.id === id);
+        if (row.sessionFile) {
+          // Native unpack relocates all same-UUID local copies. Give it a
+          // disposable native fork, never the only original conversation.
+          const result = await _sendWithResponse({ type: "fork" });
+          if (result.cancelled) throw new Error("Chat could not be snapshotted for promotion");
+          forked = true;
+          snapshot = (await _sendWithResponse({ type: "get_state" }, QUICK_CMD_TIMEOUT_MS)).sessionFile;
+          if (!snapshot || snapshot === row.sessionFile) throw new Error("omp did not create an independent promotion snapshot");
+        }
+        const closed = await _closeTab(owner.id);
+        if (!closed.ok) throw new Error(closed.error);
+        stopped = true;
+        original = { ...original, resourcesVersion: (original.resourcesVersion || 0) + 1 };
+        if (activeSessionId === owner.id) await _detachActiveSession();
+        sessionRegistry.set(owner.id, original);
+      }
+      const destination = await window.__TAURI__.core.invoke("scratch_promote", { id, snapshot });
+      const resume = await window.__TAURI__.core.invoke("scratch_promote_session", { id, destination });
+      _scratchOperations.delete(id);
+      if (original) {
+        sessionRegistry.set(original.id, { ...original, path: destination, scratchId: null, sessionFile: resume, branch: null });
+        const started = await _respawnSession(original.id, { profile, resume, reason: "Project promotion" });
+        if (!started.ok) throw new Error(started.error);
+        if (activeSessionId === null) await window.OMP_BRIDGE.activateSession(original.id);
+        void _touchRecent(destination, profile);
+        return original.id;
+      }
+      return await _openReported(destination, { profile, name: row.name, resume });
+    } catch (error) {
+      try { await restore(); }
+      catch (restoreError) { throw new Error(`${error}; restoring the original chat also failed: ${restoreError}`); }
+      throw error;
+    } finally {
+      _scratchOperations.delete(id);
+    }
   }
 
   function _layoutNow() {
@@ -995,9 +1193,11 @@
     sessionContext.contextSync?.dispose();
     sessionContext.policyController?.dispose();
     sessionContext.evidenceController?.dispose();
+    _historyRead = null;
     Object.assign(state, {
       messages:      [],
       askRecovery:   null,
+      historyError:  null,
       isStreaming:   false,
       model:         null,
       thinkingLevel: null,
@@ -1014,7 +1214,6 @@
       currentTps:    0,
       exitReason:    null,
       asyncPending:  false,
-      trimmed:       false,
       subagents:           SUB.emptySubagents(),
       backgroundTasks:     TASKS.empty(),
       agentContext:        CONTEXT.empty(),
@@ -1055,6 +1254,7 @@
       // state fields
       messages:      state.messages,
       askRecovery:   state.askRecovery,
+      historyError:  state.historyError,
       isStreaming:   state.isStreaming,
       model:         state.model,
       thinkingLevel: state.thinkingLevel,
@@ -1070,7 +1270,6 @@
       currentTps:    state.currentTps,
       exitReason:    state.exitReason,
       asyncPending:  state.asyncPending,
-      trimmed:       state.trimmed,
       // Last-turn outcome for the auto-rename gate (see _applyRpcState):
       // survives tab switches so a snapshot-restored session does not
       // forget a failed first exchange and re-arm the one-shot.
@@ -1106,6 +1305,7 @@
     Object.assign(state, {
       messages:      snap.messages,
       askRecovery:   snap.askRecovery ?? null,
+      historyError:  snap.historyError ?? null,
       isStreaming:   snap.isStreaming,
       model:         snap.model,
       thinkingLevel: snap.thinkingLevel,
@@ -1121,7 +1321,6 @@
       currentTps:    snap.currentTps,
       exitReason:    snap.exitReason ?? null,
       asyncPending:  snap.asyncPending ?? false,
-      trimmed:       snap.trimmed ?? false,
       subagents:     snap.subagents ?? SUB.emptySubagents(),
       backgroundTasks: snap.backgroundTasks ?? TASKS.empty(),
       agentContext:  snap.agentContext ?? CONTEXT.empty(),
@@ -1551,6 +1750,7 @@
       state.dictation = DICTATION.EMPTY;
     }
     _dictationCompleted = _dictationCompleted.filter(item => item.sessionId !== id);
+
     _dropGitListener(id);
     respawnVoice.delete(id);
     sessionSnapshots.delete(id);
@@ -1619,8 +1819,9 @@
    *  Shared by in-process `new_session` and a profile switch's respawn. */
   function _freshConversationFields(entry) {
     return {
-      name: _tabNameFor(window.OMP_PROJECT_NAV.projectPath(entry), "new session"),
+      name: entry.scratchId ? "New chat" : _tabNameFor(window.OMP_PROJECT_NAV.projectPath(entry), "new session"),
       sessionFile: null,
+      fork: null,
       autoRenameArmed: true,
       autoRenameInFlight: false,
       autoRenameAttempt: null,
@@ -1642,11 +1843,11 @@
    *  The dictation-before-restart ordering is covered by the fake IPC bridge
    *  in test-live-voice.mjs; the remaining ordering relies on the comments
    *  at each await and the pure profile/approval-mode decisions. */
-  async function _respawnSession(id, { profile, resume = null, fresh = false }) {
+  async function _respawnSession(id, { profile, resume = null, fresh = false, reason = null }) {
     if (!window.__TAURI__) return { ok: false, error: "not connected" };
     const entry = sessionRegistry.get(id);
     if (!entry) return { ok: false, error: "unknown tab" };
-    const what = fresh ? "Profile switch" : "Approval mode change";
+    const what = reason || (fresh ? "Profile switch" : "Approval mode change");
     // Re-entrancy: this call spans two awaits, and a second respawn of the
     // same tab would read `wasActive` as false (call 1 already nulled the
     // active slot), so it would never re-activate or `_initFetch` the
@@ -1665,7 +1866,7 @@
       }
       // Only a resumed coding conversation can retain its tab-local voice
       // history. Killing the process itself closes its native transport.
-      let savedVoice = !fresh && resume ? (id === activeSessionId ? state.liveVoice : sessionSnapshots.get(id)?.liveVoice) : null;
+      let savedVoice = !fresh && resume && profile === entry.profile ? (id === activeSessionId ? state.liveVoice : sessionSnapshots.get(id)?.liveVoice) : null;
       if (savedVoice?.active) {
         savedVoice = LIVE.apply(LIVE.apply(savedVoice, { type: "stop" }), { type: "stop_success", paused: true });
       }
@@ -1707,7 +1908,7 @@
         // Same conversation: name, file and auto-rename budget carry over;
         // only an in-flight `/rename` dies with the process (its note can
         // never arrive, so the flag would block every later refresh).
-        : { ...current, approvalMode: null, autoRenameInFlight: false });
+        : { ...current, profile, approvalMode: null, autoRenameInFlight: false });
       if (wasActive) await _detachActiveSession();
       // After the detach, which nulls `activeSessionId` synchronously — so no
       // later `_saveCurrentSession` can re-add it. A resurrected snapshot
@@ -1773,7 +1974,7 @@
       }
       // The folder is now open under `profile`, so it belongs in that
       // profile's recents (a mode restart keeps the profile: nothing new).
-      if (fresh && !spawnError && entry.path) void _touchRecent(entry.workspace?.projectPath || entry.path, profile);
+      if (fresh && !spawnError && entry.path && !entry.scratchId) void _touchRecent(entry.workspace?.projectPath || entry.path, profile);
 
       if (wasActive && activeSessionId === null) {
         // Reclaim focus only if nothing else took the active slot while the
@@ -1922,7 +2123,7 @@
     if (!activeSessionId || !sessionRegistry.has(activeSessionId)) return;
     const entry = sessionRegistry.get(activeSessionId);
     if (!entry.autoRenameInFlight) return;
-    const untitledLabel = _tabNameFor(window.OMP_PROJECT_NAV.projectPath(entry), "new session");
+    const untitledLabel = entry.scratchId ? "New chat" : _tabNameFor(window.OMP_PROJECT_NAV.projectPath(entry), "new session");
     const rearm = STITLE.shouldRearmAfterAbort(state.rpcState, entry.name, untitledLabel);
     sessionRegistry.set(activeSessionId, {
       ...entry,
@@ -1951,6 +2152,31 @@
     });
   }
 
+  // Every scratch entry point (restore, sidebar and temporary promotion
+  // opens) claims ownership here before its first IPC round-trip.
+  async function _startProjectSession(cwd, opts) {
+    const scratchId = opts.scratchId;
+    if (!scratchId) return _startSession(cwd, opts);
+    if (_scratchOperations.has(scratchId) && !opts.managing) throw new Error("Chat workspace is being managed");
+    let opening = _scratchOpenings.get(scratchId);
+    if (!opening) {
+      const existing = [...sessionRegistry.values()].find(tab => tab.scratchId === scratchId);
+      if (existing) {
+        if (opts.activate !== false) await window.OMP_BRIDGE.activateSession(existing.id);
+        return existing.id;
+      }
+      opening = _startSession(cwd, opts);
+      _scratchOpenings.set(scratchId, opening);
+    }
+    try {
+      const id = await opening;
+      if (opts.activate !== false) await window.OMP_BRIDGE.activateSession(id);
+      return id;
+    } finally {
+      if (_scratchOpenings.get(scratchId) === opening) _scratchOpenings.delete(scratchId);
+    }
+  }
+
   /** Spawn omp for `cwd` (optionally resuming a saved session), register the
    *  tab, wire the git-branch watcher, and activate it. Shared by
    *  `openSession` (new project tab), `resumeSession` (resume from disk) and
@@ -1963,13 +2189,23 @@
    *  conversation is styled cyan and, unnamed, falls back to "resumed"
    *  rather than "new session" when it has no folder.
    *
-   *  This function is side-effectful (Tauri IPC invoke, event listeners) and
-   *  not unit-tested directly; its one pure decision (the `tabName`
-   *  derivation) now lives in, and is proven by, `_tabNameFor`. */
-  async function _startProjectSession(cwd, {
+   *  Its public scratch ownership and startup races are exercised by the
+   *  fake-IPC bridge in test-scratch-chats.mjs; the label derivation lives
+   *  in `_tabNameFor`. */
+  async function _startSession(cwd, {
     resume = null, name = null, profile, activate = true, remember = true,
     workspace = null, workspaceBinding = null, userInitiated = true,
+    scratchId = null, managing = false,
   }) {
+    if (scratchId) {
+      const row = (await window.__TAURI__.core.invoke("scratch_list", { profile })).find(r => r.id === scratchId);
+      if (!row) throw new Error("Chat workspace no longer exists");
+      if (_scratchOperations.has(scratchId) && !managing) throw new Error("Chat workspace is being managed");
+      cwd = row.path; // The Rust-owned identity, never an open-tabs.json path.
+      name ||= row.name || "New chat";
+      remember = false;
+      resume ||= row.sessionFile || null;
+    }
     _lastSessionMs = Math.max(Date.now(), _lastSessionMs + 1);
     const id = `session-${_lastSessionMs}`;
     const tabName = name || _tabNameFor(workspaceBinding?.projectPath || cwd, resume ? "resumed" : "new session");
@@ -1977,7 +2213,7 @@
     // Register in tab list before starting omp so the tab shows immediately.
     // Register with null branch — chip hidden until git resolves.
     sessionRegistry.set(id, {
-      id, name: tabName, path: cwd ?? "", color, branch: null, profile,
+      id, name: tabName, path: cwd ?? "", color, branch: null, profile, scratchId,
       preparing: true, workspace: workspaceBinding,
       // The approval mode `start_session` spawned this tab's current omp
       // with (set by `_spawnSession`); null while no process runs it.
@@ -2030,7 +2266,7 @@
     // Only a folder that actually spawned is remembered.
     const opened = sessionRegistry.get(id);
     const recentPath = opened?.workspace?.projectPath || opened?.path;
-    if (recentPath && remember) void _touchRecent(recentPath, profile);
+    if (recentPath && remember && !scratchId) void _touchRecent(recentPath, profile);
     if (activate) await _switchToSession(id);
     else notify(); // tab list changed
     return id;
@@ -2314,34 +2550,6 @@
     _handleEvent(obj);
   }
 
-  // Both the model-context refresh and the raw saved branch feed the same
-  // identity-based merge. Never replace the transcript positionally.
-  function _applyMessages(messages) {
-    state.backgroundTasks = TASKS.mergeMessages(state.backgroundTasks, messages);
-    const completed = window.adaptAgentMessages(messages);
-    const merged = mergeTranscript(state.messages, completed, { trimmed: state.trimmed });
-    activeToolCards = new Map();
-    for (let i = 0; i < merged.length; i++) {
-      const m = merged[i];
-      if (m.kind === "tool" && m.status === "running" && m._toolCallId) {
-        activeToolCards.set(m._toolCallId, i);
-      }
-    }
-    // A persisted assistant message ended while its end frame was lost.
-    const streamingTs = streamingBubble?.ts;
-    if (streamingTs != null && messages.some(m => m?.role === "assistant" && m.timestamp === streamingTs)) {
-      streamingBubble = null;
-    }
-    state.messages = streamingBubble ? [...merged, streamingBubble] : merged;
-    state.ctx = { ...state.ctx, cacheUsage: CACHE.fromMessages(messages) };
-    if (activeSessionId) {
-      const prior = window.OMP_PROMPT_HISTORY.promptsFromMessages(merged, PROMPT_NORMALIZE);
-      promptHistories.set(activeSessionId, window.OMP_PROMPT_HISTORY.mergeOlder(
-        promptHistories.get(activeSessionId) ?? [], prior, promptHistoryLimit,
-      ));
-    }
-    notify();
-  }
 
   // ── RPC response handler ──────────────────────────────────────────────────
   function _handleResponse(resp) {
@@ -2367,6 +2575,7 @@
     // treated as the ordinary, uncorrelated transcript refresh on replay.
     if (resp.command === "get_messages" && typeof resp.id === "string" && resp.id.startsWith("live-history-")) return;
     if (resp.command === "get_state" && typeof resp.id === "string" && resp.id.startsWith("context-state-")) return;
+    if (resp.command === "get_state" && typeof resp.id === "string" && resp.id.startsWith("conversation-state-")) return;
     // Compact — handle success and failure both (must come before early-return below)
     if (resp.command === "compact") {
       let idx = -1;
@@ -2376,11 +2585,12 @@
       if (idx !== -1) {
         const d = resp.data ?? {};
         const update = resp.success
-          ? { status: "done", shortSummary: d.shortSummary || null, summary: d.summary || null, tokensBefore: d.tokensBefore }
+          ? { status: "done", shortSummary: d.shortSummary || null, summary: d.summary || null, tokensBefore: d.tokensBefore, firstKeptEntryId: d.firstKeptEntryId ?? null }
           : { status: "error" };
         state.messages = state.messages.map((m, i) => i === idx ? { ...m, ...update } : m);
       }
       _invalidateContext(null, false);
+      _historyRead = null;
       _send({ type: "get_state" });
       void _agentContextSync().loadMain().catch(() => {});
       notify();
@@ -2414,7 +2624,8 @@
       void _applyApprovalModes();
 
     } else if (command === "get_messages") {
-      _applyMessages(data.messages ?? []);
+      _mergeMessages(Array.isArray(data.messages) ? data.messages : []);
+      notify();
 
     } else if (command === "get_available_models") {
       state.models = (data.models ?? []).map(m => ({
@@ -2579,6 +2790,32 @@
 
     if (type === "available_commands_update") {
       _applyCommands(ev.commands);
+      return;
+    }
+
+    if (type === "auto_compaction_start") {
+      if (!state.messages.some(m => m.kind === "compact" && m.status === "pending")) {
+        state.messages = [...state.messages, { kind: "compact", status: "pending", time, automatic: true }];
+      }
+      notify();
+      return;
+    }
+    if (type === "auto_compaction_end") {
+      const idx = state.messages.findLastIndex(m => m.kind === "compact" && m.status === "pending");
+      if (ev.skipped) {
+        if (idx !== -1) state.messages = state.messages.filter((_, i) => i !== idx);
+      } else {
+        const result = ev.result;
+        const row = { kind: "compact", time, automatic: true,
+          status: result ? "done" : "error", summary: result?.summary || "",
+          shortSummary: result?.shortSummary || (ev.aborted ? "compaction cancelled" : ev.errorMessage || null),
+          tokensBefore: result?.tokensBefore ?? null, firstKeptEntryId: result?.firstKeptEntryId ?? null };
+        if (idx !== -1) state.messages = state.messages.map((m, i) => i === idx ? { ...m, ...row } : m);
+        else if (result) state.messages = [...state.messages, row];
+      }
+      _historyRead = null;
+      _send({ type: "get_state" });
+      notify();
       return;
     }
 
@@ -2990,6 +3227,7 @@
         const pendingFailure = TURN.failureOf(msg);
         const completed = {
           ...streamingBubble,
+          stopReason: msg.stopReason,
           streaming: false, thought,
           lead:   thought ? "thinking" : null,
           blocks: designBlocks.length > 0 ? designBlocks : streamingBubble.blocks,
@@ -3133,14 +3371,12 @@
     // Nothing can wake the session any more: no run, nothing queued, and no
     // background job left whose result would start one.
     if (type === "session_settled") {
-      if (state.asyncPending) {
-        state.asyncPending = false;
-        notify();
-      }
-      // The agent_end snapshot can still be busy while omp finishes its
-      // run. Recheck at quiescence so the first title is not left waiting
-      // for another user prompt or tab switch.
+      state.asyncPending = false;
+      if (state.rpcState) state.rpcState = { ...state.rpcState, isSettled: true };
+      _historyRead = null;
       _send({ type: "get_state" });
+      notify();
+      void _refreshConversationHistory();
       return;
     }
 
@@ -3328,6 +3564,7 @@
 
     _refreshCtx();
     notify();
+    void _refreshConversationHistory();
   }
 
   function _refreshCtx() {
@@ -3404,7 +3641,10 @@
         request.then(data => {
           if (!data || _switchGen !== gen || sessionContext !== conversation) return;
           const messages = window.OMP_TRANSCRIPT.messagesFromEntries(data);
-          if (messages) _applyMessages(messages);
+          if (messages) {
+            _mergeMessages(messages);
+            notify();
+          }
           if (conversation.askRecoveryRequest !== request) return;
           if (file && window.OMP_ASK_RECOVERY) {
             state.askRecovery = window.OMP_ASK_RECOVERY.fromEntries(data, file);
@@ -3440,6 +3680,10 @@
   // The `send_command` hand-off to the active tab, shared by `_send` and
   // `_sendWithResponse`; callers check the connection and handle failure.
   function _invokeSend(cmd) {
+    const scratchId = sessionRegistry.get(activeSessionId)?.scratchId;
+    if (scratchId && _scratchOperations.has(scratchId) && ["prompt", "steer", "follow_up", "new_session"].includes(cmd.type)) {
+      return Promise.reject(new Error("Chat workspace is being managed"));
+    }
     return window.__TAURI__.core
       .invoke("send_command", { sessionId: activeSessionId, json: JSON.stringify(cmd) });
   }
@@ -3835,7 +4079,7 @@
    *  an exchange the tab already ran, and the `lastTurnOk` gate keeps a
    *  branch/fork of a failed turn from spending the auto-rename. */
   function _resetForNewFile() {
-    _reloadConversation(() => ({ sessionFile: null, autoRenameSessionId: null, autoRenameInFlight: false }), true);
+    _reloadConversation(() => ({ sessionFile: null, fork: null, autoRenameSessionId: null, autoRenameInFlight: false }), true);
   }
 
   /** `branch` / `fork` (`send` runs the RPC); `_handleResponse` has already
@@ -3843,16 +4087,31 @@
    *  Refused here while the tab streams (omp would run it, but the
    *  transcript is mid-turn); omp's own refusals (`session_busy`) arrive as
    *  the rejection's message. `text` is the branched prompt (empty for a fork). */
-  async function _moveToNewFile(send) {
-    if (state.isStreaming) return { ok: false, error: "Wait for the current turn to finish." };
-    let data;
+  async function _moveToNewFile(send, entryId) {
+    if (!activeSessionId) return { ok: false, error: "No conversation is open." };
+    if (_conversationBusy()) return { ok: false, error: "Wait for the conversation to finish its current work." };
+    const id = activeSessionId;
+    const file = sessionRegistry.get(id)?.sessionFile;
+    const gen = _switchGen;
+    const images = entryId ? state.messages.find(m => m.entryId === entryId)?.images ?? [] : [];
+    _movingConversations.add(id);
+    notify();
     try {
-      data = await send();
+      // Branch can discard admitted work; unlike fork it has no native idle
+      // precondition. Re-read omp after admission, with submission disabled.
+      const rpc = await _sendWithResponse({ type: "get_state" }, QUICK_CMD_TIMEOUT_MS, "conversation-state-");
+      if (activeSessionId !== id || _switchGen !== gen || sessionRegistry.get(id)?.sessionFile !== file) return { ok: false, cancelled: true };
+      if (!rpc || _rpcConversationBusy(rpc)) return { ok: false, error: "Wait for the conversation to finish its current work." };
+      const data = await send();
+      if (data?.cancelled) return { ok: false, cancelled: true };
+      if (!sessionRegistry.has(id)) return { ok: false, cancelled: true };
+      return { ok: true, text: String(data?.text ?? ""), images, sessionId: id };
     } catch (e) {
       return { ok: false, error: String(e?.message ?? e) };
+    } finally {
+      _movingConversations.delete(id);
+      notify();
     }
-    if (data?.cancelled) return { ok: false, cancelled: true };
-    return { ok: true, text: String(data?.text ?? "") };
   }
 
   /** `OMP_BRIDGE.send`: the user bubble at once, then `prompt`. A
@@ -5392,6 +5651,37 @@
       return true;
     },
 
+    async openChat(profile = _activeProfileId()) {
+      if (!window.__TAURI__) throw new Error("New chats require the desktop app");
+      const row = await window.__TAURI__.core.invoke("scratch_create", { profile });
+      return _openReported(row.path, { profile, scratchId: row.id, name: "New chat" });
+    },
+
+    async listChats() {
+      if (!window.__TAURI__) return [];
+      await _scratchWrites;
+      return window.__TAURI__.core.invoke("scratch_list", { profile: _activeProfileId() });
+    },
+
+    async openScratchChat(row) {
+      return _openReported("", {
+        profile: row.profile || DEFAULT_PROFILE_ID, scratchId: row.id,
+        name: row.name || null, resume: row.sessionFile || null,
+      });
+    },
+
+    scratchFiles(id) { return window.__TAURI__.core.invoke("scratch_files", { id }); },
+    scratchUsage(id) { return window.__TAURI__.core.invoke("scratch_usage", { id }); },
+    exportScratchFile(id, path) { return window.__TAURI__.core.invoke("scratch_export", { id, path }); },
+
+    async promoteChat(id) {
+      return _manageScratch(id, true);
+    },
+
+    async deleteChat(id) {
+      await _manageScratch(id, false);
+    },
+
     /** Open project folder `path` (a recent-projects row) under the active
      *  profile: focus an open tab on it when there is one — the active tab
      *  if it qualifies, else the newest — and spawn a tab only otherwise.
@@ -5504,29 +5794,28 @@
         await window.OMP_BRIDGE.activateSession(open);
         return open;
       }
-      const workspaceBinding = await _recoverWorkspaceBinding(
-        session.cwd || "",
-        profile,
-      );
-      // Metadata recovery yields, so another resume may have registered this file.
-      const resumed = window.OMP_PROJECT_NAV.findConversationTab(
-        [...sessionRegistry.values()],
-        session.path,
-        profile,
-      );
-      if (resumed) {
-        await window.OMP_BRIDGE.activateSession(resumed);
-        return resumed;
-      }
-      const generated =
-        workspaceBinding?.worktree &&
-        session.title === _tabNameFor(session.cwd, "");
-      return _openReported(session.cwd || "", {
-        resume: session.path,
-        name: generated ? null : session.title,
-        profile,
-        workspaceBinding,
-      });
+      const key = `${profile}|${session.path}`;
+      if (_historyOpenings.has(key)) return _historyOpenings.get(key);
+      const opening = (async () => {
+        const chat = await window.__TAURI__.core.invoke("scratch_restore_history", { sessionFile: session.path, profile });
+        if (chat) return window.OMP_BRIDGE.openScratchChat({ ...chat, profile });
+        const workspaceBinding = await _recoverWorkspaceBinding(session.cwd || "", profile);
+        const resumed = window.OMP_PROJECT_NAV.findConversationTab(
+          [...sessionRegistry.values()], session.path, profile,
+        );
+        if (resumed) {
+          await window.OMP_BRIDGE.activateSession(resumed);
+          return resumed;
+        }
+        const generated = workspaceBinding?.worktree && session.title === _tabNameFor(session.cwd, "");
+        return _openReported(session.cwd || "", {
+          resume: session.path, name: generated ? null : session.title,
+          profile, workspaceBinding,
+        });
+      })();
+      _historyOpenings.set(key, opening);
+      try { return await opening; }
+      finally { _historyOpenings.delete(key); }
     },
 
     // ── Conversation tree (prompt-cache navigator) ───────────────────────────
@@ -5539,14 +5828,15 @@
     conversationTree(sessionFile, profile) {
       return _invokeResult("conversation_tree", { sessionFile, profile });
     },
+    refreshConversationHistory() {
+      return _refreshConversationHistory(true);
+    },
     /** Re-ask a user prompt of this tab's file: omp copies the path before it
      *  into a new session file and the process moves there. Resolves to
-     *  `{ok: true, text}` (the prompt, for the composer),
+     *  `{ok: true, text, images, sessionId}` (draft belongs to that tab),
      *  `{ok: false, cancelled: true}` or `{ok: false, error}`. */
     branchAt(entryId) {
-      return _moveToNewFile(() =>
-        _sendWithResponse({ type: "branch", entryId }),
-      );
+      return _moveToNewFile(() => _sendWithResponse({ type: "branch", entryId }), entryId);
     },
     /** Continue after a message (a turn's last reply): same move as
      *  `branchAt`, nothing to re-ask. omp refuses (`session_busy`) unless idle. */
@@ -5648,11 +5938,8 @@
         console.warn(`[live] ${error} — ignoring switch`);
         return { ok: false, error };
       }
-      return _respawnSession(id, {
-        profile: profileId,
-        resume: null,
-        fresh: true,
-      });
+      if (entry.scratchId) return _switchScratchProfile(entry, profileId);
+      return _respawnSession(id, { profile: profileId, resume: null, fresh: true });
     },
 
     // ── Tool approval mode (app/approval-mode.js, approval_mode.rs) ─────────
@@ -5701,6 +5988,8 @@
           }
           if (!sessionRegistry.has(id)) return false;
         }
+        const entry = sessionRegistry.get(id);
+        if (entry?.scratchId) await _persistScratch(entry);
         const closed = await _closeTab(id, {
           worktreeAction, sessionFile: sessionRegistry.get(id)?.sessionFile ?? null,
         });

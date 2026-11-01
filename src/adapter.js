@@ -481,10 +481,9 @@
   }
 
   // ── AgentMessage[] (model context or saved branch) → design messages ─────
-  // Rebuild completed tools with the live card builders. Calls establish order
-  // and arguments; results carry the persisted output and failure verdict.
-  // Bubbles match by timestamp, tools by call id (app/transcript-merge.js).
-  function adaptAgentMessages(apiMessages) {
+  // Raw context restores complete tool cards; saved history contains metadata
+  // only. Bubbles match by timestamp, tools by call id.
+  function adaptAgentMessages(apiMessages, { savedHistory = false } = {}) {
     const result = [];
     const messages = Array.isArray(apiMessages) ? apiMessages : [];
     const failures = window.OMP_TURN_STATUS.finalFailures(messages);
@@ -516,11 +515,13 @@
       const time   = _formatTime(msg.timestamp ?? msg.createdAt);
       const ts     = window.OMP_TRANSCRIPT.tsOf(msg);
       const blocks = Array.isArray(content) ? content : [{ type: "text", text: String(content ?? "") }];
+      const saved = typeof msg.entryId === "string" && msg.entryId ? { entryId: msg.entryId } : {};
 
       if (role === "user") {
         const { text, images } = adaptUserContent(blocks);
         if (!text && images.length === 0) continue;  // skip pure tool-result turns
-        result.push({ kind: "user", time, ts, text, images });
+        result.push({ kind: "user", time, ts, text, images, ...saved,
+          ...(msg.attribution === "agent" || msg.synthetic ? { agent: true } : {}) });
 
       } else if (role === "assistant") {
         let thought = null;
@@ -552,17 +553,33 @@
             streaming: false,
             tokens, tokensIn, tokensOut,
             ...(cacheUsage ? { cacheUsage } : {}),
+            ...saved,
+            ...(msg.stopReason ? { stopReason: msg.stopReason } : {}),
             ...(failure ? { failure } : {}),
           });
         }
         for (const block of blocks) {
-          if (block?.type === "toolCall" && typeof block.id === "string") {
+          if (block?.type !== "toolCall" || typeof block.id !== "string") continue;
+          if (savedHistory) {
+            const { _startMs, ...card } = buildToolStartCard({
+              toolName: block.name, toolCallId: block.id, args: block.arguments, intent: block.intent,
+            }, time);
+            const recorded = results.get(block.id);
+            result.push({ ...card, status: recorded ? "recorded" : "unknown",
+              historyOmittedOutput: true, ...(recorded ? { isError: recorded.isError === true } : {}) });
+          } else {
             restoreTool(block, results.get(block.id), time);
           }
         }
-      } else if (role === "toolResult" && typeof msg.toolCallId === "string" && typeof msg.toolName === "string") {
+      } else if (!savedHistory && role === "toolResult" && typeof msg.toolCallId === "string" && typeof msg.toolName === "string") {
         // A provider-filtered history can retain a result without its call.
         restoreTool(null, msg, time);
+      } else if (role === "compactionSummary" && savedHistory) {
+        // Only the journal supplies a boundary at its actual position.
+        result.push({ kind: "compact", status: "done", time, ...saved,
+          summary: typeof msg.summary === "string" ? msg.summary : "",
+          shortSummary: msg.shortSummary || null, tokensBefore: msg.tokensBefore ?? null,
+          firstKeptEntryId: msg.firstKeptEntryId ?? null });
       }
     }
     return result;

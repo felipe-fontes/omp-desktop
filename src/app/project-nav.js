@@ -101,6 +101,7 @@
   }
 
   function groupKey(tab) {
+    if (tab.scratchId) return `chat:${tab.scratchId}`;
     const path = projectPath(tab);
     return path ? `${tab.profile}|${normPath(path)}` : `tab:${tab.id}`;
   }
@@ -116,9 +117,9 @@
       if (!group) {
         group = {
           key,
-          path: path || null,
+          path: tab.scratchId ? null : path || null,
           profile: tab.profile,
-          name: path ? basename(path) : tab.name,
+          name: tab.scratchId ? tab.name : path ? basename(path) : tab.name,
           tabs: [],
         };
         groups.set(key, group);
@@ -223,9 +224,9 @@
 
   /** Label of a tab shown on its own, not inside a group (#46). */
   function tabLabel(tab) {
-    const folder = projectPath(tab) ? basename(projectPath(tab)) : "";
+    const folder = !tab.scratchId && projectPath(tab) ? basename(projectPath(tab)) : "";
     const generated = tab.path && (tab.name === basename(tab.path) || tab.name === folder);
-    const title = generated || (!tab.name && folder) ? folder : tab.name;
+    const title = generated && folder || (!tab.name && folder) ? folder : tab.name;
     return { prefix: folder && folder !== title ? folder : null, title };
   }
 
@@ -236,9 +237,9 @@
     const want = normPath(path);
     const normalized = normalizeWorkspaces(tabs);
     const sourceMatches = normalized.filter(t =>
-      projectPath(t) && t.profile === profile && normPath(projectPath(t)) === want);
+      !t.scratchId && projectPath(t) && t.profile === profile && normPath(projectPath(t)) === want);
     const matches = sourceMatches.length ? sourceMatches : normalized.filter(t =>
-      t.path && t.profile === profile && normPath(t.path) === want);
+      !t.scratchId && t.path && t.profile === profile && normPath(t.path) === want);
     if (!matches.length) return null;
     return matches.some(t => t.id === activeId) ? activeId : matches[matches.length - 1].id;
   }
@@ -256,7 +257,7 @@
   function recentRows(recents, tabs, profile) {
     const open = new Set();
     for (const tab of normalizeWorkspaces(tabs)) {
-      if (tab.profile !== profile) continue;
+      if (tab.scratchId || tab.profile !== profile) continue;
       if (projectPath(tab)) open.add(normPath(projectPath(tab)));
       if (tab.path) open.add(normPath(tab.path));
     }
@@ -306,6 +307,7 @@
         sessionFile: t.sessionFile || null,
         name: t.name || null,
         ...(t.workspace ? { workspace: t.workspace } : {}),
+        ...(t.scratchId ? { scratchId: t.scratchId } : {}),
       })),
       active: active < 0 ? null : active,
     };
@@ -321,11 +323,12 @@
     return {
       cwd: tab.path || "",
       resume,
-      name: (resume && tab.name) || null,
+      name: ((resume || tab.scratchId) && tab.name) || null,
       // No saved profile is the built-in one: the tab must record the
       // profile its process actually runs under.
       profile: tab.profile || DEFAULT_PROFILE_ID,
       ...(tab.workspace ? { workspaceBinding: tab.workspace } : {}),
+      ...(tab.scratchId ? { scratchId: tab.scratchId } : {}),
     };
   }
 

@@ -16,7 +16,9 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("omp_tree_{name}_{nanos}"));
+        let root = std::env::temp_dir()
+            .join(format!("omp_tree_{name}_{nanos}"))
+            .join("sessions");
         let dir = root.join("--work-proj--");
         fs::create_dir_all(&dir).unwrap();
         Self { root, dir }
@@ -48,7 +50,7 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
+        let _ = fs::remove_dir_all(self.root.parent().unwrap());
     }
 }
 
@@ -558,7 +560,7 @@ fn renamed_with(id: &str, title: &str) -> Value {
 }
 
 #[test]
-fn only_existing_jsonl_files_under_the_root_are_accepted() {
+fn jsonl_paths_stay_confined_to_the_sessions_root() {
     let fx = Fixture::new("validate");
     let good = fx.put(
         "s.jsonl",
@@ -589,7 +591,9 @@ fn only_existing_jsonl_files_under_the_root_are_accepted() {
         .dir
         .join("..")
         .join("..")
-        .join(elsewhere.root.file_name().unwrap())
+        .join("..")
+        .join(elsewhere.root.parent().unwrap().file_name().unwrap())
+        .join("sessions")
         .join("--work-proj--")
         .join("o.jsonl");
     assert!(build(&fx.root, &sneaky).unwrap_err().contains("outside"));
@@ -598,13 +602,7 @@ fn only_existing_jsonl_files_under_the_root_are_accepted() {
     assert!(build(&fx.root, &unwritten_outside)
         .unwrap_err()
         .contains("outside"));
-    let unwritten_sneaky = fx
-        .dir
-        .join("..")
-        .join("..")
-        .join(elsewhere.root.file_name().unwrap())
-        .join("--work-proj--")
-        .join("fresh.jsonl");
+    let unwritten_sneaky = sneaky.with_file_name("fresh.jsonl");
     assert!(build(&fx.root, &unwritten_sneaky)
         .unwrap_err()
         .contains("outside"));
@@ -728,4 +726,468 @@ fn serialises_the_contract_field_names() {
     assert_eq!(value["entries"][0]["kind"], "user");
     assert_eq!(value["entries"][0]["ts"], 1);
     assert_eq!(value["entries"][1]["parentId"], "u1");
+}
+
+#[test]
+fn history_returns_active_chain_across_compactions_and_tool_calls() {
+    let fx = Fixture::new("history_chain");
+    let mut reply = assistant("a1", Some("u1"), "answer", 2);
+    reply["message"]["content"] = json!([
+        {"type":"thinking","thinking":"reasoning"},
+        {"type":"toolCall","id":"call-1","name":"read","arguments":{"path":"x","api_key":"secret"}},
+        {"type":"text","text":"answer"}
+    ]);
+    reply["message"]["headers"] = json!({"Authorization":"secret"});
+    let tool = json!({"type":"message","id":"t1","parentId":"a1",
+        "message":{"role":"toolResult","toolCallId":"call-1","toolName":"read",
+            "isError":true,"timestamp":3,"content":[{"type":"text","text":"X".repeat(200_000)}],
+            "details":{"accessToken":"secret"}}});
+    let compact = json!({"type":"compaction","id":"k1","parentId":"t1",
+        "timestamp":"1970-01-01T00:00:01.123Z","summary":"older context",
+        "tokensBefore":1234,"firstKeptEntryId":"a1"});
+    let failed = json!({"type":"compaction","id":"bad","parentId":"k1",
+        "timestamp":"1970-01-01T00:00:02.000Z","summary":"not saved","success":false});
+    let file = fx.put(
+        "current.jsonl",
+        &with_header(
+            None,
+            vec![
+                user("u1", None, "early prompt", 1),
+                reply,
+                tool,
+                compact,
+                failed,
+                user("abandoned", Some("bad"), "abandoned branch", 4),
+                assistant("abandoned-reply", Some("abandoned"), "old answer", 5),
+                user("u2", Some("bad"), "current prompt", 6),
+                assistant("a2", Some("u2"), "current answer", 7),
+                other("custom", "last", Some("a2")),
+            ],
+        ),
+    );
+    let result = serde_json::to_value(history::build(&fx.root, &file).unwrap()).unwrap();
+    assert_eq!(result["fork"], Value::Null);
+    let messages = result["messages"].as_array().unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .map(|m| m["entryId"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["u1", "a1", "t1", "k1", "u2", "a2"]
+    );
+    assert_eq!(messages[0]["content"][0]["text"], "early prompt");
+    assert_eq!(messages[1]["content"][0]["thinking"], "reasoning");
+    assert_eq!(messages[1]["content"][1]["arguments"]["path"], "x");
+    assert_eq!(
+        messages[1]["content"][1]["arguments"]["api_key"],
+        "[REDACTED]"
+    );
+    assert_eq!(messages[1]["headers"], "[REDACTED]");
+    assert_eq!(
+        messages[2],
+        json!({"role":"toolResult","entryId":"t1",
+        "toolCallId":"call-1","toolName":"read","isError":true,"timestamp":3,
+        "historyOmittedOutput":true})
+    );
+    assert_eq!(
+        messages[3],
+        json!({"role":"compactionSummary","entryId":"k1",
+        "timestamp":"1970-01-01T00:00:01.123Z","summary":"older context","tokensBefore":1234,
+        "firstKeptEntryId":"a1"})
+    );
+    assert!(!result.to_string().contains(&"X".repeat(1000)));
+    assert!(!result.to_string().contains("secret"));
+}
+
+#[test]
+fn history_retains_early_messages_in_a_long_compacted_session() {
+    let fx = Fixture::new("history_long");
+    let mut entries = Vec::new();
+    let mut parent: Option<String> = None;
+    for n in 0..1_200 {
+        let u = format!("u{n}");
+        let a = format!("a{n}");
+        entries.push(user(&u, parent.as_deref(), &format!("prompt {n}"), n));
+        entries.push(assistant(&a, Some(&u), &format!("answer {n}"), n));
+        parent = Some(a);
+    }
+    entries.push(json!({"type":"compaction","id":"compact","parentId":parent,
+        "timestamp":"1970-01-01T00:00:00Z","summary":"summary","tokensBefore":123}));
+    entries.push(user("new", Some("compact"), "after compaction", 1201));
+    let file = fx.put("long.jsonl", &with_header(None, entries));
+    let messages = history::build(&fx.root, &file).unwrap().messages;
+    assert_eq!(messages.len(), 2402);
+    assert_eq!(messages[0]["entryId"], "u0");
+    assert_eq!(messages[1]["entryId"], "a0");
+    assert_eq!(messages[2400]["entryId"], "compact");
+    assert_eq!(messages[2400]["timestamp"], "1970-01-01T00:00:00Z");
+    assert_eq!(messages[2401]["entryId"], "new");
+}
+
+#[test]
+fn history_handles_lazy_files_partial_lines_and_missing_parents() {
+    let fx = Fixture::new("history_missing");
+    let empty =
+        serde_json::to_value(history::build(&fx.root, &fx.path("new.jsonl")).unwrap()).unwrap();
+    assert_eq!(empty, json!({"messages":[],"fork":null}));
+
+    let prefix = with_header(None, vec![user("u1", None, "kept", 1)])
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let file = fx.put_raw(
+        "partial.jsonl",
+        &format!("{prefix}\n{{\"type\":\"message\",\"id\":\"unwritten\""),
+    );
+    let history = history::build(&fx.root, &file).unwrap();
+    assert_eq!(history.messages.len(), 1);
+    assert_eq!(history.messages[0]["entryId"], "u1");
+
+    let broken = fx.put(
+        "broken.jsonl",
+        &with_header(None, vec![user("u2", Some("lost"), "x", 2)]),
+    );
+    assert!(history::build(&fx.root, &broken)
+        .unwrap_err()
+        .contains("parent entry lost is missing"));
+    let duplicate = fx.put(
+        "duplicate.jsonl",
+        &with_header(
+            None,
+            vec![user("u1", None, "first", 1), user("u1", None, "second", 2)],
+        ),
+    );
+    assert!(history::build(&fx.root, &duplicate)
+        .unwrap_err()
+        .contains("duplicate"));
+}
+
+#[test]
+fn history_fork_number_is_the_stable_complete_family_order() {
+    let fx = Fixture::new("history_forks");
+    let root = fx.put(
+        "f00.jsonl",
+        &with_header(None, vec![user("u0", None, "root", 1)]),
+    );
+    let mut children = Vec::new();
+    for n in 1..=35 {
+        let name = format!("f{n:02}.jsonl");
+        let parent = children.last().unwrap_or(&root);
+        let file = fx.put(
+            &name,
+            &with_header(Some(parent), vec![user("u0", None, "root", 1)]),
+        );
+        children.push(file);
+    }
+    let first = serde_json::to_value(history::build(&fx.root, &children[0]).unwrap()).unwrap();
+    let last = serde_json::to_value(history::build(&fx.root, &children[34]).unwrap()).unwrap();
+    assert_eq!(
+        first["fork"],
+        json!({"number":1,"parentSession":root.to_string_lossy()})
+    );
+    assert_eq!(
+        last["fork"],
+        json!({"number":35,"parentSession":children[33].to_string_lossy()})
+    );
+    assert!(history::build(&fx.root, &root).unwrap().fork.is_none());
+    fx.put("unrelated.jsonl", &with_header(None, vec![]));
+    assert_eq!(
+        history::build(&fx.root, &children[34])
+            .unwrap()
+            .fork
+            .unwrap()
+            .number,
+        35
+    );
+}
+
+#[test]
+fn history_preserves_bare_parent_session_ids() {
+    let fx = Fixture::new("history_bare_parent");
+    fx.put(
+        "f00.jsonl",
+        &[
+            json!({"type":"session","id":"root-id"}),
+            user("u1", None, "root", 1),
+        ],
+    );
+    let one = fx.put(
+        "f01.jsonl",
+        &[
+            json!({"type":"session","id":"fork-one","parentSession":"root-id"}),
+            user("u1", None, "root", 1),
+        ],
+    );
+    let two = fx.put(
+        "f02.jsonl",
+        &[
+            json!({"type":"session","id":"fork-two","parentSession":"root-id"}),
+            user("u1", None, "root", 1),
+        ],
+    );
+    let first = serde_json::to_value(history::build(&fx.root, &one).unwrap()).unwrap();
+    let second = serde_json::to_value(history::build(&fx.root, &two).unwrap()).unwrap();
+    assert_eq!(first["fork"], json!({"number":1,"parentSession":"root-id"}));
+    assert_eq!(
+        second["fork"],
+        json!({"number":2,"parentSession":"root-id"})
+    );
+}
+
+#[test]
+fn history_rejects_outside_files_and_oversized_lines() {
+    let fx = Fixture::new("history_security");
+    let elsewhere = Fixture::new("history_elsewhere");
+    let outside = elsewhere.put("other.jsonl", &with_header(None, vec![]));
+    assert!(history::build(&fx.root, &outside)
+        .unwrap_err()
+        .contains("outside"));
+    assert!(history::build(&fx.root, &elsewhere.path("new.jsonl"))
+        .unwrap_err()
+        .contains("outside"));
+    assert!(history::build(&fx.root, &fx.path("new.txt"))
+        .unwrap_err()
+        .contains(".jsonl"));
+
+    let large = fx.put_raw("huge.jsonl", &"x".repeat(16 * 1024 * 1024 + 1));
+    assert!(history::build(&fx.root, &large)
+        .unwrap_err()
+        .contains("line exceeds"));
+
+    let large_metadata = fx.put(
+        "large-metadata.jsonl",
+        &with_header(
+            None,
+            vec![
+                json!({"type":"message","id":"tool","parentId":null,"message":{
+            "role":"toolResult","toolCallId":"a".repeat(16 * 1024 + 1),
+            "toolName":"read","isError":false}}),
+            ],
+        ),
+    );
+    assert!(history::build(&fx.root, &large_metadata)
+        .unwrap_err()
+        .contains("metadata exceeds"));
+}
+
+#[cfg(unix)]
+#[test]
+fn history_rejects_escaping_and_dangling_symlinks() {
+    use std::os::unix::fs::symlink;
+    let fx = Fixture::new("history_links");
+    let elsewhere = Fixture::new("history_link_target");
+    let outside = elsewhere.put("other.jsonl", &with_header(None, vec![]));
+    let escaping = fx.path("escaping.jsonl");
+    symlink(outside, &escaping).unwrap();
+    assert!(history::build(&fx.root, &escaping)
+        .unwrap_err()
+        .contains("outside"));
+    let dangling = fx.path("dangling.jsonl");
+    symlink(fx.path("missing.jsonl"), &dangling).unwrap();
+    assert!(history::build(&fx.root, &dangling)
+        .unwrap_err()
+        .contains("dangling"));
+}
+
+#[test]
+fn history_replays_captured_leaf_and_ignores_late_off_branch_records() {
+    let fx = Fixture::new("captured_leaf");
+    let early = user("root", None, "root", 1);
+    let old = user("old", Some("root"), "abandoned", 2);
+    let current = user("current", Some("root"), "current", 3);
+    let mut late = other("model_usage", "late", Some("old"));
+    late["activeLeafId"] = json!("current");
+    let file = fx.put(
+        "valid.jsonl",
+        &with_header(
+            None,
+            vec![early.clone(), old.clone(), current.clone(), late.clone()],
+        ),
+    );
+    let history = history::build(&fx.root, &file).unwrap();
+    assert_eq!(
+        history
+            .messages
+            .iter()
+            .map(|m| m["entryId"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["root", "current"]
+    );
+
+    late["activeLeafId"] = Value::Null;
+    let file = fx.put(
+        "clear.jsonl",
+        &with_header(None, vec![early.clone(), current.clone(), late.clone()]),
+    );
+    let messages = history::build(&fx.root, &file).unwrap().messages;
+    assert!(
+        messages.is_empty(),
+        "expected cleared history, got {messages:?}"
+    );
+
+    late["activeLeafId"] = json!("missing");
+    let mut intervening = other("custom", "offbranch", Some("old"));
+    intervening["activeLeafId"] = json!("root");
+    let file = fx.put(
+        "dangling.jsonl",
+        &with_header(None, vec![early, old, current, intervening, late]),
+    );
+    let history = history::build(&fx.root, &file).unwrap();
+    assert_eq!(
+        history
+            .messages
+            .iter()
+            .map(|m| m["entryId"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["root", "current"]
+    );
+}
+
+fn history_blob(fx: &Fixture, bytes: &[u8]) -> String {
+    let hash = crate::json_store::hex_sha256(bytes);
+    let dir = fx.root.parent().unwrap().join("blobs");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(&hash), bytes).unwrap();
+    format!("blob:sha256:{hash}")
+}
+
+fn image_message(id: &str, parent: Option<&str>, reference: &str) -> Value {
+    let mut entry = user(id, parent, "image", 1);
+    entry["message"]["content"] = json!([{"type":"image","data":reference,"mimeType":"image/png"}]);
+    entry
+}
+
+#[test]
+fn history_hydrates_native_images_and_provider_data_urls_without_mutation() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let fx = Fixture::new("history_blobs");
+    let bytes = b"\x89PNG\r\n\x1a\nactual image bytes";
+    let url = "data:image/png;base64,iVBORw0KGgo=";
+    let reference = history_blob(&fx, bytes);
+    let url_ref = history_blob(&fx, url.as_bytes());
+    let mut reply = assistant("answer", Some("image"), "done", 2);
+    reply["message"]["content"] = json!([{"type":"image","data":reference,"mimeType":"image/png"},
+        {"type":"input_image","image_url":url_ref}]);
+    let entries = with_header(None, vec![image_message("image", None, &reference), reply]);
+    let file = fx.put("images.jsonl", &entries);
+    let before = fs::read(&file).unwrap();
+    let messages = history::build(&fx.root, &file).unwrap().messages;
+    assert_eq!(messages[0]["content"][0]["data"], STANDARD.encode(bytes));
+    assert_eq!(messages[1]["content"][0]["data"], STANDARD.encode(bytes));
+    assert_eq!(messages[1]["content"][1]["image_url"], url);
+    assert_eq!(fs::read(&file).unwrap(), before);
+    assert_eq!(
+        fs::read(
+            fx.root
+                .parent()
+                .unwrap()
+                .join("blobs")
+                .join(reference.strip_prefix("blob:sha256:").unwrap())
+        )
+        .unwrap(),
+        bytes
+    );
+}
+
+#[test]
+fn history_reports_missing_invalid_corrupt_and_oversized_images() {
+    let fx = Fixture::new("history_bad_blobs");
+    let missing = format!("blob:sha256:{}", "a".repeat(64));
+    let file = fx.put(
+        "missing.jsonl",
+        &with_header(None, vec![image_message("i", None, &missing)]),
+    );
+    assert!(history::build(&fx.root, &file)
+        .unwrap_err()
+        .contains("blob"));
+    let invalid = format!("blob:sha256:{}", "A".repeat(64));
+    let file = fx.put(
+        "invalid.jsonl",
+        &with_header(None, vec![image_message("i", None, &invalid)]),
+    );
+    assert!(history::build(&fx.root, &file)
+        .unwrap_err()
+        .contains("lowercase SHA-256"));
+    let blob_dir = fx.root.parent().unwrap().join("blobs");
+    fs::create_dir_all(&blob_dir).unwrap();
+    fs::write(blob_dir.join("a".repeat(64)), b"wrong bytes").unwrap();
+    assert!(history::build(&fx.root, &fx.path("missing.jsonl"))
+        .unwrap_err()
+        .contains("SHA-256"));
+    fs::write(blob_dir.join("a".repeat(64)), vec![0; 8 * 1024 * 1024 + 1]).unwrap();
+    assert!(history::build(&fx.root, &fx.path("missing.jsonl"))
+        .unwrap_err()
+        .contains("exceeds"));
+}
+
+#[test]
+fn history_bounds_hydrated_images_and_skips_unselected_blobs() {
+    let fx = Fixture::new("history_blob_limits");
+    let reference = history_blob(&fx, &vec![7; 8 * 1024 * 1024]);
+    let mut oversized = user("i", None, "images", 1);
+    oversized["message"]["content"] = Value::Array(
+        (0..6)
+            .map(|_| json!({"type":"image","data":reference,"mimeType":"image/png"}))
+            .collect(),
+    );
+    let file = fx.put("many.jsonl", &with_header(None, vec![oversized]));
+    assert!(history::build(&fx.root, &file)
+        .unwrap_err()
+        .contains("hydrated images exceed"));
+
+    let missing = format!("blob:sha256:{}", "f".repeat(64));
+    let mut late = other("model_usage", "late", Some("abandoned"));
+    late["activeLeafId"] = json!("current");
+    let file = fx.put(
+        "branch.jsonl",
+        &with_header(
+            None,
+            vec![
+                user("root", None, "root", 1),
+                image_message("abandoned", Some("root"), &missing),
+                user("current", Some("root"), "current", 2),
+                late,
+            ],
+        ),
+    );
+    let messages = history::build(&fx.root, &file).unwrap().messages;
+    assert_eq!(
+        messages
+            .iter()
+            .map(|m| m["entryId"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["root", "current"]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn history_rejects_blob_and_store_symlinks() {
+    use std::os::unix::fs::symlink;
+    let fx = Fixture::new("history_blob_links");
+    let other = Fixture::new("history_blob_link_target");
+    let bytes = b"outside";
+    let hash = crate::json_store::hex_sha256(bytes);
+    let outside = other.root.join(&hash);
+    fs::write(&outside, bytes).unwrap();
+    let store = fx.root.parent().unwrap().join("blobs");
+    fs::create_dir_all(&store).unwrap();
+    symlink(&outside, store.join(&hash)).unwrap();
+    let file = fx.put(
+        "link.jsonl",
+        &with_header(
+            None,
+            vec![image_message("i", None, &format!("blob:sha256:{hash}"))],
+        ),
+    );
+    assert!(history::build(&fx.root, &file)
+        .unwrap_err()
+        .contains("blob"));
+    fs::remove_file(store.join(&hash)).unwrap();
+    fs::remove_dir(&store).unwrap();
+    symlink(&other.root, &store).unwrap();
+    assert!(history::build(&fx.root, &file)
+        .unwrap_err()
+        .contains("blob store"));
 }

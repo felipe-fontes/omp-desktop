@@ -134,6 +134,9 @@
        window.OMP_PROJECT_NAV at top level and live.js calls it, so it must
        load before all of them. -->
   <script src="app/project-nav.js"></script>
+  <!-- Full-history navigation and bounded chat pages; the minimap and chat
+       read these pure helpers at load time. -->
+  <script src="app/conversation-navigation.js"></script>
 
   <!-- File preview (issue #39): which file and lines a read card or a chat
        link points at, project confinement, highlighted lines. IIFE that
@@ -355,6 +358,7 @@
        and window.useModalLayer (above). app-live.jsx destructures
        window.FilePreview. -->
   <script type="text/babel" src="design/chat/file-preview.jsx"></script>
+  <script type="text/babel" src="design/chat/message-actions.jsx"></script>
   <script type="text/babel" src="design/chat/user-bubble.jsx"></script>
   <script type="text/babel" src="design/chat/eval-cell.jsx"></script>
   <script type="text/babel" src="design/chat/assistant-bubble.jsx"></script>
@@ -447,6 +451,7 @@
   <!-- Project sidebar (#27); reads window.TabRunDot / window.TabLabel
        (tab-group-chip.jsx) and window.OMP_PROJECT_NAV at top level. -->
   <script type="text/babel" src="design/project-sidebar.jsx"></script>
+  <script type="text/babel" src="design/chat-workspace.jsx"></script>
   <!-- Session column with no tab open; destructures window.MarkdownContent
        and window.OMP_MATRIX at top level. -->
   <script type="text/babel" src="design/empty-workspace.jsx"></script>

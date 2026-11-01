@@ -53,6 +53,9 @@ pub struct OpenTab {
     /// Origin/base metadata is display-only; `path` remains the execution folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<crate::conversation_workspace::WorkspaceBinding>,
+    /// App-private chat workspace identity, absent for ordinary projects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch_id: Option<String>,
 }
 
 /// The persisted layout: tabs in order plus the active tab's index.
@@ -112,7 +115,12 @@ impl OpenTabsStore {
 fn sanitize(mut layout: Layout) -> Layout {
     layout.tabs.truncate(MAX_TABS);
     for tab in &mut layout.tabs {
-        for field in [&mut tab.profile, &mut tab.session_file, &mut tab.name] {
+        for field in [
+            &mut tab.profile,
+            &mut tab.session_file,
+            &mut tab.name,
+            &mut tab.scratch_id,
+        ] {
             if field.as_deref().is_some_and(str::is_empty) {
                 *field = None;
             }
@@ -129,8 +137,9 @@ fn sanitize(mut layout: Layout) -> Layout {
 ///   same folder: the folder is what the user had open.
 /// - A missing folder is retained only when its saved conversation has a
 ///   native recovery point; otherwise it is dropped and listed in `skipped`.
-/// - A pathless tab without a conversation has nothing left to reopen and
-///   is dropped silently.
+/// - Scratch chats are retained by identity even if the saved path is stale;
+///   the caller must resolve that identity against native metadata before use.
+/// - A pathless ordinary tab without a conversation is dropped silently.
 fn restorable(layout: Layout, mut can_restore: impl FnMut(&OpenTab) -> bool) -> Restore {
     let Layout { tabs, active } = sanitize(layout);
     let mut out = Vec::with_capacity(tabs.len());
@@ -144,14 +153,15 @@ fn restorable(layout: Layout, mut can_restore: impl FnMut(&OpenTab) -> bool) -> 
         {
             tab.session_file = None;
         }
-        if !(tab.path.is_empty()
-            || Path::new(&tab.path).is_dir()
-            || tab.session_file.is_some() && can_restore(&tab))
+        if tab.scratch_id.is_none()
+            && !(tab.path.is_empty()
+                || Path::new(&tab.path).is_dir()
+                || tab.session_file.is_some() && can_restore(&tab))
         {
             skipped.push(tab.path);
             continue;
         }
-        if tab.path.is_empty() && tab.session_file.is_none() {
+        if tab.scratch_id.is_none() && tab.path.is_empty() && tab.session_file.is_none() {
             continue;
         }
         if active == Some(i) {
@@ -233,6 +243,7 @@ mod tests {
             session_file: session_file.map(str::to_owned),
             name: Some("label".to_owned()),
             workspace: None,
+            scratch_id: None,
         }
     }
 
@@ -273,6 +284,30 @@ mod tests {
         assert_eq!(restored["tabs"][0]["path"], working);
         assert_eq!(restored["tabs"][0]["workspace"]["projectPath"], origin);
         assert_eq!(restored["active"], 0);
+    }
+
+    #[test]
+    fn scratch_identity_survives_stale_or_empty_saved_paths() {
+        let (store, dir) = scratch_store();
+        let stale = dir.missing("old-chat-path");
+        let mut first = tab(&stale, None);
+        first.scratch_id = Some("chat-a".into());
+        let mut second = tab("", None);
+        second.scratch_id = Some("chat-b".into());
+        store
+            .save(&Layout {
+                tabs: vec![first, second],
+                active: Some(1),
+            })
+            .expect("save");
+
+        let restored = store.load(|_| false);
+        assert_eq!(restored.layout.tabs.len(), 2);
+        assert_eq!(restored.layout.tabs[0].path, stale);
+        assert_eq!(restored.layout.tabs[0].scratch_id.as_deref(), Some("chat-a"));
+        assert_eq!(restored.layout.tabs[1].scratch_id.as_deref(), Some("chat-b"));
+        assert_eq!(restored.layout.active, Some(1));
+        assert!(restored.skipped.is_empty());
     }
 
     #[test]
@@ -450,13 +485,14 @@ mod tests {
                 session_file: Some(String::new()),
                 name: Some(String::new()),
                 workspace: None,
+                scratch_id: Some(String::new()),
             }],
             active: Some(0),
         });
         let t = &got.tabs[0];
         assert_eq!(
-            (&t.profile, &t.session_file, &t.name),
-            (&None, &None, &None)
+            (&t.profile, &t.session_file, &t.name, &t.scratch_id),
+            (&None, &None, &None, &None)
         );
         assert_eq!(got.active, Some(0));
     }

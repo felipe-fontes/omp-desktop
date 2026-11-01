@@ -181,9 +181,6 @@ check("a follow-up stamped before the replies it waited behind keeps omp's order
   // Frames for "second" and "third" were lost; the follow-up's echo and "fourth" replayed.
   const gap = mergeTranscript([liveUser("go", 1), liveBubble("first", 2), liveUser("and then?", 10), liveBubble("fourth", 41)], persisted);
   assert.deepEqual(shape(gap), ["user:go", "assistant:first", "assistant:second", "assistant:third", "user:and then?", "assistant:fourth"]);
-  // Trimmed down to the follow-up: the replies before it stay trimmed.
-  const trimmed = mergeTranscript([liveUser("and then?", 10), liveBubble("fourth", 41)], persisted, { trimmed: true });
-  assert.deepEqual(shape(trimmed), ["user:and then?", "assistant:fourth"]);
 });
 
 check("missed turns go in before a later bubble of a message omp dropped", () => {
@@ -194,12 +191,6 @@ check("missed turns go in before a later bubble of a message omp dropped", () =>
   const merged = mergeTranscript([liveUser("go", 1), liveBubble("first", 2), attempt, liveBubble("retried", 40)], persisted);
   assert.deepEqual(shape(merged), ["user:go", "assistant:first", "assistant:second", "assistant:third", "assistant:", "assistant:retried"]);
   assert.equal(merged[4], attempt);
-});
-
-check("history trimmed off the live transcript is not brought back", () => {
-  const persisted = adapt([userMsg("old", 1), replyMsg("older reply", 2), userMsg("new", 50), replyMsg("reply", 51)]);
-  const merged = mergeTranscript([liveTool(), liveUser("new", 50), liveBubble("reply", 51)], persisted, { trimmed: true });
-  assert.deepEqual(shape(merged), ["tool", "user:new", "assistant:reply"]);
 });
 
 check("a resumed tab's history goes before a prompt sent before it arrived", () => {

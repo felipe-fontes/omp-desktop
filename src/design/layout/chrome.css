@@ -258,6 +258,12 @@
 .tab-prefix { flex: 0 100000 auto; color: var(--fg-4); }
 .tab-sep { flex: none; margin: 0 5px; color: var(--fg-5); }
 .tab-title { flex: 0 1 auto; min-width: 0; }
+.tab-fork {
+  display: inline-flex; align-items: center; gap: 2px; flex: none;
+  margin-left: 5px; color: var(--fg-3); font-family: var(--font-mono);
+  font-size: var(--d-text-xs); font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.tab-group-item > .tab-fork, .psb-main > .tab-fork { margin-left: 0; }
 /* Inline conversation-name editor (#32): tab bar, group popover, sidebar. */
 .rename-field { height: 20px; padding: 0 5px; border-color: var(--accent); }
 /* In the tab bar: same footprint as the .tab-name it replaces. */
@@ -306,6 +312,7 @@
 }
 .tab-add:hover { color: var(--accent); background: var(--bg-hover); }
 .tab-add.on { color: var(--accent); }
+.tab-add:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 
 /* ── Grouped tab chip (#27) ──────────────────────────────────────────── */
 .tab-count {

@@ -40,6 +40,7 @@ mod recent_projects;
 mod redaction;
 mod remote;
 mod saved_sessions;
+mod scratch;
 mod spawn_gate;
 mod stats;
 mod supervisor;
@@ -476,6 +477,19 @@ async fn conversation_tree(
 ) -> Result<conversation_tree::ConversationTree, String> {
     let profile = store.resolve_owned(profile)?;
     off_ipc(move || conversation_tree::load(&app, &session_file, profile.as_deref())).await?
+}
+
+/// Read the active saved parent chain, including pre-compaction messages.
+#[tauri::command]
+async fn conversation_history(
+    session_file: String,
+    profile: Option<String>,
+    store: State<'_, Arc<profiles::ProfileStore>>,
+    app: tauri::AppHandle,
+) -> Result<conversation_tree::ConversationHistory, String> {
+    let profile = store.resolve_owned(profile)?;
+    off_ipc(move || conversation_tree::load_history(&app, &session_file, profile.as_deref()))
+        .await?
 }
 
 /// Kill the omp process for a tab session. Also drops its session-scoped
@@ -1825,7 +1839,20 @@ pub fn run() {
             stop_git_watch,
             open_url_external,
             list_saved_sessions,
+            scratch::scratch_create,
+            scratch::scratch_list,
+            scratch::scratch_for_profile,
+            scratch::scratch_restore_history,
+            scratch::scratch_update,
+            scratch::scratch_files,
+            scratch::scratch_usage,
+            scratch::scratch_export,
+            scratch::scratch_pick_project,
+            scratch::scratch_promote,
+            scratch::scratch_promote_session,
+            scratch::scratch_delete,
             conversation_tree,
+            conversation_history,
             approval_rules_list,
             approval_approve_and_grant,
             approval_rules_revoke,

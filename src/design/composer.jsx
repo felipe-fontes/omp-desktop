@@ -9,6 +9,7 @@ const { isDesktop, slashMenu, midPromptSlashToken, skillMenu, matchesQuery, inse
 const {
   entryOf: draftEntryOf, updateEntry: updateDraftEntry, pruneEntries: pruneDrafts, DRAFT_IDLE, recallInDraft,
   normalizePaste, shouldCollapsePaste, collapsePaste, pastesIn, expandPastes, inlinePaste,
+  insertPromptDraft,
 } = window.OMP_SESSION_UI;
 const { restoredDraft: restoredQueueDraft } = window.OMP_QUEUE;
 // The footer's send/newline chord labels per `submitKey` tweak
@@ -36,7 +37,7 @@ function hintKeyFor(actionId, fallback) {
 // ── The composer (input + plan/steer modes + send) ────────────────────
 // `submitKey` ("enter" | "ctrl+enter") and `pasteCollapseLines` come from the
 // tweaks (Settings › Composer); the defaults match TWEAK_DEFAULTS.
-function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePlan, planBlocked = "", goalMode = false, goalTint = false, onToggleGoal, goalBlocked = "", goalStrip = null, onOpenCmd, onOpenModel, currentModel, thinking, onLoadThinkingLevels, onSetThinking, isStreaming, backgroundWork = false, pendingRequests = [], onOpenPending, onAbort, onApprove, annotationCount = 0, microcopy, onFollowUp, draftInsert, promptHistory = [], promptInsert, queue, queueSending, onRemoveQueued, onPromoteQueued, onSendQueuedNow, browserChips = [], onRemoveBrowserChip, onBrowserChipClick, submitKey = "enter", pasteCollapseLines = 5, liveVoice, liveError, onLiveAction, dictation, dictationError, onDictationAction, dictationCompleted, onAckDictation }) {
+function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePlan, planBlocked = "", goalMode = false, goalTint = false, onToggleGoal, goalBlocked = "", goalStrip = null, onOpenCmd, onOpenModel, currentModel, thinking, onLoadThinkingLevels, onSetThinking, isStreaming, backgroundWork = false, conversationMoving = false, pendingRequests = [], onOpenPending, onAbort, onApprove, annotationCount = 0, microcopy, onFollowUp, draftInsert, promptHistory = [], promptInsert, queue, queueSending, onRemoveQueued, onPromoteQueued, onSendQueuedNow, browserChips = [], onRemoveBrowserChip, onBrowserChipClick, submitKey = "enter", pasteCollapseLines = 5, liveVoice, liveError, onLiveAction, dictation, dictationError, onDictationAction, dictationCompleted, onAckDictation }) {
   // Drafts are per tab (issue #28). The composer stays mounted across tab
   // switches and keeps one draft per session id (app/session-ui.js
   // DRAFT_IDLE): text, pending image attachments (sent alongside the next
@@ -273,14 +274,16 @@ function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePla
     const step = window.OMP_WIDGETS.consumePromptInsert(promptInsert, seenInsertRef.current, sessionIds);
     if (step.kind === "none") return;
     seenInsertRef.current = step.nonce;
-    // A widget insert for a freshly opened tab (`sessionId`, insert target
-    // new-tab) goes into that tab's own draft, appended like any widget insert.
+    // Widget inserts append; rewind inserts replace text and attachments in
+    // their owning tab, including an image-only prompt and a hidden tab.
     if (step.kind === "targeted") {
       const target = step.sessionId;
-      const prevText = draftEntryOf(drafts, target, DRAFT_IDLE).text;
-      const nextText = window.OMP_WIDGETS.appendToDraft(prevText, promptInsert.text);
-      updateOpenDraft(target, d => ({ ...d, text: window.OMP_WIDGETS.appendToDraft(d.text, promptInsert.text), historyNav: null }));
-      if (sessionIdRef.current === target) setCaret(nextText.length);
+      const previous = draftEntryOf(drafts, target, DRAFT_IDLE);
+      const nextText = promptInsert.append ? window.OMP_WIDGETS.appendToDraft(previous.text, promptInsert.text) : promptInsert.text;
+      const back = (promptInsert.images ?? []).slice(0, MAX_ATTACHMENTS)
+        .map(image => ({ id: `att-${++attachCounterRef.current}`, name: "", image, src: toDataUrl(image) }));
+      updateOpenDraft(target, draft => insertPromptDraft(draft, promptInsert, back, MAX_ATTACHMENTS, window.OMP_WIDGETS.appendToDraft));
+      if (sessionIdRef.current === target) { setCaret(nextText.length); setActiveIdx(0); }
       requestAnimationFrame(() => {
         if (sessionIdRef.current !== target) return;
         const ta = focusTextarea();
@@ -392,6 +395,7 @@ function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePla
   // '/' command is being typed), never silently reroute into executing the
   // highlighted palette command instead.
   const sendWith = (dispatcher, { followUp = false } = {}) => {
+    if (conversationMoving) return; // keep the draft until the file change settles
     if (showSlash && !followUp) { execCmd(filtered[clampedIdx]); return; }
     if (pendingImages > 0) return; // a paste/pick is still preparing — its image would ship on the *next* message instead
     // A follow-up (`onFollowUp` dispatcher) requires non-empty text.
@@ -706,7 +710,7 @@ function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePla
         {isStreaming ? (
           <>
             {steerable && (
-              <button className={`btn outlined${goalMode ? " goal-resume" : ""}`} onClick={send} disabled={pendingImages > 0}
+              <button className={`btn outlined${goalMode ? " goal-resume" : ""}`} onClick={send} disabled={conversationMoving || pendingImages > 0}
                 style={goalMode ? undefined : { color: "var(--amber)", borderColor: "color-mix(in oklab, var(--amber) 40%, var(--line))" }}>
                 <Icon name={goalMode ? "goal" : "arrow"} size={10} color={goalMode ? "var(--lilac)" : "var(--amber)"} /> {goalMode ? "start goal" : "steer"}
               </button>
@@ -725,7 +729,7 @@ function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePla
         ) : (
           <>
             {planMode && (
-              <button className="btn outlined" onClick={onApprove}
+              <button className="btn outlined" onClick={onApprove} disabled={conversationMoving}
                 style={{ color: "var(--amber)", borderColor: "color-mix(in oklab, var(--amber) 40%, var(--line))" }}>
                 <Icon name="play" size={10} color="var(--amber)" /> approve
               </button>
@@ -736,7 +740,7 @@ function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePla
               </button>
             ) : (
             <button className={`btn primary${goalMode ? " goal-start" : ""}`} onClick={send}
-              disabled={!sendable || pendingImages > 0}>
+              disabled={conversationMoving || !sendable || pendingImages > 0} title={conversationMoving ? "Changing conversation…" : undefined}>
               {goalMode
                 ? "start goal"
                 : planMode

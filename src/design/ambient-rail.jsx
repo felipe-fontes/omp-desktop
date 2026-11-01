@@ -9,6 +9,9 @@ function AmbientRail({
   hoveredMsgIdx,
   onMinimapHover,
   onMinimapClick,
+  historyError,
+  onRefreshHistory,
+  conversationKey,
   subagents,
   subagentPaneOpen,
   onOpenSubagent,
@@ -85,10 +88,13 @@ function AmbientRail({
           </span>
         </div>
         <SessionMinimap
+          key={conversationKey}
           messages={messages}
           hoveredIdx={hoveredMsgIdx}
           onHover={onMinimapHover}
           onClick={onMinimapClick}
+          historyError={historyError}
+          onRefreshHistory={onRefreshHistory}
         />
       </div>
     ),

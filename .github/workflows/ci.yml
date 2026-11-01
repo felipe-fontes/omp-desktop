@@ -16,7 +16,6 @@ on:
       - '.github/workflows/ci.yml'
       - '.github/workflows/tests.yml'
   pull_request:
-    branches: [main, master, feat/voice-worktrees-pr-integration]
 
 jobs:
   test:

@@ -2,6 +2,8 @@
 
 One desktop tab owns one headless Chromium, shared by its omp agent and the browser panel. Rust owns the choice of browser, the process, the CDP connections, page selection, the screencast and the annotation overlay. The app webview only paints images and forwards input: browser pages never load in it.
 
+Scratch-workspace promotion keeps the frontend tab id while replacing its native browser and shell so files can be copied without active writers. The tab's `resourcesVersion` forces the browser hook to reconnect its channel even if React batches the intervening inactive state; stale channel messages stay ignored. Composer annotation chips remain user-owned draft data. Ordinary profile changes keep the same native browser.
+
 ## Modules and data flow
 
 | File | Responsibility |

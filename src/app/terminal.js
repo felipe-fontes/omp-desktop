@@ -57,6 +57,12 @@
   const togglePanel = (s, sid) =>
     entryOf(s, sid).open ? closePanel(s, sid) : openPanel(s, sid);
 
+  // Workspace promotion replaces the shell without replacing the UI tab.
+  // Preserve panel visibility but forget the previous shell incarnation.
+  function resetShell(s, sid) {
+    return s?.[sid] ? patch(s, sid, { status: null, error: null }) : s;
+  }
+
   /**
    * Rust reported the tab's shell (`terminal_open`, `terminal_status`).
    * Ignored for a tab with no entry (closed meanwhile), for `null` (no
@@ -189,6 +195,7 @@
     openPanel,
     closePanel,
     togglePanel,
+    resetShell,
     applyStatus,
     applyExit,
     spawnFailed,

@@ -523,4 +523,33 @@ check("normalized legacy worktrees restore their own cwd, profile, title and ses
   assert.equal(spec.workspaceBinding.worktree, true);
 });
 
+check("scratch chats keep their identity on restore and never expose an opaque folder as their label", () => {
+  const chat = tab("chat", "/private/chats/opaque/workspace", { scratchId: "opaque", name: "Research" });
+  const layout = N.tabLayout([chat], "chat");
+  const spec = N.restoreSpec(layout.tabs[0]);
+  assert.equal(spec.scratchId, "opaque");
+  assert.equal(spec.name, "Research", "an empty chat also keeps its name");
+  assert.deepEqual(N.tabLabel(chat), { prefix: null, title: "Research" });
+});
+
+check("chat histories sharing files stay separate from each other and project groups", () => {
+  const chats = [
+    tab("a", "/private/shared", { scratchId: "chat-a", name: "Research" }),
+    tab("b", "/private/shared", { scratchId: "chat-b", name: "Earlier discussion" }),
+    tab("c", "/private/shared", { scratchId: "chat-work", name: "Work", profile: "work" }),
+    tab("project", "/private/shared"),
+  ];
+  assert.deepEqual(N.groupTabs(chats).map(group => [group.name, group.tabs.length]), [["Research", 1], ["Earlier discussion", 1], ["Work", 1], ["shared", 1]]);
+
+});
+
+check("repository-free chats do not claim a project at the same path", () => {
+  const chat = tab("chat", "/private/shared", { scratchId: "chat", name: "Research" });
+  const project = tab("project", "/private/shared");
+  assert.equal(N.groupTabs([chat])[0].path, null);
+  assert.equal(N.findProjectTab([chat], "/private/shared", chat.profile, "chat"), null);
+  assert.equal(N.findProjectTab([chat, project], "/private/shared", chat.profile, "chat"), "project");
+  assert.equal(N.recentRows([{ path: "/private/shared" }], [chat], chat.profile).length, 1);
+});
+
 console.log(`project-nav: ${passed} checks passed`);

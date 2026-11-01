@@ -1,9 +1,3 @@
-// Transcript heatmap; scrolls after three rows, independent of rail height.
-// ── Minimap of the session: dense grid, one cell per message ─────────
-// Hue encodes role/tool color (same palette as the chat). For assistant
-// messages, opacity is log-scaled by tokens used so expensive turns pop
-// against cheap ones. Click scrolls the chat to that message; hover
-// highlights it via shared hoveredIdx state.
 function _MM_ToolLegend() {
   const { StatusDetail, TOOL_META } = window;
   const { tools, swatch } = React.useMemo(() => {
@@ -54,136 +48,101 @@ function _MM_ToolLegend() {
     </StatusDetail>
   );
 }
+/* session-minimap.jsx — the entire conversation, not just the rendered page. */
+const { Icon: _MM_Icon, TOOL_META: _MM_Tools } = window;
+const { minimapKind: _MM_kind } = window.OMP_CONVERSATION_NAV;
 
-function SessionMinimap({ messages, hoveredIdx, onHover, onClick }) {
-  const { Icon, TOOL_META } = window;
-  // Log-scaled max across assistant messages so heatmap variance is
-  // visible even when one compaction turn dwarfs the rest.
-  const { maxTokens, shown } = React.useMemo(() => {
+function minimapTitle(message, kind) {
+  const time = message.time ? ` · ${message.time}` : "";
+  if (kind === "compact") return message.status === "pending" ? "Compacting context…"
+    : message.status === "error" ? message.shortSummary || "Compaction failed"
+    : `Context compacted${message.tokensBefore != null ? ` · ${window.formatTokens(message.tokensBefore)} tokens before` : ""}${time}`;
+  if (kind === "user") return `You · ${message.text?.slice(0, 100) || "image"}${time}`;
+  if (kind === "failure") return `Request failed${message.failure.httpStatus != null ? ` · HTTP ${message.failure.httpStatus}` : ""}${time}`;
+  if (message.kind === "assistant") {
+    const label = kind === "answer" ? "Answer" : kind === "reasoning" ? "Reasoning" : kind === "update" ? "Assistant update" : "Note";
+    const text = message.blocks?.find(block => block.type === "text" && block.text?.trim())?.text;
+    return `${label}${text ? ` · ${text.slice(0, 100)}` : ""}${message.tokens ? ` · ${message.tokens.toLocaleString()} tokens` : ""}${time}`;
+  }
+  if (kind === "tool") return `${message.title || message.tool || "Tool"}${message.isError ? " · failed" : ""}${time}`;
+  if (kind === "job") return `${message.jobId} finished${message.label ? ` · ${message.label}` : ""}`;
+  if (kind === "retry") return `Retrying · attempt ${message.attempt}`;
+  if (kind === "goal") return window.OMP_GOAL.rowView(message).title;
+  if (kind === "approval") return `Auto-approved · ${message.tool || "tool"}`;
+  return `${kind}${time}`;
+}
+
+function SessionMinimap({ messages, hoveredIdx, onHover, onClick, historyError, onRefreshHistory }) {
+  const gridRef = React.useRef(null);
+  const following = React.useRef(true);
+  const [focused, setFocused] = React.useState(null);
+  const shown = React.useMemo(() => messages.flatMap((message, index) => window.OMP_TURN_STATUS.isHidden(message) ? [] : [index]), [messages]);
+  const maxTokens = React.useMemo(() => {
     let max = 0;
-    let n = 0;
-    for (const m of messages) {
-      if (window.OMP_TURN_STATUS.isHidden(m)) continue; // the chat hides it too
-      n++;
-      if (m.kind === "assistant" && m.tokens && m.tokens > max) max = m.tokens;
+    for (const index of shown) {
+      const message = messages[index];
+      if (message.kind === "assistant" && message.tokens > max) max = message.tokens;
     }
-    return { maxTokens: max, shown: n };
-  }, [messages]);
-  const logMax = Math.log10(maxTokens + 1) || 1;
-
+    return max;
+  }, [messages, shown]);
+  const tabStop = shown.includes(focused) ? focused : shown.at(-1);
+  React.useLayoutEffect(() => {
+    const grid = gridRef.current;
+    if (grid && following.current) grid.scrollTop = grid.scrollHeight;
+  }, [shown.length]);
+  const keyNav = (event, index) => {
+    const position = shown.indexOf(index);
+    const next = event.key === "Home" ? 0 : event.key === "End" ? shown.length - 1
+      : event.key === "ArrowLeft" ? position - 1 : event.key === "ArrowRight" ? position + 1
+      : event.key === "ArrowUp" ? position - 13 : event.key === "ArrowDown" ? position + 13 : null;
+    if (next == null) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const target = shown[Math.max(0, Math.min(shown.length - 1, next))];
+    gridRef.current?.querySelector(`[data-minimap-idx="${target}"]`)?.focus();
+  };
   return (
     <div className="minimap">
-      <div className="minimap-head">
-        <Icon name="minimap" size={11} color="var(--fg-3)" />
-        <span className="mono" style={{ color: "var(--fg-3)" }}>
-          session
-        </span>
-        <span
-          className="mono"
-          style={{ marginLeft: "auto", color: "var(--fg-4)" }}
-        >
-          {shown}
-        </span>
+      <div className="minimap-head mono">
+        <span>entire conversation</span>
+        <span className="minimap-count">{shown.length}</span>
       </div>
-      <div className="minimap-grid">
-        {messages.map((m, i) => {
-          if (window.OMP_TURN_STATUS.isHidden(m)) return null;
-          let hue = "var(--fg-5)";
-          if (m.kind === "user") hue = "var(--fg-2)";
-          else if (m.kind === "assistant")
-            hue = m.failure ? "var(--rose)" : "var(--accent)";
-          else if (m.kind === "ask") hue = "var(--amber)";
-          else if (m.kind === "retry") hue = TOOL_META.retry.color;
-          else if (m.kind === "tool")
-            hue = TOOL_META[m.tool]?.color || "var(--fg-4)";
-          else if (m.kind === "job") hue = TOOL_META.job.color;
-          else if (m.kind === "goal") hue = TOOL_META.goal.color;
-          else if (m.kind === "approval") hue = TOOL_META.approval.color;
-
-          // Brightness: assistant cells modulate by log(tokens), others flat.
-          let opacity = 0.7;
-          if (m.kind === "assistant" && m.tokens && maxTokens > 0) {
-            const t = Math.log10(m.tokens + 1) / logMax;
-            opacity = 0.4 + 0.6 * Math.max(0, Math.min(1, t));
-          }
-
-          // Per-kind tooltip — tools don't carry their own tokens (the
-          // LLM cost lives on the assistant message that invoked them),
-          // so they get tool-specific info instead of a token chip.
-          let title;
-          if (m.kind === "assistant" && m.failure) {
-            title = `request failed${m.failure.httpStatus != null ? ` · HTTP ${m.failure.httpStatus}` : ""}${m.time ? " · " + m.time : ""}`;
-          } else if (m.kind === "assistant") {
-            const tok = m.tokens ? `${m.tokens.toLocaleString()} tok` : "—";
-            const inOut =
-              m.tokensIn != null || m.tokensOut != null
-                ? ` (${(m.tokensIn ?? 0).toLocaleString()} in · ${(m.tokensOut ?? 0).toLocaleString()} out)`
-                : "";
-            title = `assistant · ${tok}${inOut}${m.time ? " · " + m.time : ""}`;
-          } else if (m.kind === "tool") {
-            const dur = m.duration
-              ? ` · ${(m.duration / 1000).toFixed(1)}s`
-              : "";
-            const status =
-              m.status === "running"
-                ? " · running"
-                : m.status === "ok"
-                  ? ""
-                  : ` · ${m.status}`;
-            title = `${m.tool ?? "tool"}${m.title ? " " + m.title : ""}${dur}${status}`;
-          } else if (m.kind === "user") {
-            const preview = m.text
-              ? ` · ${m.text.slice(0, 80)}${m.text.length > 80 ? "…" : ""}`
-              : "";
-            title = `you${preview}`;
-          } else if (m.kind === "job") {
-            title = `${m.jobId} finished${m.label ? " · " + m.label : ""}`;
-          } else if (m.kind === "retry") {
-            title = `retrying · attempt ${m.attempt}${m.maxAttempts ? " of " + m.maxAttempts : ""}`;
-          } else if (m.kind === "goal") {
-            title = window.OMP_GOAL.rowView(m).title;
-          } else if (m.kind === "approval") {
-            title = `auto-approved · ${m.tool || "tool"}`;
-          } else {
-            title = m.kind;
-          }
-          const cls =
-            `minimap-cell ${m.kind} ${m.streaming ? "live" : ""} ${hoveredIdx === i ? "hot" : ""}`.trim();
-
+      {historyError && <div className="minimap-error" role="status">
+        <span title={historyError}>Saved history unavailable</span>
+        <button type="button" className="btn ghost" title={historyError} onClick={onRefreshHistory}>Retry</button>
+      </div>}
+      <div className="minimap-grid" ref={gridRef} role="group" aria-label="Conversation minimap"
+        onScroll={event => { const el = event.currentTarget; following.current = el.scrollHeight - el.scrollTop - el.clientHeight < 16; }}>
+        {shown.map(index => {
+          const message = messages[index];
+          const kind = _MM_kind(message);
+          const title = minimapTitle(message, kind);
+          const hue = kind === "compact" ? (message.status === "error" ? "var(--rose)" : "var(--lilac)")
+            : kind === "answer" ? "var(--accent)" : kind === "failure" ? "var(--rose)"
+            : kind === "ask" ? "var(--amber)" : kind === "tool" ? _MM_Tools[message.tool]?.color || "var(--fg-4)"
+            : _MM_Tools[kind]?.color || "var(--fg-4)";
+          const heat = kind === "answer" && message.tokens && maxTokens > 0
+            ? 0.4 + 0.6 * Math.log10(message.tokens + 1) / Math.log10(maxTokens + 1)
+            : 1;
           return (
-            <button
-              type="button"
-              key={m._id ?? i}
-              className={cls}
-              style={{ background: hue, opacity }}
-              title={title}
-              aria-label={title}
-              onMouseEnter={() => onHover?.(i)}
-              onMouseLeave={() => onHover?.(null)}
-              onFocus={() => onHover?.(i)}
-              onBlur={() => onHover?.(null)}
-              onClick={() => onClick?.(i)}
-            />
+            <button type="button" key={message._id ?? index} data-minimap-idx={index}
+              className={`minimap-cell ${kind}${message.streaming || message.status === "pending" ? " live" : ""}${hoveredIdx === index ? " hot" : ""}`}
+              style={{ "--mm-color": hue, "--mm-heat": heat }} title={title} aria-label={title}
+              tabIndex={tabStop === index ? 0 : -1}
+              onKeyDown={event => keyNav(event, index)}
+              onFocus={() => { setFocused(index); onHover?.(index); }} onBlur={() => onHover?.(null)}
+              onMouseEnter={() => onHover?.(index)} onMouseLeave={() => onHover?.(null)}
+              onClick={() => onClick?.(index)}>
+              {kind === "compact" && <><_MM_Icon name="context" size={10} /><span>{message.status === "pending" ? "compacting…" : message.status === "error" ? "compaction failed" : "context compacted"}</span></>}
+            </button>
           );
         })}
       </div>
       <div className="minimap-legend">
-        <span className="minimap-legend-item">
-          <i aria-hidden="true" style={{ background: "var(--fg-2)" }} />
-          you
-        </span>
-        <span className="minimap-legend-item">
-          <i
-            aria-hidden="true"
-            className="minimap-assistant-swatch"
-            style={{ background: "var(--accent)" }}
-          />
-          assistant
-        </span>
-        <span className="minimap-legend-item">
-          <i aria-hidden="true" style={{ background: "var(--amber)" }} />
-          ask
-        </span>
+        <span className="minimap-legend-item"><i className="answer" />answer</span>
+        <span className="minimap-legend-item"><i className="reasoning" />reasoning</span>
+        <span className="minimap-legend-item"><i className="user" />you</span>
+        <span className="minimap-legend-item"><i className="compact" />compact</span>
         <_MM_ToolLegend />
       </div>
     </div>
