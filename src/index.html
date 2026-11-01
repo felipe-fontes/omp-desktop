@@ -91,6 +91,9 @@
        must load before them. -->
   <script src="app/chat-collapse.js"></script>
 
+  <!-- Provider-reported prompt cache usage; shared by chat and Ambient. -->
+  <script src="app/cache-usage.js"></script>
+
   <!-- Prompt history (issue #16): pure list/navigation helpers, in-memory
        only. Dependency-free IIFE; composer.jsx references window.
        OMP_PROMPT_HISTORY, and live.js reads it at its own top-level IIFE
@@ -304,6 +307,8 @@
        destructure it at top level. -->
   <script type="text/babel" src="design/ui/collapse-toggle.jsx"></script>
   <script type="text/babel" src="design/ui/sparks.jsx"></script>
+  <!-- Native cache disclosures shared by assistant replies and the rail. -->
+  <script type="text/babel" src="design/ui/cache-usage.jsx"></script>
   <!-- Markdown renderer; MarkdownLinkContext + useMarkdownClick (the
        containers' delegated click: copy buttons, then the link handler
        app-live.jsx provides). Destructures window.copyCodeBlockClick

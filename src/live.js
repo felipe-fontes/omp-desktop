@@ -23,6 +23,7 @@
   const TURN = window.OMP_TURN_STATUS;
   const GOAL = window.OMP_GOAL;
   const EXT = window.OMP_EXT_WIDGETS;
+  const CACHE = window.OMP_CACHE_USAGE;
   const { tsOf, mergeTranscript } = window.OMP_TRANSCRIPT;
 
   // ── Safe defaults so design components never crash on missing fields ──────
@@ -34,7 +35,7 @@
     commands: LOCAL_COMMANDS,
     models: [],
     activity: [],
-    ctx: { used: 0, total: 200000, pct: 0, label: "0 / 200k", cost: "$0.00", tokensPerSec: 0 },
+    ctx: { used: 0, total: 200000, pct: 0, label: "0 / 200k", cost: "$0.00", tokensPerSec: 0, cacheUsage: null },
     microcopy: {
       empty:        "Hand me a project. I'll set the table.",
       streamingTip: "Press ⎋ to interrupt — your cursor is in the room.",
@@ -1993,6 +1994,9 @@
         streamingBubble = null;
       }
       state.messages = streamingBubble ? [...merged, streamingBubble] : merged;
+      // Raw messages include requests that only called tools and have no
+      // persisted chat bubble. The rail still reports their cache usage.
+      state.ctx = { ...state.ctx, cacheUsage: CACHE.fromMessages(data.messages) };
       // Backfill prompt history from the persisted transcript — runs on
       // every arrival (plain tab switch, or a resumed/restored session),
       // not just once: mergeOlder is a no-op for prompts already known, so
@@ -2466,7 +2470,11 @@
       // still lands in omp's messageCount, so the gate needs the outcome,
       // not just the count.
       const answered = msg?.role === "assistant" && !TURN.failedStop(msg);
-      if (msg?.role === "assistant") lastTurnOk = answered;
+      const cacheUsage = CACHE.fromMessage(msg);
+      if (msg?.role === "assistant") {
+        lastTurnOk = answered;
+        state.ctx = { ...state.ctx, cacheUsage };
+      }
       const usage = msg?.usage;
       const tokens = usage ? ((usage.input ?? 0) + (usage.output ?? 0)) : null;
       // Only an assistant message ends the streaming bubble: when frames were
@@ -2490,6 +2498,7 @@
           tokens,
           tokensIn:  usage?.input  ?? null,
           tokensOut: usage?.output ?? null,
+          ...(cacheUsage ? { cacheUsage } : {}),
           ts:        tsOf(msg) ?? streamingBubble.ts,
           ...(pendingFailure ? { pendingFailure } : {}),
           // omp may retry a stream that stalled or dropped (`retryStarted`).
@@ -2823,7 +2832,7 @@
   }
 
   function _refreshCtx() {
-    state.ctx = window.buildCtx(state.rpcState, state.sessionCost, state.currentTps);
+    state.ctx = { ...window.buildCtx(state.rpcState, state.sessionCost, state.currentTps), cacheUsage: state.ctx.cacheUsage };
   }
 
   function _initFetch() {

@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Chat replies now show a compact **cache** disclosure, with the latest request also in the Ambient context card. Expand it for provider/model, cache-read/write tokens, uncached input, output and available costs. This works with any provider's omp usage counters; missing counters and unrecognized cache formats have distinct notices. Provider support stays unknown when the data cannot establish it: zero counters can be omp defaults, not proof a provider has no cache. This is request usage, not live cache size or time remaining.
+
 ## [0.12.1] - 2026-10-21
 
 ### Added
