@@ -1,8 +1,9 @@
 /* adapter.js — pure transforms between RPC data and design component data shapes.
    No side effects. All functions exported via window.* for Babel-transpiled scripts.
    Depends on: window.MODEL_NAMES (model-names.js loaded first),
-   window.OMP_TURN_STATUS (app/turn-status.js) and window.OMP_TRANSCRIPT
-   (app/transcript-merge.js), both for adaptAgentMessages. */
+   window.OMP_CACHE_USAGE (app/cache-usage.js), window.OMP_TURN_STATUS
+   (app/turn-status.js) and window.OMP_TRANSCRIPT (app/transcript-merge.js),
+   the latter three for adaptAgentMessages. */
 
 (function () {
   "use strict";
@@ -543,12 +544,14 @@
           const tokensIn  = u?.input  ?? u?.input_tokens  ?? null;
           const tokensOut = u?.output ?? u?.output_tokens ?? null;
           const tokens = (tokensIn != null || tokensOut != null) ? (tokensIn ?? 0) + (tokensOut ?? 0) : null;
+          const cacheUsage = window.OMP_CACHE_USAGE.fromMessage(msg);
           result.push({
             kind: "assistant", time, ts, thought,
             lead: thought ? "thinking" : null,
             blocks: designBlocks,
             streaming: false,
             tokens, tokensIn, tokensOut,
+            ...(cacheUsage ? { cacheUsage } : {}),
             ...(failure ? { failure } : {}),
           });
         }

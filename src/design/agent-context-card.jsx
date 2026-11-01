@@ -43,6 +43,7 @@ function ContextCard({
           <span className="mono">context</span>
         </div>
         <window.ContextPolicyGauge ctx={ctx} {...policyEditor} />
+        <window.CacheUsage report={ctx?.cacheUsage} scope="last request" />
         <div className="rail-spark">
           {sparklineValues?.length > 0 && (
             <window.Sparkline

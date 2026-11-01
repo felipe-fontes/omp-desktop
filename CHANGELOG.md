@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Chat replies now show a compact **cache** disclosure, with the latest request also in the Ambient context card. Expand it for provider/model, cache-read/write tokens, uncached input, output and available costs. This works with any provider's omp usage counters; missing counters and unrecognized cache formats have distinct notices. Provider support stays unknown when the data cannot establish it: zero counters can be omp defaults, not proof a provider has no cache. This is request usage, not live cache size or time remaining.
+
 - **Disposable conversation worktrees**: × offers **Cancel**, **Keep for now**, or **Save restore point and remove**. Verified restore points preserve commit, staged/unstaged changes and local data; capture failure keeps the files and exposes a safe retry. Reopening reconstructs the saved workspace without resetting a moved branch or overwriting an occupied old folder. Conversations and evidence remain outside the checkout.
 - **Settings → Session → Workspace storage** shows retained checkout and restore-point sizes, pinning, restoration and advisory count/byte limits. Kept checkouts become eligible for verified automatic snapshot-and-removal after thirty days of explicit-user inactivity; app startup and background checks do not renew it. Open or pinned worktrees stay protected, and budgets never shorten the lease or delete restore points.
 

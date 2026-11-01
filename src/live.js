@@ -28,6 +28,7 @@
   const EXT = window.OMP_EXT_WIDGETS;
   const LIVE = window.OMP_LIVE_VOICE;
   const DICTATION = LIVE.DICTATION;
+  const CACHE = window.OMP_CACHE_USAGE;
   const { tsOf, mergeTranscript } = window.OMP_TRANSCRIPT;
 
   // ── Safe defaults so design components never crash on missing fields ──────
@@ -39,7 +40,7 @@
     commands: LOCAL_COMMANDS,
     models: [],
     activity: [],
-    ctx: { used: null, total: null, pct: null, status: "unavailable", modelKey: null, label: "— / —", cost: "$0.00", tokensPerSec: 0 },
+    ctx: { used: null, total: null, pct: null, status: "unavailable", modelKey: null, label: "— / —", cost: "$0.00", tokensPerSec: 0, cacheUsage: null },
     microcopy: {
       empty:        "Hand me a project. I'll set the table.",
       streamingTip: "Press ⎋ to interrupt — your cursor is in the room.",
@@ -2332,6 +2333,7 @@
       streamingBubble = null;
     }
     state.messages = streamingBubble ? [...merged, streamingBubble] : merged;
+    state.ctx = { ...state.ctx, cacheUsage: CACHE.fromMessages(messages) };
     if (activeSessionId) {
       const prior = window.OMP_PROMPT_HISTORY.promptsFromMessages(merged, PROMPT_NORMALIZE);
       promptHistories.set(activeSessionId, window.OMP_PROMPT_HISTORY.mergeOlder(
@@ -2966,7 +2968,11 @@
       // still lands in omp's messageCount, so the gate needs the outcome,
       // not just the count.
       const answered = msg?.role === "assistant" && !TURN.failedStop(msg);
-      if (msg?.role === "assistant") lastTurnOk = answered;
+      const cacheUsage = CACHE.fromMessage(msg);
+      if (msg?.role === "assistant") {
+        lastTurnOk = answered;
+        state.ctx = { ...state.ctx, cacheUsage };
+      }
       const usage = msg?.usage;
       const tokens = usage ? ((usage.input ?? 0) + (usage.output ?? 0)) : null;
       // Only an assistant message ends the streaming bubble: when frames were
@@ -2990,6 +2996,7 @@
           tokens,
           tokensIn:  usage?.input  ?? null,
           tokensOut: usage?.output ?? null,
+          ...(cacheUsage ? { cacheUsage } : {}),
           ts:        tsOf(msg) ?? streamingBubble.ts,
           ...(pendingFailure ? { pendingFailure } : {}),
           // omp may retry a stream that stalled or dropped (`retryStarted`).
@@ -3324,7 +3331,7 @@
   }
 
   function _refreshCtx() {
-    state.ctx = window.buildCtx(state.rpcState, state.sessionCost, state.currentTps);
+    state.ctx = { ...window.buildCtx(state.rpcState, state.sessionCost, state.currentTps), cacheUsage: state.ctx.cacheUsage };
   }
 
   // A new model or compacted history invalidates every older accounting read.

@@ -3,6 +3,7 @@
    first plan reply). */
 
 const { Icon: _ChatIcon, MarkdownContent: _ChatMd, AnnotablePlan: _ChatAP, CopyButton: _ChatCopy, CollapseToggle: _ChatCollapse } = window;
+const { CacheUsage: _AB_CacheUsage } = window;
 
 function InlinePlan({ plan }) {
   return (
@@ -140,6 +141,7 @@ function AssistantBubble({ msg, idx, highlighted, annotable, annotations, onAnno
           return null;
         })}
         {msg.failure && <_AB_Failure failure={msg.failure} />}
+        {!msg.streaming && msg.cacheUsage && <_AB_CacheUsage report={msg.cacheUsage} />}
       </div>
     </div>
   );
