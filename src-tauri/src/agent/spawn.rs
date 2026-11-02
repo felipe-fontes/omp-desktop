@@ -322,6 +322,10 @@ fn sanitize_child_env(cmd: &mut Command) {
 /// [`crate::supervisor::ProcessSupervisor`] already attached to it, so the
 /// whole process tree (subagents, tool-call children) can be torn down as
 /// a unit — plain `Child::kill` only signals the direct `omp` process.
+///
+/// Branch timing, intent and naming follow the user's task, not chat startup.
+/// Append the desktop policy without replacing system/project instructions or
+/// changing the existing context extensions and tool-approval mode.
 pub(super) fn spawn_omp(
     cwd: Option<&str>,
     resume: Option<&str>,
@@ -349,6 +353,9 @@ pub(super) fn spawn_omp(
     super::context_extension::apply(&mut cmd, profile)?;
     cmd.env("OMP_DESKTOP_CONTEXT_EPOCH", context_epoch);
     cmd.env("OMP_DESKTOP_EVIDENCE_BOOTSTRAP", evidence_bootstrap);
+    if let Some(policy) = super::branch_policy::for_workspace(resolved_cwd.as_deref()) {
+        cmd.arg("--append-system-prompt").arg(policy);
+    }
     cmd.args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
