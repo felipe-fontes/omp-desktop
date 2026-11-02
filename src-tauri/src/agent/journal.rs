@@ -72,6 +72,17 @@ struct PendingRequest {
     id: String,
     event: JournalEvent,
     answering: bool,
+    /// Input observed after `open_url` while a native-admitted login is active.
+    /// The RPC wire has no callback provenance. Before a Worktree cutover,
+    /// the send gate accepts this only from an explicit-extension-only
+    /// metadata process; ambient extensions remain trusted on ready sessions.
+    login_callback: bool,
+}
+
+struct PendingLogin {
+    id: String,
+    auth_opened: bool,
+    uncertain: bool,
 }
 
 /// Ring of the most recent [`JournalEvent`]s for one session, bounded by
@@ -92,6 +103,7 @@ pub(super) struct EventJournal {
     /// Sticky for this process: omitted IDs cannot be tracked to settlement.
     pending_incomplete: bool,
     background_tasks: Option<JournalEvent>,
+    login: Option<PendingLogin>,
 }
 
 impl EventJournal {
@@ -106,6 +118,7 @@ impl EventJournal {
             pending_bytes: 0,
             pending_incomplete: false,
             background_tasks: None,
+            login: None,
         }
     }
 
@@ -140,6 +153,26 @@ impl EventJournal {
         decoded: bool,
     ) -> u64 {
         let seq = self.push(text);
+        if let Some(frame) = frame {
+            if frame.get("type").and_then(Value::as_str) == Some("response")
+                && frame.get("command").and_then(Value::as_str) == Some("login")
+            {
+                if let Some(id) = frame.get("id").and_then(Value::as_str) {
+                    self.finish_login(id);
+                }
+            }
+            if frame.get("type").and_then(Value::as_str) == Some("extension_ui_request")
+                && frame.get("method").and_then(Value::as_str) == Some("open_url")
+                && frame
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .is_some_and(|url| !url.is_empty())
+            {
+                if let Some(login) = &mut self.login {
+                    login.auth_opened = true;
+                }
+            }
+        }
         let Some(frame) =
             frame.filter(|f| f.get("type").and_then(Value::as_str) == Some("extension_ui_request"))
         else {
@@ -161,7 +194,7 @@ impl EventJournal {
                 if let Some(id) = frame.get("targetId").and_then(Value::as_str) {
                     self.remove_pending(id);
                 } else {
-                    self.pending_incomplete = true;
+                    self.mark_pending_incomplete();
                 }
             }
             Some("ask" | "select" | "confirm" | "input" | "editor") => {
@@ -170,19 +203,19 @@ impl EventJournal {
                     .and_then(Value::as_str)
                     .filter(|id| !id.is_empty())
                 else {
-                    self.pending_incomplete = true;
+                    self.mark_pending_incomplete();
                     return seq;
                 };
                 self.remove_pending(id);
                 let Some(text) = self.frame_text(frame, decoded) else {
-                    self.pending_incomplete = true;
+                    self.mark_pending_incomplete();
                     return seq;
                 };
                 if id.len() > MAX_PENDING_ID_BYTES
                     || self.pending.len() >= MAX_PENDING_REQUESTS
                     || text.len() > MAX_PENDING_BYTES.saturating_sub(self.pending_bytes)
                 {
-                    self.pending_incomplete = true;
+                    self.mark_pending_incomplete();
                     return seq;
                 }
                 self.pending_bytes += text.len();
@@ -190,13 +223,16 @@ impl EventJournal {
                     id: id.to_owned(),
                     event: JournalEvent { seq, text },
                     answering: false,
+                    login_callback: frame.get("method").and_then(Value::as_str) == Some("input")
+                        && self.login.as_ref().is_some_and(|login| login.auth_opened)
+                        && crate::approval::approval_tool_name(frame).is_none(),
                 });
             }
             Some(
                 "notify" | "setStatus" | "setWidget" | "setTitle" | "set_editor_text" | "open_url",
             ) => {}
             // A future method may be a callback; do not claim a complete set.
-            _ => self.pending_incomplete = true,
+            _ => self.mark_pending_incomplete(),
         }
         seq
     }
@@ -214,8 +250,59 @@ impl EventJournal {
     /// A discarded oversized stdout frame could itself have been a callback.
     pub(super) const fn mark_pending_incomplete(&mut self) {
         self.pending_incomplete = true;
+        if let Some(login) = &mut self.login {
+            login.uncertain = true;
+        }
     }
 
+    /// Observe the outgoing login before writing it: omp may respond as soon
+    /// as the bytes reach its pipe.
+    pub(super) fn begin_login(&mut self, id: &str) -> Result<(), &'static str> {
+        if id.is_empty() || id.len() > MAX_PENDING_ID_BYTES {
+            return Err("invalid login request id");
+        }
+        if self.login.is_some() {
+            return Err("a login is already in progress");
+        }
+        self.login = Some(PendingLogin {
+            id: id.to_owned(),
+            auth_opened: false,
+            uncertain: false,
+        });
+        Ok(())
+    }
+
+    pub(super) fn finish_login(&mut self, id: &str) {
+        if self.login.as_ref().is_some_and(|login| login.id == id) {
+            self.login = None;
+            for pending in &mut self.pending {
+                pending.login_callback = false;
+            }
+        }
+    }
+
+    pub(super) fn is_login_answer(&self, id: &str) -> bool {
+        self.login.as_ref().is_some_and(|login| !login.uncertain)
+            && self
+                .pending
+                .iter()
+                .any(|pending| pending.id == id && pending.login_callback && !pending.answering)
+    }
+
+    /// A frame lost during login makes this exchange uncertain. Unlike ordinary
+    /// answers, the exact observed callback must still be outstanding.
+    pub(super) fn begin_login_answer(&mut self, id: &str) -> Result<Option<u64>, &'static str> {
+        if self.login.as_ref().is_none_or(|login| login.uncertain) {
+            return Err("no login callback is open");
+        }
+        let pending = self
+            .pending
+            .iter_mut()
+            .find(|pending| pending.id == id && pending.login_callback && !pending.answering)
+            .ok_or("no open login input for this process")?;
+        pending.answering = true;
+        Ok(Some(pending.event.seq))
+    }
     /// Start an answer without holding the journal across a blocking pipe
     /// write. An in-flight entry is omitted and makes snapshots incomplete:
     /// neither a premature close nor a stale callback can be inferred.

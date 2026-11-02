@@ -577,6 +577,67 @@ test("an action older than the 15 s ack timeout is dropped as expired", async ()
   assert.deepEqual(h.results, [["1", true], ["2", false, "expired"]]);
 });
 
+for (const route of [
+  { kind: "prompt", streaming: false, method: "send" },
+  { kind: "prompt", streaming: true, method: "steer" },
+  { kind: "steer", streaming: false, method: "steer" },
+]) {
+  for (const change of ["none", "before deadline", "deadline boundary", "expired", "server stopped", "device disconnected", "device revoked"]) {
+    test(`${route.kind}${route.streaming ? " while streaming" : ""} rechecks ${change} after delayed preparation`, async () => {
+      let release;
+      const gate = new Promise(resolve => { release = resolve; });
+      const attempts = [], delivered = [], guardErrors = [];
+      const fakeSend = method => async (text, images, rawText, canSend) => {
+        attempts.push({ method, text, images, rawText, guardType: typeof canSend });
+        await gate;
+        try {
+          canSend?.();
+        } catch (error) {
+          guardErrors.push(error.message);
+          throw error;
+        }
+        delivered.push([method, text]);
+        return true;
+      };
+      const h = guarded({ send: fakeSend("send"), steer: fakeSend("steer") },
+        () => snapshot({ isStreaming: route.streaming }));
+      const pending = h.handle(prompt("delayed", { kind: route.kind }));
+      await flush();
+      assert.deepEqual(attempts, [{
+        method: route.method, text: "go", images: undefined, rawText: "go", guardType: "function",
+      }]);
+      assert.deepEqual(delivered, []);
+      if (change === "before deadline") await h.time.advance(14999);
+      if (change === "deadline boundary") await h.time.advance(15000);
+      if (change === "expired") await h.time.advance(15001);
+      if (change === "server stopped") h.status.listening = false;
+      if (change === "device disconnected") h.status.devices[0].connected = false;
+      if (change === "device revoked") h.status.devices = [];
+      release();
+      await pending;
+
+      const reason = {
+        "deadline boundary": "expired",
+        expired: "expired",
+        "server stopped": "remote access disabled",
+        "device disconnected": "device revoked",
+        "device revoked": "device revoked",
+      }[change];
+      assert.deepEqual(guardErrors, reason ? [reason] : []);
+      assert.deepEqual(delivered, reason ? [] : [[route.method, "go"]]);
+      assert.deepEqual(h.results[0].slice(0, 2), ["delayed", !reason]);
+
+      if (reason) {
+        h.status.listening = true;
+        h.status.devices = [{ id: "d", connected: true }];
+        await h.handle(prompt("retry", { kind: route.kind, text: "try again" }));
+        assert.deepEqual(delivered, [[route.method, "try again"]]);
+        assert.deepEqual(h.results.at(-1), ["retry", true]);
+      }
+    });
+  }
+}
+
 test("the queue holds 16 actions; more are refused as busy at once", async () => {
   let release, hold = true;
   const h = guarded({ send: t => { h.calls.push(["send", t]); return hold ? new Promise(resolve => { release = resolve; }) : true; } });

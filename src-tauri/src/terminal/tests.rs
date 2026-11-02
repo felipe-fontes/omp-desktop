@@ -498,6 +498,23 @@ fn re_registering_a_tab_keeps_its_shell() {
     assert_eq!(out.number_after("B="), out.number_after("A="));
 }
 
+#[test]
+fn workspace_change_refuses_a_running_shell_and_retires_an_exited_one() {
+    let (manager, out) = open("workspace-move");
+    let first = manager.status("workspace-move").unwrap();
+    assert!(manager.prepare_workspace_change("workspace-move").is_err());
+    manager.write("workspace-move", "exit\n").unwrap();
+    assert!(wait_until(SLOW, || manager
+        .status("workspace-move")
+        .is_some_and(|status| status.state == TerminalState::Exited)));
+    manager.prepare_workspace_change("workspace-move").unwrap();
+    assert!(manager.status("workspace-move").is_none());
+    let next = manager
+        .open(Arc::clone(&out), "workspace-move", 80, 24)
+        .unwrap();
+    assert!(next.instance > first.instance);
+}
+
 /// The status follows the slot: none, starting (a pending spawn, which a
 /// second `open` reports instead of spawning), running, exited with code.
 #[test]

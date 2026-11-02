@@ -80,6 +80,11 @@ pub fn omp_output<S: AsRef<OsStr>>(args: &[S]) -> Result<std::process::Output, S
     Omp::locate()?.output(args)
 }
 
+/// A trusted omp command for supervised, tool-free workspace naming.
+pub fn omp_command() -> Result<Command, String> {
+    Ok(Omp::locate()?.command())
+}
+
 // ── omp version floor ───────────────────────────────────────────────────────
 
 /// Oldest omp OMP Desktop runs against: the newest release whose RPC
@@ -313,6 +318,32 @@ fn sanitize_child_env(cmd: &mut Command) {
     cmd.env_remove("PI_PROFILE");
 }
 
+/// Configure the same extension and RPC arguments for every launch.
+fn configure_omp(
+    cmd: &mut Command,
+    launch: super::Launch<'_>,
+    resolved_cwd: Option<&str>,
+    context_epoch: &str,
+    evidence_bootstrap: &str,
+) -> Result<(), String> {
+    // Explicit desktop extensions remain available even when ambient
+    // extension discovery is disabled for a pending metadata-only process.
+    super::context_extension::apply(cmd, launch.profile)?;
+    if launch.metadata_only {
+        cmd.arg("--no-extensions");
+    }
+    cmd.env("OMP_DESKTOP_CONTEXT_EPOCH", context_epoch);
+    cmd.env("OMP_DESKTOP_EVIDENCE_BOOTSTRAP", evidence_bootstrap);
+    cmd.args(omp_args(
+        launch.profile,
+        launch.resume,
+        resolved_cwd,
+        launch.mode,
+        launch.config,
+    ));
+    Ok(())
+}
+
 /// Spawn omp for a live session in `rpc-ui` mode (see `omp_args`), by the
 /// absolute path [`Omp::locate`] found and [`check_omp_version`] confirmed
 /// meets [`MIN_OMP_VERSION`].
@@ -323,11 +354,7 @@ fn sanitize_child_env(cmd: &mut Command) {
 /// whole process tree (subagents, tool-call children) can be torn down as
 /// a unit — plain `Child::kill` only signals the direct `omp` process.
 pub(super) fn spawn_omp(
-    cwd: Option<&str>,
-    resume: Option<&str>,
-    profile: Option<&str>,
-    mode: ApprovalMode,
-    config: Option<&Path>,
+    launch: super::Launch<'_>,
     context_epoch: &str,
     evidence_bootstrap: &str,
 ) -> Result<(Child, crate::supervisor::ProcessSupervisor), String> {
@@ -339,18 +366,19 @@ pub(super) fn spawn_omp(
     check_omp_version(&omp)?;
     // Resolve once so `current_dir` and `--cwd=` (see `resolve_cwd`) can
     // never disagree or compound a relative value into a nested path.
-    let resolved_cwd = cwd.filter(|dir| !dir.is_empty()).map(resolve_cwd);
-    let args = omp_args(profile, resume, resolved_cwd.as_deref(), mode, config);
+    let resolved_cwd = launch.cwd.filter(|dir| !dir.is_empty()).map(resolve_cwd);
     // `Omp::command` defaults stdin to closed; a live RPC session needs it
     // piped. No `cmd /C` wrapper on Windows: killing cmd.exe would orphan
     // omp without a Job Object.
     let mut cmd = omp.command();
-    // Load only embedded desktop extensions. Keep the browser-only config last.
-    super::context_extension::apply(&mut cmd, profile)?;
-    cmd.env("OMP_DESKTOP_CONTEXT_EPOCH", context_epoch);
-    cmd.env("OMP_DESKTOP_EVIDENCE_BOOTSTRAP", evidence_bootstrap);
-    cmd.args(&args)
-        .stdin(Stdio::piped())
+    configure_omp(
+        &mut cmd,
+        launch,
+        resolved_cwd.as_deref(),
+        context_epoch,
+        evidence_bootstrap,
+    )?;
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(dir) = resolved_cwd.as_deref() {

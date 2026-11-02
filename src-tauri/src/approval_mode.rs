@@ -186,6 +186,28 @@ impl ApprovalModeStore {
             .unwrap_or(file.default)
     }
 
+    /// A native-verified worktree inherits its source project's mode unless
+    /// the actual checkout has its own explicit override.
+    pub fn resolve_workspace(&self, actual: Option<&Path>, source: Option<&Path>) -> ApprovalMode {
+        let Some(source) = source.filter(|path| !path.as_os_str().is_empty()) else {
+            return self.resolve(actual);
+        };
+        if actual == Some(source) {
+            return self.resolve(actual);
+        }
+        let actual = actual
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(project_key);
+        let source = project_key(source);
+        let file = self.cached();
+        actual
+            .as_ref()
+            .and_then(|key| file.projects.get(key))
+            .or_else(|| file.projects.get(&source))
+            .copied()
+            .unwrap_or(file.default)
+    }
+
     /// Store the default for every project without an override. Blocking
     /// file I/O.
     pub fn set_default(&self, mode: ApprovalMode) -> Result<ApprovalModeView, String> {
@@ -315,6 +337,38 @@ mod tests {
         assert_eq!(store.resolve(Some(&a)), ApprovalMode::Yolo);
         assert_eq!(store.resolve(Some(&b)), ApprovalMode::AlwaysAsk);
         assert_eq!(store.resolve(None), ApprovalMode::AlwaysAsk);
+    }
+
+    #[test]
+    fn managed_worktree_inherits_source_mode_unless_checkout_has_an_override() {
+        let source = scratch_dir();
+        let checkout = scratch_dir();
+        let store = ApprovalModeStore::load(None);
+        store.set_default(ApprovalMode::Yolo).unwrap();
+        store
+            .set_project(&source, Some(ApprovalMode::AlwaysAsk))
+            .unwrap();
+        assert_eq!(
+            store.resolve_workspace(Some(&checkout), Some(&source)),
+            ApprovalMode::AlwaysAsk
+        );
+        store
+            .set_project(&checkout, Some(ApprovalMode::Write))
+            .unwrap();
+        assert_eq!(
+            store.resolve_workspace(Some(&checkout), Some(&source)),
+            ApprovalMode::Write
+        );
+        store.set_project(&checkout, None).unwrap();
+        assert_eq!(
+            store.resolve_workspace(Some(&checkout), Some(&source)),
+            ApprovalMode::AlwaysAsk
+        );
+        store.set_project(&source, None).unwrap();
+        assert_eq!(
+            store.resolve_workspace(Some(&checkout), Some(&source)),
+            ApprovalMode::Yolo
+        );
     }
 
     #[cfg(unix)]

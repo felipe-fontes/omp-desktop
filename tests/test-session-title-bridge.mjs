@@ -10,7 +10,7 @@ const flush = async () => {
   for (let i = 0; i < 50; i++) await Promise.resolve();
 };
 
-function harness(t, { title, autoName = true, isStreaming = false } = {}) {
+function harness(t, { title, autoName = true, isStreaming = false, firstPromptWorkspace = false } = {}) {
   const window = { OMP_TWEAKS_STORE: { read: () => ({ autoName }) } };
   const timers = new Set();
   const scope = {
@@ -64,10 +64,11 @@ function harness(t, { title, autoName = true, isStreaming = false } = {}) {
   const bridge = window.OMP_BRIDGE;
   const listeners = new Map(),
     commands = [],
-    states = new Map();
+    states = new Map(),
+    deferred = new Map(), workspaceBindings = new Map();
   let snapshot,
     seq = 0,
-    rejectRename = false;
+    rejectRename = false, metadataStarts = 0, approvalMode = "write";
   bridge.onUpdate((value) => {
     snapshot = value;
   });
@@ -95,20 +96,54 @@ function harness(t, { title, autoName = true, isStreaming = false } = {}) {
     },
     core: {
       async invoke(name, args) {
+        if (name === "conversation_workspace_inspect" && firstPromptWorkspace) {
+          return {
+            path: args.path, projectPath: args.path, repoRoot: args.path,
+            currentBranch: "main", head: "a".repeat(40),
+            branches: [{ name: "main", refName: "refs/heads/main", commit: "a".repeat(40) }],
+            defaults: { baseRef: "refs/heads/main", worktree: true },
+          };
+        }
+        if (name === "approval_mode_set_default") {
+          approvalMode = args.mode;
+          return { default: approvalMode, projects: {} };
+        }
+        if (name === "conversation_workspace_set_deferred") {
+          if (args.workspace.worktree) {
+            deferred.set(args.sessionId, args.workspace);
+            workspaceBindings.delete(args.sessionId);
+            return { workspace: null, deferredWorkspace: args.workspace };
+          }
+          deferred.delete(args.sessionId);
+          const workspace = { projectPath: "/project", baseRef: args.workspace.baseRef,
+            baseCommit: args.workspace.baseCommit, worktree: false };
+          workspaceBindings.set(args.sessionId, workspace);
+          return { workspace, deferredWorkspace: null };
+        }
         if (name === "start_session") {
-          const id = args.args.sessionId;
+          const { sessionId: id, cwd, resume, deferredWorkspace, firstPrompt } = args.args;
+          if (deferredWorkspace) deferred.set(id, deferredWorkspace);
+          const selection = firstPrompt ? deferred.get(id) : null;
+          if (firstPrompt) {
+            assert.ok(selection, "the first prompt prepares the pending workspace");
+            deferred.delete(id);
+          }
+          const metadataIndex = firstPromptWorkspace && !firstPrompt ? ++metadataStarts : 0;
           states.set(id, {
-            sessionId: id,
-            sessionFile: args.args.resume || `/saved/${id}.jsonl`,
-            sessionName: title,
-            messageCount: 2,
+            sessionId: firstPromptWorkspace
+              ? (firstPrompt ? "target-omp-id" : metadataIndex === 1 ? "metadata-omp-id" : `metadata-omp-id-${metadataIndex}`)
+              : id,
+            sessionFile: resume || `/saved/${firstPrompt ? "target" : id}.jsonl`,
+            sessionName: firstPrompt || metadataIndex > 1 ? null : title,
+            messageCount: firstPromptWorkspace ? 0 : 2,
             isStreaming,
             isSettled: !isStreaming,
           });
           return {
-            approvalMode: "write",
-            path: args.args.cwd,
-            workspace: null,
+            approvalMode,
+            path: firstPrompt ? "/worktrees/task" : cwd,
+            workspace: selection ? { projectPath: cwd, ...selection } : workspaceBindings.get(id) ?? null,
+            deferredWorkspace: deferred.get(id) ?? null,
           };
         }
         if (name === "replay_events") return { dropped: false, events: [] };
@@ -157,6 +192,13 @@ function harness(t, { title, autoName = true, isStreaming = false } = {}) {
         isSettled: !value,
       });
     },
+    sessionState() {
+      return states.get(bridge.activeSessionId);
+    },
+    async completeFirstExchange() {
+      states.get(bridge.activeSessionId).messageCount = 2;
+      await this.turn();
+    },
     async reopen() {
       await bridge.resumeSession({
         path: "/saved/conversation.jsonl",
@@ -194,6 +236,79 @@ function harness(t, { title, autoName = true, isStreaming = false } = {}) {
     },
   };
 }
+
+test("the first worktree exchange is auto-titled after the metadata session is replaced", async (t) => {
+  const h = harness(t, { firstPromptWorkspace: true });
+  const id = await h.bridge.openSession("/project");
+  await flush();
+  assert.equal(h.sessionState().sessionId, "metadata-omp-id");
+  assert.equal(h.bridge.getState().rpcState.sessionId, "metadata-omp-id");
+  assert.ok(h.snapshot.sessions[0].deferredWorkspace);
+  assert.equal(h.renames().length, 0);
+
+  assert.equal(await h.bridge.send("Implement the feature", []), true);
+  await flush();
+  assert.equal(h.bridge.activeSessionId, id);
+  assert.equal(h.sessionState().sessionId, "target-omp-id");
+  assert.equal(h.bridge.getState().rpcState.sessionId, "target-omp-id");
+  assert.equal(h.snapshot.sessions[0].path, "/worktrees/task");
+  assert.equal(h.renames().length, 0, "an incomplete target exchange must not be named");
+  await h.completeFirstExchange();
+  assert.equal(h.renames().length, 1, "the target session remains eligible for its first title");
+  assert.equal(h.renames()[0].sessionId, id);
+  await h.named("Implement the feature");
+  assert.equal(h.snapshot.sessions[0].name, "Implement the feature");
+});
+
+test("a manual title before worktree preparation remains disarmed in the target session", async (t) => {
+  const h = harness(t, { firstPromptWorkspace: true, title: "My chosen title" });
+  const id = await h.bridge.openSession("/project");
+  await flush();
+  assert.equal(h.sessionState().sessionId, "metadata-omp-id");
+  assert.equal(h.bridge.getState().rpcState.sessionId, "metadata-omp-id");
+  assert.equal(h.snapshot.sessions[0].name, "My chosen title");
+
+  assert.equal(await h.bridge.send("Implement the feature", []), true);
+  await flush();
+  assert.equal(h.sessionState().sessionId, "target-omp-id");
+  await h.completeFirstExchange();
+  for (let i = 0; i < 10; i++) await h.turn();
+  assert.equal(h.renames().length, 0);
+  assert.equal(h.snapshot.sessions[0].name, "My chosen title");
+});
+
+for (const restartApproval of [false, true]) {
+  for (const manualTitle of [false, true]) {
+    test(`a ${manualTitle ? "manual" : "pending automatic"} title survives Local choice${restartApproval ? " and approval restart" : ""}`, async (t) => {
+      const h = harness(t, { firstPromptWorkspace: true, ...(manualTitle ? { title: "My chosen title" } : {}) });
+      const id = await h.bridge.openSession("/project");
+      await flush();
+      assert.equal(h.sessionState().sessionId, "metadata-omp-id");
+      const local = { baseRef: "refs/heads/main", baseCommit: "a".repeat(40),
+        worktree: false, acknowledgeShared: true };
+      assert.equal((await h.bridge.setConversationWorkspace(id, local)).ok, true);
+      await flush();
+      assert.equal(h.sessionState().sessionId, "metadata-omp-id-2");
+      if (restartApproval) {
+        const result = await h.bridge.setApprovalModeDefault("yolo");
+        assert.equal(result.ok, true);
+        assert.ok(result.restarted.includes(id));
+        await flush();
+        assert.equal(h.sessionState().sessionId, "metadata-omp-id-3");
+      }
+      assert.equal(await h.bridge.send("Implement the local change", []), true);
+      await h.completeFirstExchange();
+      if (manualTitle) {
+        assert.equal(h.renames().length, 0);
+        assert.equal(h.snapshot.sessions[0].name, "My chosen title");
+      } else {
+        assert.equal(h.renames().length, 1);
+        assert.equal(h.renames()[0].sessionId, id);
+      }
+    });
+  }
+}
+
 
 test("the first title lands when the turn-end snapshot stays busy until session settlement", async (t) => {
   const h = harness(t, { isStreaming: true });

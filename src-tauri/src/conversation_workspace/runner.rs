@@ -6,6 +6,9 @@ use std::time::Duration;
 const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub(super) trait Runner {
+    fn validate_branch(&self, root: &Path, name: &str) -> Result<(), String> {
+        validate_branch(root, name, || false)
+    }
     fn switch(&self, root: &Path, branch: &str) -> Result<(), String>;
     fn worktree(
         &self,
@@ -49,6 +52,13 @@ impl<'a> Native<'a> {
 }
 
 impl Runner for Native<'_> {
+    fn validate_branch(&self, root: &Path, name: &str) -> Result<(), String> {
+        validate_branch(root, name, || {
+            self.cancellation
+                .is_some_and(|(manager, ticket)| manager.check_ticket(ticket).is_err())
+        })
+    }
+
     fn switch(&self, root: &Path, branch: &str) -> Result<(), String> {
         let mut command = git(root)?;
         command.args([
@@ -84,7 +94,7 @@ impl Runner for Native<'_> {
     }
 }
 
-pub(super) fn validate_branch(root: &Path, name: &str) -> Result<(), String> {
+fn validate_branch(root: &Path, name: &str, cancelled: impl Fn() -> bool) -> Result<(), String> {
     // Git's --branch form accepts previous-checkout expressions. Those expand
     // to another name and are not an explicit branch name.
     if name.is_empty() || name.starts_with("@{-") || name.starts_with("refs/heads/") {
@@ -92,7 +102,7 @@ pub(super) fn validate_branch(root: &Path, name: &str) -> Result<(), String> {
     }
     let mut command = git(root)?;
     command.args(["check-ref-format", "--branch", name]);
-    let output = process::run(&mut command, || false, CHECKOUT_TIMEOUT)?;
+    let output = process::run(&mut command, cancelled, CHECKOUT_TIMEOUT)?;
     if !output.status.success() {
         return Err("invalid branch name".to_string());
     }

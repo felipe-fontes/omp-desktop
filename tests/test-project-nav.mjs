@@ -494,15 +494,103 @@ check("restoreSpec opens a fresh, unnamed tab on the folder when there is no con
   assert.deepEqual(spec, { cwd: "/a", resume: null, name: null, profile: "default" });
 });
 
+check("pending worktree intent survives layout persistence without becoming a ready workspace", () => {
+  const deferredWorkspace = {
+    baseRef: "refs/heads/main", baseCommit: "a".repeat(40),
+    worktree: true, acknowledgeShared: false,
+  };
+  for (const sessionFile of [null, "/s/pending.jsonl"]) {
+    const pending = tab("pending", "/source", { profile: "work", deferredWorkspace, sessionFile });
+    const layout = JSON.parse(JSON.stringify(N.tabLayout([pending], "pending")));
+    assert.equal(layout.active, 0);
+    assert.deepEqual(layout.tabs[0].deferredWorkspace, deferredWorkspace);
+    assert.equal(layout.tabs[0].sessionFile, null, "pending layouts must not save the source process's session file");
+    assert.equal(Object.hasOwn(layout.tabs[0], "workspace"), false);
+    const reopened = N.restoreSpec(layout.tabs[0]);
+    assert.equal(reopened.cwd, "/source");
+    assert.equal(reopened.profile, "work");
+    assert.equal(reopened.resume, null, "pending preparation cannot resume even a stale saved session");
+    assert.deepEqual(reopened.deferredWorkspace, deferredWorkspace);
+    assert.equal(Object.hasOwn(reopened, "workspaceBinding"), false);
+    assert.equal(N.restoreSpec({ ...layout.tabs[0], sessionFile: "/s/stale.jsonl" }).resume, null);
+  }
+});
+
+check("an unsent Local selection is restored as pending for fresh safety validation", () => {
+  const selection = {
+    baseRef: "refs/heads/main", baseCommit: "a".repeat(40),
+    worktree: false, acknowledgeShared: true,
+  };
+  const persistedSelection = { ...selection, acknowledgeShared: false };
+  const workspace = { projectPath: "/source", baseRef: selection.baseRef, baseCommit: selection.baseCommit, worktree: false };
+  for (const sessionFile of [null, "/s/ephemeral.jsonl"]) {
+    const local = tab("local", "/source/sub", {
+      profile: "work", workspace, deferredWorkspace: null,
+      workspaceChoiceAvailable: true, workspaceSelection: selection, sessionFile,
+    });
+    const saved = JSON.parse(JSON.stringify(N.tabLayout([local], "local"))).tabs[0];
+    assert.deepEqual(saved.deferredWorkspace, persistedSelection, "shared-file consent must be obtained again after restore");
+    assert.equal(saved.sessionFile, null, "an unsent Local selection must not save the source process's session file");
+    const reopened = N.restoreSpec(saved);
+    assert.equal(reopened.cwd, "/source/sub");
+    assert.equal(reopened.profile, "work");
+    assert.equal(reopened.resume, null, "an unsent Local choice cannot resume an ephemeral session file");
+    assert.deepEqual(reopened.deferredWorkspace, persistedSelection);
+  }
+  const pending = tab("pending-local", "/source/sub", { deferredWorkspace: selection });
+  const savedPending = JSON.parse(JSON.stringify(N.tabLayout([pending], "pending-local"))).tabs[0];
+  assert.deepEqual(savedPending.deferredWorkspace, persistedSelection);
+  assert.deepEqual(N.restoreSpec(savedPending).deferredWorkspace, persistedSelection);
+  assert.equal(selection.acknowledgeShared, true, "saving must not change the live choice");
+  const sent = tab("sent", "/source/sub", {
+    profile: "work", workspace, workspaceChoiceAvailable: false,
+    workspaceSelection: selection, sessionFile: "/s/sent.jsonl",
+  });
+  const saved = JSON.parse(JSON.stringify(N.tabLayout([sent], "sent"))).tabs[0];
+  assert.equal(saved.sessionFile, "/s/sent.jsonl");
+  assert.equal(Object.hasOwn(saved, "deferredWorkspace"), false);
+  const reopened = N.restoreSpec(saved);
+  assert.equal(reopened.resume, "/s/sent.jsonl");
+  assert.deepEqual(reopened.workspaceBinding, workspace);
+  assert.equal(Object.hasOwn(reopened, "deferredWorkspace"), false);
+});
+
 check("worktree restore keeps the execution folder and never requests creation again", () => {
   const workspace = { projectPath: "/source", baseRef: "refs/heads/main", baseCommit: "a".repeat(40), worktree: true };
-  const layout = N.tabLayout([tab("isolated", "/worktrees/feature", { workspace, sessionFile: "/s/feature.jsonl" })], "isolated");
-  const reopened = N.restoreSpec(JSON.parse(JSON.stringify(layout)).tabs[0]);
-  assert.equal(reopened.cwd, "/worktrees/feature");
-  assert.equal(reopened.workspaceBinding.projectPath, "/source");
-  assert.equal(reopened.workspaceBinding.worktree, true);
-  assert.equal(reopened.resume, "/s/feature.jsonl");
-  assert.equal(Object.hasOwn(reopened, "workspace"), false, "restoration must not prepare a second worktree");
+  for (const sessionFile of [null, "/s/feature.jsonl"]) {
+    const layout = JSON.parse(JSON.stringify(N.tabLayout([
+      tab("isolated", "/worktrees/feature", { workspace, sessionFile }),
+    ], "isolated")));
+    assert.deepEqual(layout.tabs[0].workspace, workspace);
+    assert.equal(Object.hasOwn(layout.tabs[0], "deferredWorkspace"), false);
+    const reopened = N.restoreSpec(layout.tabs[0]);
+    assert.equal(reopened.cwd, "/worktrees/feature");
+    assert.deepEqual(reopened.workspaceBinding, workspace);
+    assert.equal(reopened.resume, sessionFile);
+    assert.equal(Object.hasOwn(reopened, "workspace"), false, "restoration must not prepare a second worktree");
+    assert.equal(Object.hasOwn(reopened, "deferredWorkspace"), false, "ready worktrees must not be prepared again");
+  }
+});
+
+check("pending and ready conversations stay grouped under their canonical source project", () => {
+  const pending = tab("pending", "/worktrees/existing", {
+    profile: "work", sourceProjectPath: "/source",
+    deferredWorkspace: { baseRef: "refs/heads/main", baseCommit: "a".repeat(40), worktree: true, acknowledgeShared: false },
+  });
+  const ready = isolated("ready", "/worktrees/feature", "/source", { profile: "work", sourceProjectPath: "/stale-source" });
+  assert.equal(N.projectPath(pending), "/source");
+  assert.equal(N.projectPath(ready), "/source", "a prepared binding takes priority over inspected metadata");
+  const groups = N.groupTabs([pending, ready]);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].path, "/source");
+  assert.deepEqual(groups[0].tabs.map(t => t.id), ["pending", "ready"]);
+  assert.equal(N.findProjectTab([pending, ready], "/source", "work", "ready"), "ready");
+  assert.equal(N.findProjectTab([pending, ready], "/source", "default", "ready"), null);
+  const saved = JSON.parse(JSON.stringify(N.tabLayout([pending], "pending"))).tabs[0];
+  assert.equal(Object.hasOwn(saved, "sourceProjectPath"), false, "canonical source metadata is re-inspected on restore");
+  const reopened = N.restoreSpec(saved);
+  assert.equal(reopened.cwd, "/worktrees/existing", "source grouping must not change the execution folder");
+  assert.deepEqual(reopened.deferredWorkspace, pending.deferredWorkspace);
 });
 
 check("normalized legacy worktrees restore their own cwd, profile, title and session", () => {

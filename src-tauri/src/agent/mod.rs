@@ -155,6 +155,8 @@ pub struct Launch<'a> {
     pub profile: Option<&'a str>,
     /// `--approval-mode`, from `approval_mode::ApprovalModeStore::resolve`.
     pub mode: crate::approval_mode::ApprovalMode,
+    /// Derived from the native prepared state, never from a renderer mode flag.
+    pub metadata_only: bool,
     /// Settings overlay passed as `--config=<path>` (the tab's browser
     /// `cdpUrl`, see `crate::browser`); `None` = no overlay.
     pub config: Option<&'a std::path::Path>,
@@ -220,10 +222,8 @@ impl AgentBridge {
         let Launch {
             cwd,
             source_project,
-            resume,
-            profile,
-            mode,
-            config,
+            metadata_only,
+            ..
         } = launch;
         let gen = self.next_gen.fetch_add(1, Ordering::SeqCst);
         let timestamp = std::time::SystemTime::now()
@@ -237,7 +237,7 @@ impl AgentBridge {
             let bootstrap = evidence.register_run(&session_id, &epoch, cwd, source_project)?;
             let bootstrap = serde_json::to_string(&bootstrap)
                 .map_err(|e| format!("Evidence bootstrap: {e}"))?;
-            spawn_omp(cwd, resume, profile, mode, config, &epoch, &bootstrap)
+            spawn_omp(launch, &epoch, &bootstrap)
         })();
         let (mut child, supervisor) = match spawned {
             Ok(c) => c,
@@ -291,6 +291,7 @@ impl AgentBridge {
                 // and `reap_and_clear_grants` below.
                 session_id.clone(),
                 BridgeInner {
+                    metadata_only,
                     gen,
                     stdin: Some(stdin_arc),
                     child: Some(child),
@@ -387,6 +388,11 @@ impl AgentBridge {
         self.clear_error(session_id);
     }
 
+    /// First-prompt checkout must not overlap the source process.
+    pub fn is_running(&self, session_id: &str) -> Result<bool, String> {
+        Ok(self.with_entry(session_id, |_| ())?.is_some())
+    }
+
     /// Write a JSON line to the session's stdin. The `type` field is
     /// checked against [`ALLOWED_COMMAND_TYPES`] before anything reaches
     /// the child process — a renderer bug or injected script can only ever
@@ -398,7 +404,12 @@ impl AgentBridge {
     /// generic "session not found" so the frontend gets the real reason.
     /// An `extension_ui_response` that reached omp settles its approval
     /// prompt: answered, it can no longer be granted ([`approvals`]).
-    pub fn send(&self, session_id: &str, line: &str) -> Result<(), String> {
+    pub fn send(
+        &self,
+        session_id: &str,
+        line: &str,
+        manager: &crate::conversation_workspace::WorkspaceManager,
+    ) -> Result<(), String> {
         // Strip any trailing CR/LF the caller appended. The omp RPC parser
         // is line-framed — a stray blank line corrupts the stream and a
         // newline embedded inside `line` would split one logical message
@@ -408,19 +419,29 @@ impl AgentBridge {
         let trimmed = line.trim_end_matches(['\r', '\n']);
         let command = validate_command_type(trimmed)?;
         let answered = approvals::answered_id(&command);
+        let login = (command.get("type").and_then(serde_json::Value::as_str) == Some("login"))
+            .then(|| command.get("id").and_then(serde_json::Value::as_str))
+            .flatten();
+        if command.get("type").and_then(serde_json::Value::as_str) == Some("login")
+            && login.is_none()
+            && manager.has_unstarted_choice(session_id)
+        {
+            return Err("login requires a request id before the first task".into());
+        }
 
         let context_request = matches!(
             command.get("type").and_then(serde_json::Value::as_str),
             Some("get_entries" | "get_subagent_messages")
         );
-        let Some((stdin_arc, open, answer_journal, alive, context_catalog)) =
+        let Some((stdin_arc, open, answer_journal, alive, context_catalog, metadata_only)) =
             self.with_entry(session_id, |inner| {
                 (
                     inner.stdin.as_ref().map(Arc::clone),
                     answered.map(|_| Arc::clone(&inner.approvals)),
-                    answered.map(|_| Arc::clone(&inner.journal)),
+                    (answered.is_some() || login.is_some()).then(|| Arc::clone(&inner.journal)),
                     answered.map(|_| Arc::clone(&inner.alive)),
                     context_request.then(|| Arc::clone(&inner.context_catalog)),
+                    inner.metadata_only,
                 )
             })?
         else {
@@ -429,18 +450,42 @@ impl AgentBridge {
                 .unwrap_or_else(|| format!("session '{session_id}' not found")));
         };
         let stdin_arc = stdin_arc.ok_or_else(|| "agent not running".to_string())?;
+        let login_answer = answered.filter(|id| {
+            valid_login_answer(&command)
+                && answer_journal.as_ref().is_some_and(|journal| {
+                    journal
+                        .lock()
+                        .is_ok_and(|journal| journal.is_login_answer(id))
+                })
+        });
+        if login.is_some() || login_answer.is_some() {
+            manager.admit_metadata_login(session_id, metadata_only)?;
+        }
+        // Login input is still subject to an atomic journal claim at write
+        // time; everything else follows the normal task admission gate.
+        manager.admit_command(
+            session_id,
+            command_is_task(&command) && login_answer.is_none(),
+        )?;
         if let Some(catalog) = &context_catalog {
             catalog
                 .lock()
                 .map_err(|_| "catalog lock poisoned".to_owned())?
                 .request(&command);
         }
-        if let Err(error) = write_command(
-            &stdin_arc,
-            trimmed,
-            answered.zip(open.as_deref()),
-            answered.zip(answer_journal.as_deref()),
-        ) {
+        let written = if let (Some(id), Some(journal)) = (login_answer, answer_journal.as_deref()) {
+            write_login_answer(&stdin_arc, trimmed, id, journal)
+        } else if let (Some(id), Some(journal)) = (login, answer_journal.as_deref()) {
+            write_login_command(&stdin_arc, trimmed, id, journal)
+        } else {
+            write_command(
+                &stdin_arc,
+                trimmed,
+                answered.zip(open.as_deref()),
+                answered.zip(answer_journal.as_deref()),
+            )
+        };
+        if let Err(error) = written {
             if let Some(catalog) = &context_catalog {
                 if let Ok(mut catalog) = catalog.lock() {
                     catalog.cancel(&command);
@@ -646,8 +691,33 @@ fn reap_and_clear_grants(
 /// Extracted as a pure function so the validation logic is unit-testable
 /// without a running child process.
 fn validate_command_type(trimmed: &str) -> Result<serde_json::Value, String> {
-    let parsed: serde_json::Value =
-        serde_json::from_str(trimmed).map_err(|_| "command is not valid JSON".to_string())?;
+    struct Frame(serde_json::Value);
+    impl<'de> serde::Deserialize<'de> for Frame {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct FrameVisitor;
+            impl<'de> serde::de::Visitor<'de> for FrameVisitor {
+                type Value = Frame;
+                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("a JSON command object without duplicate fields")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Frame, A::Error> {
+                    let mut fields = serde_json::Map::new();
+                    while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
+                        if fields.insert(key, value).is_some() {
+                            return Err(serde::de::Error::custom("duplicate command field"));
+                        }
+                    }
+                    Ok(Frame(serde_json::Value::Object(fields)))
+                }
+            }
+            deserializer.deserialize_map(FrameVisitor)
+        }
+    }
+    let Frame(parsed) = serde_json::from_str(trimmed)
+        .map_err(|_| "command is not valid JSON or contains duplicate fields".to_string())?;
     let cmd_type = parsed
         .get("type")
         .and_then(serde_json::Value::as_str)
@@ -656,6 +726,101 @@ fn validate_command_type(trimmed: &str) -> Result<serde_json::Value, String> {
         return Err(format!("command type '{cmd_type}' is not allowed"));
     }
     Ok(parsed)
+}
+
+/// Only these commands are permitted while the source process is metadata-only.
+fn command_is_task(command: &serde_json::Value) -> bool {
+    let Some(kind) = command.get("type").and_then(serde_json::Value::as_str) else {
+        return true;
+    };
+    !matches!(
+        kind,
+        "get_session_stats"
+            | "get_state"
+            | "get_messages"
+            | "get_entries"
+            | "get_available_models"
+            | "get_available_commands"
+            | "negotiate_protocol"
+            | "set_model"
+            | "cycle_model"
+            | "cycle_thinking_level"
+            | "get_available_thinking_levels"
+            | "set_thinking_level"
+            | "get_login_providers"
+            | "login"
+            | "set_ask_dialog"
+            | "set_subagent_subscription"
+            | "get_subagents"
+            | "get_subagent_messages"
+            | "set_auto_compaction"
+            | "set_auto_retry"
+            | "dictation_start"
+            | "dictation_stop"
+    )
+}
+
+/// Input replies are strings or explicit cancellation, never tool approvals.
+fn valid_login_answer(command: &serde_json::Value) -> bool {
+    let Some(fields) = command.as_object() else {
+        return false;
+    };
+    if fields
+        .keys()
+        .any(|key| !matches!(key.as_str(), "type" | "id" | "value" | "cancelled"))
+    {
+        return false;
+    }
+    matches!(
+        (fields.get("value"), fields.get("cancelled")),
+        (Some(serde_json::Value::String(_)), None) | (None, Some(serde_json::Value::Bool(true)))
+    )
+}
+
+fn write_login_command<W: Write>(
+    stdin: &Mutex<W>,
+    line: &str,
+    id: &str,
+    journal: &Mutex<EventJournal>,
+) -> Result<(), String> {
+    let mut writer = stdin
+        .lock()
+        .map_err(|_| "stdin lock poisoned".to_string())?;
+    journal
+        .lock()
+        .map_err(|_| "journal lock poisoned".to_string())?
+        .begin_login(id)
+        .map_err(str::to_owned)?;
+    let result = writeln!(*writer, "{line}").and_then(|()| writer.flush());
+    if result.is_err() {
+        if let Ok(mut journal) = journal.lock() {
+            journal.finish_login(id);
+        }
+    }
+    drop(writer);
+    result.map_err(|error| error.to_string())
+}
+
+fn write_login_answer<W: Write>(
+    stdin: &Mutex<W>,
+    line: &str,
+    id: &str,
+    journal: &Mutex<EventJournal>,
+) -> Result<(), String> {
+    let mut writer = stdin
+        .lock()
+        .map_err(|_| "stdin lock poisoned".to_string())?;
+    let seq = journal
+        .lock()
+        .map_err(|_| "journal lock poisoned".to_string())?
+        .begin_login_answer(id)
+        .map_err(str::to_owned)?;
+    let result = writeln!(*writer, "{line}").and_then(|()| writer.flush());
+    if let Ok(mut journal) = journal.lock() {
+        journal.finish_answer(id, seq, result.is_ok());
+    }
+    drop(writer);
+    result.map_err(|error| error.to_string())
 }
 
 /// Write one command line to omp's `stdin`. An answer is marked in flight
@@ -736,6 +901,30 @@ mod tests {
         assert!(err.contains("missing string 'type'"));
     }
 
+    #[test]
+    fn pending_command_admission_rejects_duplicate_types_and_classifies_task_routes() {
+        assert!(validate_command_type(r#"{"type":"get_state","type":"prompt"}"#).is_err());
+        assert!(validate_command_type(r#"{"type":"prompt","type":"get_state"}"#).is_err());
+        assert!(validate_command_type(r#"{"type":42}"#).is_err());
+        assert!(!command_is_task(
+            &validate_command_type(r#"{"type":"set_model","provider":"x","modelId":"y"}"#).unwrap()
+        ));
+        for kind in [
+            "prompt",
+            "follow_up",
+            "steer",
+            "live_start",
+            "goal",
+            "branch",
+            "fork",
+            "extension_ui_response",
+        ] {
+            assert!(command_is_task(
+                &validate_command_type(&format!(r#"{{"type":"{kind}"}}"#)).unwrap()
+            ));
+        }
+    }
+
     fn open_prompt(id: &str) -> Mutex<PendingApprovals> {
         let open = Mutex::new(PendingApprovals::new(None));
         approvals::observe(
@@ -808,11 +997,198 @@ mod tests {
         Arc::new(Mutex::new(journal))
     }
 
+    #[test]
+    fn login_claims_roll_back_failed_writes_and_ignore_cancelled_callbacks() {
+        let journal = journal_with_frames(&[]);
+        let login = r#"{"type":"login","id":"login-1","providerId":"oauth"}"#;
+        assert!(write_login_command(&Mutex::new(Broken), login, "login-1", &journal).is_err());
+        let stdin = Mutex::new(Vec::<u8>::new());
+        write_login_command(&stdin, login, "login-1", &journal).unwrap();
+        let observe = |frame: serde_json::Value| {
+            journal
+                .lock()
+                .unwrap()
+                .push_frame(Arc::from(frame.to_string()), Some(&frame), false);
+        };
+        observe(
+            serde_json::json!({"type":"extension_ui_request","method":"open_url","url":"https://example.test"}),
+        );
+        observe(
+            serde_json::json!({"type":"extension_ui_request","method":"input","id":"code","timeout":600_000}),
+        );
+        let answer = r#"{"type":"extension_ui_response","id":"code","value":"abc"}"#;
+        assert!(write_login_answer(&Mutex::new(Broken), answer, "code", &journal).is_err());
+        assert!(journal.lock().unwrap().is_login_answer("code"));
+        write_login_answer(&stdin, answer, "code", &journal).unwrap();
+        assert!(!journal.lock().unwrap().is_login_answer("code"));
+        observe(
+            serde_json::json!({"type":"extension_ui_request","method":"input","id":"cancelled","timeout":600_000}),
+        );
+        observe(
+            serde_json::json!({"type":"extension_ui_request","method":"cancel","targetId":"cancelled"}),
+        );
+        assert!(write_login_answer(&stdin, answer, "cancelled", &journal).is_err());
+    }
+
+    #[cfg(unix)]
+    fn pending_oauth_fixture(
+        manager: &crate::conversation_workspace::WorkspaceManager,
+    ) -> Option<crate::git_browser::fixture::Repo> {
+        use crate::conversation_workspace::{StartContext, WorkspaceOptions};
+        let repo = crate::git_browser::fixture::init("agent-pending-oauth")?;
+        let source = crate::external_open::canonical_folder(repo.path()).unwrap();
+        let ticket = manager.ticket("oauth").unwrap();
+        manager
+            .lock()
+            .prepare_deferred(
+                "oauth",
+                &source,
+                WorkspaceOptions {
+                    base_ref: None,
+                    base_commit: None,
+                    worktree: true,
+                    acknowledge_shared: false,
+                    task: String::new(),
+                    branch_name: None,
+                },
+                StartContext {
+                    data: None,
+                    manager,
+                    ticket: &ticket,
+                },
+            )
+            .unwrap();
+        Some(repo)
+    }
+
+    #[cfg(unix)]
+    fn set_oauth_metadata_only(bridge: &AgentBridge, metadata_only: bool) {
+        bridge
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut("oauth")
+            .unwrap()
+            .metadata_only = metadata_only;
+    }
+
+    #[cfg(unix)]
+    fn oauth_input(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "extension_ui_request", "id": id, "method": "input",
+            "title": "Paste code"
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_workspace_only_allows_correlated_login_input_or_cancellation() {
+        use crate::conversation_workspace::WorkspaceManager;
+        use std::process::{Command, Stdio};
+
+        let manager = WorkspaceManager::default();
+        let Some(_repo) = pending_oauth_fixture(&manager) else {
+            return;
+        };
+
+        let bridge = AgentBridge::new();
+        let mut command = Command::new("cat");
+        command.stdin(Stdio::piped()).stdout(Stdio::null());
+        let mut child = crate::spawn_gate::spawn(&mut command).unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let journal = journal_with_frames(&[]);
+        bridge.sessions.lock().unwrap().insert(
+            "oauth".into(),
+            BridgeInner {
+                metadata_only: false,
+                stdin: Some(Arc::new(Mutex::new(stdin))),
+                child: Some(child),
+                journal: Arc::clone(&journal),
+                ..idle_inner(Arc::new(AtomicBool::new(true)))
+            },
+        );
+        let observe = |frame: serde_json::Value| {
+            journal
+                .lock()
+                .unwrap()
+                .push_frame(Arc::from(frame.to_string()), Some(&frame), false);
+        };
+        let send = |line: &str| bridge.send("oauth", line, &manager);
+        observe(oauth_input("before-login"));
+        assert!(
+            send(r#"{"type":"extension_ui_response","id":"before-login","value":"x"}"#).is_err()
+        );
+        assert!(send(r#"{"type":"login","providerId":"oauth"}"#).is_err());
+        assert!(send(r#"{"type":"login","id":"login-1","providerId":"oauth"}"#).is_err());
+        set_oauth_metadata_only(&bridge, true);
+        assert!(send(r#"{"type":"login","id":"login-1","providerId":"oauth"}"#).is_ok());
+        assert!(send(r#"{"type":"login","id":"login-2","providerId":"oauth"}"#).is_err());
+        observe(oauth_input("before-url"));
+        assert!(send(r#"{"type":"extension_ui_response","id":"before-url","value":"x"}"#).is_err());
+        observe(
+            serde_json::json!({"type":"extension_ui_request","method":"open_url","url":"https://example.test/auth"}),
+        );
+        observe(approval_prompt("approval", "bash"));
+        observe(serde_json::json!({"type":"extension_ui_request","id":"ask","method":"ask"}));
+        assert!(
+            send(r#"{"type":"extension_ui_response","id":"approval","value":"Approve"}"#).is_err()
+        );
+        assert!(send(r#"{"type":"extension_ui_response","id":"ask","cancelled":true}"#).is_err());
+        assert!(send(r#"{"type":"extension_ui_response","id":"unknown","value":"x"}"#).is_err());
+        observe(oauth_input("code"));
+        assert!(send(
+            r#"{"type":"extension_ui_response","id":"code","value":"x","cancelled":true}"#
+        )
+        .is_err());
+        assert!(send(
+            r#"{"type":"extension_ui_response","id":"code","type":"get_state","value":"x"}"#
+        )
+        .is_err());
+        set_oauth_metadata_only(&bridge, false);
+        assert!(
+            send(r#"{"type":"extension_ui_response","id":"code","value":"oauth-code"}"#).is_err()
+        );
+        set_oauth_metadata_only(&bridge, true);
+        assert!(
+            send(r#"{"type":"extension_ui_response","id":"code","value":"oauth-code"}"#).is_ok()
+        );
+        assert!(send(r#"{"type":"extension_ui_response","id":"code","value":"again"}"#).is_err());
+        observe(oauth_input("cancel"));
+        assert!(send(r#"{"type":"extension_ui_response","id":"cancel","cancelled":true}"#).is_ok());
+        observe(oauth_input("stale"));
+        observe(
+            serde_json::json!({"type":"response","command":"login","id":"login-1","success":true}),
+        );
+        assert!(send(r#"{"type":"extension_ui_response","id":"stale","value":"x"}"#).is_err());
+        assert!(send(r#"{"type":"login","id":"login-2","providerId":"oauth"}"#).is_ok());
+        observe(
+            serde_json::json!({"type":"extension_ui_request","method":"open_url","url":"https://example.test/auth"}),
+        );
+        observe(oauth_input("uncertain"));
+        journal.lock().unwrap().mark_pending_incomplete();
+        assert!(send(r#"{"type":"extension_ui_response","id":"uncertain","value":"x"}"#).is_err());
+        observe(
+            serde_json::json!({"type":"response","command":"login","id":"login-2","success":false}),
+        );
+        assert!(send(r#"{"type":"login","id":"login-3","providerId":"oauth"}"#).is_ok());
+        observe(
+            serde_json::json!({"type":"extension_ui_request","method":"open_url","url":"https://example.test/auth"}),
+        );
+        observe(oauth_input("fresh"));
+        assert!(
+            send(r#"{"type":"extension_ui_response","id":"fresh","value":"new-code"}"#).is_ok()
+        );
+        assert!(send(r#"{"type":"prompt","message":"run a task"}"#).is_err());
+        assert!(manager.has_unstarted_choice("oauth"));
+        bridge.shutdown_all();
+    }
+
     /// A map entry with no process behind it (generation 1, empty journal and
     /// extension state); a test overrides the fields it exercises.
     pub(super) fn idle_inner(alive: Arc<AtomicBool>) -> BridgeInner {
         BridgeInner {
             gen: 1,
+            metadata_only: false,
             stdin: None,
             child: None,
             supervisor: None,
@@ -1038,6 +1414,7 @@ mod tests {
             .send(
                 sid,
                 r#"{"type":"extension_ui_response","id":"q","value":"Deny"}"#,
+                &crate::conversation_workspace::WorkspaceManager::default(),
             )
             .unwrap();
         assert_eq!(tracker().snapshot()[sid], (false, 0));
@@ -1088,7 +1465,8 @@ mod tests {
         assert!(bridge
             .send(
                 sid,
-                r#"{"type":"extension_ui_response","id":"q","value":"Deny"}"#
+                r#"{"type":"extension_ui_response","id":"q","value":"Deny"}"#,
+                &crate::conversation_workspace::WorkspaceManager::default(),
             )
             .is_err());
         assert_eq!(tracker().snapshot()[sid], (false, 1));

@@ -33,14 +33,20 @@
     return MODES.find(m => m.value === mode)?.label ?? mode;
   }
 
-  /** The mode a tab in folder `path` spawns with: the project's override,
-   *  else the global default. No view yet (before the boot fetch) reads as
-   *  the desktop's default, which is also what Rust spawns with then. */
-  function effectiveFor(view, path) {
+  /** Actual checkout override first, then its verified source project, then
+   *  the global default. Paths are canonicalized by the native workspace. */
+  function effectiveFor(view, path, sourcePath = null) {
     if (!view) return DEFAULT_MODE;
     const own = path ? view.projects?.[path] : undefined;
     if (isMode(own)) return own;
+    const source = sourcePath ? view.projects?.[sourcePath] : undefined;
+    if (isMode(source)) return source;
     return isMode(view.default) ? view.default : DEFAULT_MODE;
+  }
+
+  function effectiveForTab(view, entry) {
+    return effectiveFor(view, entry?.path || null,
+      entry?.workspace?.projectPath || entry?.sourceProjectPath || null);
   }
 
   /** Toolbar approvals button for a tab: `running` is the label of the mode its omp
@@ -50,7 +56,7 @@
    *  `label` is the one-line form (`running ⇢ target` when pending).
    *  `warn` follows the target, so yolo turns amber as soon as it is chosen. */
   function statusCell(view, entry) {
-    const effective = effectiveFor(view, entry?.path || null);
+    const effective = effectiveForTab(view, entry);
     const running = isMode(entry?.approvalMode) ? entry.approvalMode : null;
     const pending = running !== null && running !== effective;
     const target = labelOf(effective);
@@ -73,9 +79,9 @@
     const now = [];
     const later = [];
     for (const s of Array.isArray(sessions) ? sessions : []) {
-      if (!isMode(s?.approvalMode) || s.approvalMode === effectiveFor(view, s.path || null)) continue;
+      if (!isMode(s?.approvalMode) || s.approvalMode === effectiveForTab(view, s)) continue;
       if (s.runState === "failed") continue;
-      (isBusyRunState(s.runState) ? later : now).push(s.id);
+      (s.workspacePreparing || s.workspaceConfiguring || isBusyRunState(s.runState) ? later : now).push(s.id);
     }
     return { now, later };
   }
@@ -96,6 +102,6 @@
   }
 
   window.OMP_APPROVAL_MODE = Object.freeze({
-    MODES, DEFAULT_MODE, isMode, labelOf, effectiveFor, statusCell, restartPlan, projectRows,
+    MODES, DEFAULT_MODE, isMode, labelOf, effectiveFor, effectiveForTab, statusCell, restartPlan, projectRows,
   });
 })();

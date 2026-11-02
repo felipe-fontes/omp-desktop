@@ -157,7 +157,7 @@
       if (!status?.listening) return "remote access disabled";
       if (!status.devices?.some(device => device.id === action.deviceId && device.connected)) return "device revoked";
       const startedAt = typeof action.dispatchedAt === "number" ? Math.min(enqueuedAt, action.dispatchedAt) : enqueuedAt;
-      return Date.now() - startedAt > ACTION_MAX_AGE_MS ? "expired" : null;
+      return Date.now() - startedAt >= ACTION_MAX_AGE_MS ? "expired" : null;
     };
     async function ensureTab(action, enqueuedAt) {
       if (typeof bridge.waitForActivation === "function") await bridge.waitForActivation();
@@ -181,6 +181,11 @@
         const reason = refusal(action, enqueuedAt);
         if (reason) throw new Error(reason);
       };
+      const admission = () => {
+        guard();
+        if (activeTab() !== tabId || getSnapshot()?.activeSessionId !== tabId) throw new Error("tab not available");
+        return true;
+      };
       try {
         guard();
         await ensureTab(action, enqueuedAt);
@@ -188,22 +193,23 @@
         // never got the command.
         const deliver = async call => {
           if (typeof bridge.waitForActivation === "function") await bridge.waitForActivation();
-          guard();
-          if (activeTab() !== tabId || getSnapshot()?.activeSessionId !== tabId) throw new Error("tab not available");
+          admission();
           let result;
-          try { result = await call(); } catch { throw new Error("desktop could not deliver"); }
-          if (result === false) throw new Error("desktop could not deliver");
+          try { result = await call(); } catch { admission(); throw new Error("desktop could not deliver"); }
+          if (result === false) { admission(); throw new Error("desktop could not deliver"); }
           if (result?.ok === false) throw new Error(result.error);
         };
         switch (kind) {
           case "select": break;
           case "prompt":
             if (!nonBlank(action.text)) throw new Error("invalid text");
-            await deliver(() => getSnapshot().isStreaming ? bridge.steer(action.text) : bridge.send(action.text));
+            await deliver(() => getSnapshot().isStreaming
+              ? bridge.steer(action.text, undefined, action.text, admission)
+              : bridge.send(action.text, undefined, action.text, admission));
             break;
           case "steer":
             if (!nonBlank(action.text)) throw new Error("invalid text");
-            await deliver(() => bridge.steer(action.text)); break;
+            await deliver(() => bridge.steer(action.text, undefined, action.text, admission)); break;
           case "abort": await deliver(() => bridge.abort()); break;
           case "answer": {
             const deadline = Date.now() + 5000;

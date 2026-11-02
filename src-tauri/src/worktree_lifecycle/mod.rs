@@ -57,6 +57,9 @@ pub fn register(
     profile: &str,
     session_file: Option<&str>,
 ) -> Result<Option<WorkspaceView>, String> {
+    if prepared.deferred_workspace.is_some() {
+        return Ok(None);
+    }
     if !managed_candidate(app, &prepared.path) {
         return Ok(None);
     }
@@ -107,6 +110,9 @@ pub fn for_tab(
     let prepared = registry
         .get(id)
         .ok_or_else(|| "conversation tab is no longer registered".to_string())?;
+    if prepared.deferred_workspace.is_some() {
+        return Ok(None);
+    }
     if let Some(id) = prepared.storage_id.as_deref() {
         return with_store(app, |store| {
             let mut view = store.workspace(id)?;

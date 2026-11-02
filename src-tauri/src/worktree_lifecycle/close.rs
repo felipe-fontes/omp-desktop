@@ -46,6 +46,7 @@ pub fn close_tab(
     let (retained_id, retained) = registry
         .take_registration(session_id)
         .ok_or_else(|| "conversation tab is no longer registered".to_string())?;
+    let task_admission = manager.suspend_task_admission(session_id);
     crate::end_tabs_locked(app, &[session_id], &mut registry);
     let result = (|| {
         if view.state == "evicted" {
@@ -68,6 +69,7 @@ pub fn close_tab(
     })()
     .map(|_| ())
     .map_err(|error| {
+        manager.restore_task_admission(session_id, task_admission);
         registry.retain_registration(retained_id, retained);
         format!(
             "Close could not finish; local work was retained. The agent and terminal were stopped. {error}"

@@ -17,6 +17,8 @@ pub(super) struct BridgeInner {
     /// must never clobber the entry of a freshly started session that
     /// happens to share an id.
     pub(super) gen: u64,
+    /// True only when this incarnation disabled ambient extension discovery.
+    pub(super) metadata_only: bool,
     /// Stdin wrapped in its own mutex so writes never serialize through
     /// the bridge map lock. A blocked write on a slow consumer can no
     /// longer deadlock concurrent `start_session` / `stop_session` calls.

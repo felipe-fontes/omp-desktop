@@ -14,23 +14,36 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 pub struct Output {
     pub status: ExitStatus,
     pub stdout: Vec<u8>,
+    pub stdout_truncated: bool,
     pub stderr: Vec<u8>,
+}
+
+struct Captured {
+    bytes: Vec<u8>,
+    truncated: bool,
 }
 
 fn drain(
     mut pipe: impl Read + Send + 'static,
-) -> Result<Receiver<std::io::Result<Vec<u8>>>, String> {
+) -> Result<Receiver<std::io::Result<Captured>>, String> {
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("workspace-output".to_string())
         .spawn(move || {
             let mut tail = VecDeque::with_capacity(OUTPUT_KEEP);
+            let mut truncated = false;
             let mut chunk = [0u8; 4096];
             let result = loop {
                 match pipe.read(&mut chunk) {
-                    Ok(0) => break Ok(Vec::from(tail)),
+                    Ok(0) => {
+                        break Ok(Captured {
+                            bytes: Vec::from(tail),
+                            truncated,
+                        })
+                    }
                     Ok(n) => {
                         let excess = (tail.len() + n).saturating_sub(OUTPUT_KEEP);
+                        truncated |= excess > 0;
                         tail.drain(..excess);
                         tail.extend(&chunk[..n]);
                     }
@@ -51,8 +64,8 @@ fn terminate(supervisor: &ProcessSupervisor, child: &mut Child) {
 }
 
 fn take_output(
-    rx: &Receiver<std::io::Result<Vec<u8>>>,
-    slot: &mut Option<Vec<u8>>,
+    rx: &Receiver<std::io::Result<Captured>>,
+    slot: &mut Option<Captured>,
 ) -> Result<(), String> {
     if slot.is_some() {
         return Ok(());
@@ -121,8 +134,9 @@ pub fn run(
         if let (Some(stdout), Some(stderr)) = (&mut stdout, &mut stderr) {
             return Ok(Output {
                 status,
-                stdout: std::mem::take(stdout),
-                stderr: std::mem::take(stderr),
+                stdout_truncated: stdout.truncated,
+                stdout: std::mem::take(&mut stdout.bytes),
+                stderr: std::mem::take(&mut stderr.bytes),
             });
         }
         if cancelled() {

@@ -13,6 +13,7 @@ const Babel = createRequire(import.meta.url)(fileURLToPath(new URL("../src/babel
 const compile = path => Babel.transform(source(path), { presets: ["react"] }).code;
 const chatCode = compile("src/design/chat/chat-view.jsx");
 const actionCode = compile("src/design/chat/message-actions.jsx");
+const composerCode = compile("src/design/composer.jsx");
 
 // Slots follow hook call order, and changed effects clean up before re-running.
 // A commit attaches refs before layout effects, then runs passive effects;
@@ -247,6 +248,61 @@ const deferred = () => {
 };
 const flush = async () => { for (let i = 0; i < 10; i++) await Promise.resolve(); };
 
+function composerHarness(onSend, onCancelWorkspace = () => {}) {
+  const h = reactHarness(), calls = [], errors = [];
+  const window = {
+    OMP_MENTIONS: { parseMentionQuery: () => null },
+    OMP_IMAGES: {
+      MAX_ATTACHMENTS: 4, prepareImage: async file => file.image,
+      toDataUrl: image => `data:${image.data}`,
+    },
+    OMP_SLASH: { slashMenu: () => [], midPromptSlashToken: () => null },
+    OMP_QUEUE: {}, OMP_BROWSER: { droppedScreenshots: () => 0 },
+    Icon() {}, useActiveRowIntoView() {},
+  };
+  const names = ["LiveVoicePanel", "DictationPanel", "PendingInput", "QueueStrip", "BrowserChips",
+    "PasteStrip", "VoiceSpectrum", "VoiceModeButton", "ThinkingMenu", "TabRunDot", "MentionMenu"];
+  const scope = {
+    window, React: h.React, document: { activeElement: null },
+    requestAnimationFrame: () => {}, setTimeout, clearTimeout,
+    console: { error: (...args) => errors.push(args) },
+    ...Object.fromEntries(names.map(name => [name, () => null])),
+  };
+  for (const file of ["src/app/session-ui.js", "src/app/widgets.js"]) runInNewContext(source(file), scope);
+  runInNewContext(composerCode, scope);
+  const props = {
+    sessionId: "A", sessionIds: ["A", "B"], targetedDraftInserts: [], dictationCompleted: [],
+    onAckDraftInserts() {}, onAckDictation() {}, microcopy: {}, onCancelWorkspace,
+    onSend(text, images) {
+      calls.push({ sessionId: props.sessionId, text, images: Array.from(images) });
+      return onSend(text, images);
+    },
+  };
+  const render = () => h.commit(() => window.Composer(props));
+  const textarea = () => nodes(h.tree, node => node.type === "textarea")[0];
+  const images = () => nodes(h.tree, node => node.type === "img").map(node => node.props.src);
+  const send = () => byClass(h.tree, "primary").find(node => node.type === "button");
+  render();
+  return {
+    calls, errors, render, textarea, images, send,
+    update(next) { Object.assign(props, next); render(); },
+    type(text) {
+      textarea().props.onChange({ target: { value: text, selectionStart: text.length } });
+      render();
+    },
+    async attach(image) {
+      const input = nodes(h.tree, node => node.type === "input" && node.props.type === "file")[0];
+      input.props.onChange({ target: { files: [{ type: "image/png", name: "capture.png", image }], value: "capture.png" } });
+      await flush();
+      render();
+    },
+    cancel() {
+      click(buttons(h.tree).find(button => button.children.includes("Cancel send")));
+    },
+    unmount: h.unmount,
+  };
+}
+
 test("rewind is confirmed and cancellation or Escape never moves the conversation", () => {
   const calls = [];
   const ui = actionHarness({ onRewind: id => { calls.push(id); return { ok: true }; }, onFork: () => ({ ok: true }) });
@@ -353,5 +409,102 @@ test("backend refusal and rejection surface errors and restore usable controls",
   assert.equal(alerts[0].children[0], "transport failed");
   assert.equal(ui.primary()[0].props.disabled, false);
   assert.equal(attempts, 2);
+  ui.unmount();
+});
+
+for (const outcome of ["cancelled", "rejected"]) {
+  test(`composer retains its text and image after an async ${outcome} submission and can retry`, async () => {
+    const first = deferred(), retry = deferred(), attempts = [first, retry];
+    const ui = composerHarness(() => attempts.shift().promise, () => first.resolve(false));
+    const image = { data: "original-image", mimeType: "image/png" };
+    ui.type("Keep this request");
+    await ui.attach(image);
+    click(ui.send());
+    ui.render();
+    assert.equal(ui.textarea().props.value, "Keep this request");
+    assert.deepEqual(ui.images(), ["data:original-image"]);
+    if (outcome === "cancelled") {
+      ui.update({ workspace: { workspacePreparing: true } });
+      ui.cancel();
+    } else {
+      first.reject(new Error("workspace preparation failed"));
+    }
+    await flush();
+    ui.update({ workspace: null });
+    assert.equal(ui.textarea().props.value, "Keep this request");
+    assert.deepEqual(ui.images(), ["data:original-image"]);
+    if (outcome === "rejected") assert.match(ui.errors[0][1].message, /workspace preparation failed/);
+    else assert.equal(ui.errors.length, 0);
+
+    click(ui.send());
+    assert.deepEqual(ui.calls, [
+      { sessionId: "A", text: "Keep this request", images: [image] },
+      { sessionId: "A", text: "Keep this request", images: [image] },
+    ]);
+    retry.resolve(true);
+    await flush();
+    ui.render();
+    assert.equal(ui.textarea().props.value, "");
+    assert.deepEqual(ui.images(), []);
+    ui.unmount();
+  });
+}
+
+test("composer deduplicates in-flight submissions and does not erase later edits", async () => {
+  const pending = deferred(), ui = composerHarness(() => pending.promise);
+  const original = { data: "original", mimeType: "image/png" };
+  const added = { data: "added", mimeType: "image/png" };
+  ui.type("Original request");
+  await ui.attach(original);
+  const send = ui.send();
+  click(send);
+  click(send);
+  ui.render();
+  click(ui.send());
+  assert.deepEqual(ui.calls, [{ sessionId: "A", text: "Original request", images: [original] }]);
+  ui.type("Edited while sending");
+  await ui.attach(added);
+  click(ui.send());
+  assert.equal(ui.calls.length, 1, "a changed draft must not start a second concurrent submission");
+  pending.resolve(true);
+  await flush();
+  ui.render();
+  assert.equal(ui.textarea().props.value, "Edited while sending");
+  assert.deepEqual(ui.images(), ["data:original", "data:added"]);
+  ui.unmount();
+});
+
+test("async submissions update only their originating tab after tab switches", async () => {
+  const first = deferred(), second = deferred(), attempts = [first, second];
+  const ui = composerHarness(() => attempts.shift().promise);
+  const imageA = { data: "image-a", mimeType: "image/png" };
+  const imageB = { data: "image-b", mimeType: "image/png" };
+  ui.type("Draft A");
+  await ui.attach(imageA);
+  click(ui.send());
+  ui.update({ sessionId: "B" });
+  ui.type("Draft B");
+  await ui.attach(imageB);
+  click(ui.send());
+  assert.deepEqual(ui.calls, [
+    { sessionId: "A", text: "Draft A", images: [imageA] },
+    { sessionId: "B", text: "Draft B", images: [imageB] },
+  ]);
+  first.resolve(false);
+  await flush();
+  ui.render();
+  assert.equal(ui.textarea().props.value, "Draft B");
+  assert.deepEqual(ui.images(), ["data:image-b"]);
+  ui.update({ sessionId: "A" });
+  assert.equal(ui.textarea().props.value, "Draft A");
+  assert.deepEqual(ui.images(), ["data:image-a"]);
+  second.resolve(true);
+  await flush();
+  ui.render();
+  assert.equal(ui.textarea().props.value, "Draft A");
+  assert.deepEqual(ui.images(), ["data:image-a"]);
+  ui.update({ sessionId: "B" });
+  assert.equal(ui.textarea().props.value, "");
+  assert.deepEqual(ui.images(), []);
   ui.unmount();
 });

@@ -18,7 +18,7 @@ Same three values as omp (`docs/approval-mode.md` in the omp repo), kebab-case o
 
 ## The flag is the only lever
 
-- `spawn::omp_args` always pushes `mode.flag()` (`--approval-mode=always-ask|write|yolo`). The mode a tab runs is the one `start_session` resolved from the store for its folder, never a value the webview sent (`StartSessionArgs` keeps `deny_unknown_fields`).
+- `spawn::omp_args` always pushes `mode.flag()` (`--approval-mode=always-ask|write|yolo`). The mode is resolved natively for the actual checkout and verified source project, never a value the webview sent (`StartSessionArgs` keeps `deny_unknown_fields`).
 - omp has no RPC for changing the mode of a running process. A change therefore means a new process.
 - omp's `main.ts` applies the flag with `cfgToolsApprovalMode.override`: the flag beats `tools.approvalMode` in `~/.omp/agent/config.yml` (and the profile's), so a config file cannot move a desktop tab off the mode the desktop chose. `tools.approval` per-tool policies are honoured in every mode.
 - The desktop does not pass `--yolo` or `--auto-approve`.
@@ -40,16 +40,16 @@ Same three values as omp (`docs/approval-mode.md` in the omp repo), kebab-case o
 
 ## Resolution
 
-`start_session` calls `ApprovalModeStore::resolve(cwd)`: the project's override if the tab's folder has one, else `default`. It returns the mode string, which is what omp was spawned with. The frontend stores that return value as `sessionRegistry` `approvalMode` for the incarnation (`null` until the first spawn resolves). `StartSessionArgs` keeps `deny_unknown_fields`, so a mode in the request is refused.
+`start_session` calls `ApprovalModeStore::resolve_workspace(actual, source)`: an explicit actual-checkout override wins, then a verified source-project override, then the global default. The source comes from native workspace inspection/binding, not a renderer-supplied policy path. A first-prompt worktree therefore cannot silently lose a stricter source mode. The returned mode becomes `sessionRegistry.approvalMode` for this process incarnation (`null` until startup resolves); a mode in `StartSessionArgs` is refused.
 
-The frontend's "what should run" is `OMP_APPROVAL_MODE.effectiveFor(view, path)`: the project row's value if set, else `default`. A null view or a tab without a path falls back as the pure module documents.
+The frontend's matching decision is `OMP_APPROVAL_MODE.effectiveForTab(view, entry)`, using the actual path and source identity with the same precedence. The editor operates on the grouped source project while retaining separate explicit per-checkout overrides. Null views and pathless tabs keep the documented default behavior.
 
 ## Restart on change
 
 `setApprovalModeDefault` / `setApprovalModeProject` store the returned view and call `_applyApprovalModes()`, which is `OMP_APPROVAL_MODE.restartPlan(view, sessions)`:
 
-- A tab is in the plan iff its `approvalMode` is a mode and differs from `effectiveFor(view, path)`.
-- **Idle** tabs (`!isBusyRunState(runState)`, not `failed`) are restarted now: `_respawnSession(id, { profile, resume: sessionFile })`.
+- A tab is in the plan iff its `approvalMode` is a mode and differs from `effectiveForTab(view, entry)`.
+- **Idle** tabs (`!isBusyRunState(runState)`, not `failed`) restart now through `_respawnSession`. An in-flight workspace preparation or choice change defers the mode restart until it settles; it cannot race first-prompt cutover.
 - **Busy** tabs (`running`, `retrying`, `waiting-user`, `background`) are left alone and recomputed later. The idle hook is every applied `get_state` response (the `get_state` branch of `_handleResponse`): the one the active tab's `agent_end` asks for and the one `_initFetch` sends on activation both pass through it, so a busy tab is re-planned at its next idle point. A background tab's `agent_end` is not processed until it is active, so it is checked on activation.
 - **`failed`** tabs (omp process gone) are in neither list; their next start uses the new mode.
 - A per-tab `_respawning` guard (generalised from `_profileSwitching`) keeps a second pass from respawning the same tab while one is in flight.
@@ -58,7 +58,7 @@ The frontend's "what should run" is `OMP_APPROVAL_MODE.effectiveFor(view, path)`
 `_respawnSession` is the body of the profile switch, generalised. Both paths go through `stop_session` (not `close_tab`), so:
 
 - The tab id, name, project folder and terminal shell survive. `stop_session` does not touch the terminal (`terminal.md`).
-- The conversation survives: the new process is `omp … --resume=<sessionFile>`. `start_session` validates the resume path against the profile's sessions directory (`saved_sessions::validate_resume`). A tab whose omp has not yet written its session file has no `sessionFile`, or one that does not exist yet (`validate_resume`: "resume path does not exist"); its restart falls back to a spawn without `--resume` (a fresh conversation). This is the only case where a mode restart starts fresh.
+- Ready coding conversations survive through `omp … --resume=<sessionFile>`, validated against the profile's session directory. An unstarted metadata conversation deliberately restarts without resume, retains its deferred choice/model/thinking and clears only the old native title identity. A ready conversation whose file has not yet been written still uses the existing missing-resume fallback to a fresh process.
 - A profile switch keeps its old behaviour: `branch: null` and `_freshConversationFields`, a fresh conversation. A mode restart keeps the registry entry as it is; only `processStartedAt` changes.
 - The restarted process is a new omp process, so it writes the conversation to the prompt cache again (its system prompt differs), the same cold write the conversation tree shows for any new process (CHANGELOG 0.7.0).
 - A failure shows the note "Approval mode change failed" (the profile path keeps "Profile switch failed").

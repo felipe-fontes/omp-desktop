@@ -1,11 +1,9 @@
-// The bridge owns the pending request; this dialog owns inspection and choices.
-// Neither opening the dialog nor editing defaults starts a conversation.
+// Advanced per-conversation workspace choices and project defaults.
 const { OMP_CONVERSATION_WORKSPACE: _NC_Workspace } = window;
 
 function NewConversationDialog({
   request,
   bridge,
-  onStarted,
   suspended = false,
 }) {
   const panelRef = React.useRef(null);
@@ -21,7 +19,6 @@ function NewConversationDialog({
   const [statusError, setStatusError] = React.useState(null);
   const [refName, setRefName] = React.useState(null);
   const [worktree, setWorktree] = React.useState(false);
-  const [task, setTask] = React.useState("");
   const [createBranch, setCreateBranch] = React.useState(false);
   const [branchName, setBranchName] = React.useState("");
   const [defaultRef, setDefaultRef] = React.useState(null);
@@ -59,8 +56,11 @@ function NewConversationDialog({
       const defaults = _NC_Workspace.defaultSelection(preview);
       setInfo(preview);
       if (!selectionInitializedRef.current) {
-        setRefName(initial.refName);
-        setWorktree(!!preview.repoRoot && initial.worktree);
+        const desired = request.preferredWorktree ?? request.workspace?.worktree ?? initial.worktree;
+        setRefName(desired ? (request.workspace?.worktree ? request.workspace.baseRef : initial.refName) : _NC_Workspace.defaultRef(preview));
+        setWorktree(!!preview.repoRoot && desired);
+        setCreateBranch(!!desired && !!request.workspace?.branchName);
+        setBranchName(desired ? (request.workspace?.branchName || "") : "");
         selectionInitializedRef.current = true;
       } else if (!preview.repoRoot) {
         setWorktree(false);
@@ -79,7 +79,7 @@ function NewConversationDialog({
     }
     if (request.configure) return; // Editing project defaults never needs a checkout scan.
     try {
-      const result = await bridge.conversationWorkspaceStatus(preview.path);
+      const result = await bridge.conversationWorkspaceStatus(preview.path, request.sessionId);
       if (!current()) return;
       if (!result?.ok || !_NC_Workspace.statusKnown(result.value)) {
         setStatusError(
@@ -167,7 +167,7 @@ function NewConversationDialog({
   const decision = configuring
     ? _NC_Workspace.defaultsDecision(info, defaultRef, defaultWorktree)
     : _NC_Workspace.selection(info, refName, worktree, acknowledge, status, {
-        task,
+        deferred: true,
         branchName: createBranch ? branchName : undefined,
       });
   const folder = info?.projectPath || info?.path || request.path;
@@ -185,10 +185,8 @@ function NewConversationDialog({
         request.id,
         decision.options,
       );
-      if (result?.ok && task.trim()) {
-        onStarted?.({ sessionId: result.sessionId, task });
-      } else if (mountedRef.current && !result?.ok) {
-        setError(String(result?.error || "Could not start the conversation."));
+      if (mountedRef.current && !result?.ok) {
+        setError(String(result?.error || "Could not update the workspace."));
       }
     } catch (err) {
       if (mountedRef.current) setError(String(err?.message || err));
@@ -252,7 +250,7 @@ function NewConversationDialog({
       >
         <div className="nc-head">
           <span id="nc-title">
-            {configuring ? "Project workspace defaults" : "New conversation"}
+            {configuring ? "Project workspace defaults" : "Conversation workspace"}
           </span>
           <span className="nc-profile mono">{request.profile}</span>
         </div>
@@ -276,33 +274,9 @@ function NewConversationDialog({
             </div>
           ) : (
             <div className="nc-explainer">
-              These choices apply only to this conversation; starting does not
-              save project defaults.
+              These choices apply only to this conversation and do not save
+              project defaults. Worktrees are prepared on the first message.
             </div>
-          )}
-          {!configuring && (
-            <label className="nc-field">
-              <span>
-                Task{" "}
-                <span className="nc-optional">
-                  {createBranch
-                    ? "(required for branch creation)"
-                    : "(optional)"}
-                </span>
-              </span>
-              <textarea
-                rows={3}
-                value={task}
-                disabled={busy}
-                onChange={(e) => setTask(e.target.value)}
-                aria-required={createBranch}
-                aria-describedby="nc-task-help"
-              />
-              <span className="nc-field-help" id="nc-task-help">
-                Added to the new conversation's draft for you to review; it will
-                not be sent automatically.
-              </span>
-            </label>
           )}
           <div className="nc-row">
             <label className="nc-branch">
@@ -411,9 +385,8 @@ function NewConversationDialog({
           )}
           {!configuring && info?.repoRoot && worktree && (
             <div className="nc-note">
-              A separate worktree will be created from the selected commit. It
-              starts detached, without a branch, unless you choose to create
-              one. Uncommitted source changes are not copied.
+              A separate worktree and branch will be created on the first
+              message. Uncommitted source changes are not copied.
             </div>
           )}
           {!configuring && info?.repoRoot && worktree && (
@@ -425,7 +398,7 @@ function NewConversationDialog({
                   disabled={busy}
                   onChange={(e) => setCreateBranch(e.target.checked)}
                 />
-                Create branch for this task
+                Choose an explicit branch name
               </label>
               {createBranch && (
                 <label className="nc-field">
@@ -439,7 +412,7 @@ function NewConversationDialog({
                     aria-describedby="nc-branch-help"
                   />
                   <span className="nc-field-help" id="nc-branch-help">
-                    Enter a task and an explicit new branch name.
+                    Leave this off to name the branch from your first message.
                   </span>
                 </label>
               )}
@@ -548,10 +521,10 @@ function NewConversationDialog({
             {busy
               ? configuring
                 ? "Saving…"
-                : "Starting…"
+                : "Saving…"
               : configuring
                 ? "Save defaults"
-                : "Start conversation"}
+                : "Save workspace"}
           </button>
         </div>
       </div>

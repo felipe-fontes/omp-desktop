@@ -32,7 +32,7 @@
   // Saved bases are used only for isolated worktrees, never to switch the
   // existing checkout implicitly. Preserve missing worktree bases for review.
   function initialSelection(info) {
-    const worktree = !!info?.repoRoot && !!info?.defaults?.worktree;
+    const worktree = !!info?.repoRoot && (info?.defaults ? !!info.defaults.worktree : true);
     return {
       refName: worktree
         ? (info?.defaults?.baseRef ?? defaultRef(info))
@@ -120,7 +120,7 @@
       if (!info.repoRoot)
         return refuse("Creating a branch requires a Git repository.");
       if (!worktree) return refuse("Enable Worktree to create a branch.");
-      if (!task.trim()) return refuse("Enter a task before creating a branch.");
+      if (!task.trim() && !intent.deferred) return refuse("Enter a task before creating a branch.");
       if (typeof branchName !== "string" || !branchName.trim())
         return refuse("Enter a branch name to create a branch.");
       if (
@@ -220,7 +220,7 @@
     } else if (!worktree && !same && (status.dirty || status.owners > 0)) {
       error =
         "Cannot switch branches while this folder has uncommitted changes or is used by an open tab. Use a worktree instead.";
-    } else if (!worktree && !same && !task.trim()) {
+    } else if (!worktree && !same && !task.trim() && !intent.deferred) {
       error =
         "Enter a task before switching the existing checkout to another branch.";
     } else if (needsAcknowledgement && !acknowledgeShared) {
