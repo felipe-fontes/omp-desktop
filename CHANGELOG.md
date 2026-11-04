@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Prompt-driven Git feature branches: Rust checks the selected folder before sending the compact branch policy. Only existing Git working trees qualify; non-Git or absent workspaces receive no branching instructions, and Git is never initialized automatically. After the first implementation task or a separate feature, branch naming follows prompt context or explicit user instructions. Related follow-ups stay on their branch, with no automatic worktree, commit or push.
+
 - Chat replies now show a compact **cache** disclosure, with the latest request also in the Ambient context card. Expand it for provider/model, cache-read/write tokens, uncached input, output and available costs. This works with any provider's omp usage counters; missing counters and unrecognized cache formats have distinct notices. Provider support stays unknown when the data cannot establish it: zero counters can be omp defaults, not proof a provider has no cache. This is request usage, not live cache size or time remaining.
 
 - **Disposable conversation worktrees**: × offers **Cancel**, **Keep for now**, or **Save restore point and remove**. Verified restore points preserve commit, staged/unstaged changes and local data; capture failure keeps the files and exposes a safe retry. Reopening reconstructs the saved workspace without resetting a moved branch or overwriting an occupied old folder. Conversations and evidence remain outside the checkout.

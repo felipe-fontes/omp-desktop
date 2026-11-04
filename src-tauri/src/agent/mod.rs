@@ -21,6 +21,7 @@
 //! through `crate::supervisor` (Job Object / process group).
 
 mod approvals;
+mod branch_policy;
 mod context_catalog;
 mod context_extension;
 mod evidence_requests;
