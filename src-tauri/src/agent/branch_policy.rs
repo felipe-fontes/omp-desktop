@@ -1,9 +1,24 @@
 //! Feature-branch instructions for the agent's explicitly selected workspace.
+//!
+//! Only Local conversations get them. A pending source process is
+//! metadata-only and runs no task; a managed worktree's branch is created
+//! natively on the first prompt, so the agent must not create a second one.
 
 use std::path::Path;
 
+pub(super) fn for_launch(
+    cwd: Option<&str>,
+    metadata_only: bool,
+    managed_worktree: bool,
+) -> Option<&'static str> {
+    if metadata_only || managed_worktree {
+        return None;
+    }
+    for_workspace(cwd)
+}
+
 /// No selected working tree means no branch-policy text reaches the agent.
-pub(super) fn for_workspace(cwd: Option<&str>) -> Option<&'static str> {
+fn for_workspace(cwd: Option<&str>) -> Option<&'static str> {
     let path = Path::new(cwd?);
     if !path.is_absolute() {
         return None;
@@ -14,9 +29,23 @@ pub(super) fn for_workspace(cwd: Option<&str>) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::for_workspace;
+    use super::{for_launch, for_workspace};
     use crate::git_browser::fixture;
     use crate::test_support::TempDir;
+
+    #[test]
+    fn only_a_full_local_process_receives_branch_instructions() {
+        let Some(repo) = fixture::init("branch-policy-launch") else {
+            return;
+        };
+        let cwd = repo.path().to_str();
+        assert!(for_launch(cwd, false, false).is_some());
+        // The native manager already created this worktree's branch.
+        assert!(for_launch(cwd, false, true).is_none());
+        // A pending source process may not run tasks at all.
+        assert!(for_launch(cwd, true, false).is_none());
+        assert!(for_launch(cwd, true, true).is_none());
+    }
 
     #[test]
     fn non_git_workspace_receives_no_branch_instructions() {

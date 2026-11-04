@@ -158,6 +158,9 @@ pub struct Launch<'a> {
     pub mode: crate::approval_mode::ApprovalMode,
     /// Derived from the native prepared state, never from a renderer mode flag.
     pub metadata_only: bool,
+    /// An app-managed worktree whose branch the native workspace manager
+    /// created; it never receives the agent branch policy.
+    pub managed_worktree: bool,
     /// Settings overlay passed as `--config=<path>` (the tab's browser
     /// `cdpUrl`, see `crate::browser`); `None` = no overlay.
     pub config: Option<&'a std::path::Path>,

@@ -5,6 +5,25 @@ use std::time::Duration;
 
 const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The branch a new worktree checks out.
+#[derive(Clone, Copy)]
+pub(super) enum WorktreeBranch<'a> {
+    Detached,
+    /// Created at the commit (`-b`), never an existing name.
+    New(&'a str),
+    /// An existing local branch whose tip is the commit.
+    Existing(&'a str),
+}
+
+impl<'a> WorktreeBranch<'a> {
+    pub(super) const fn name(self) -> Option<&'a str> {
+        match self {
+            Self::Detached => None,
+            Self::New(name) | Self::Existing(name) => Some(name),
+        }
+    }
+}
+
 pub(super) trait Runner {
     fn validate_branch(&self, root: &Path, name: &str) -> Result<(), String> {
         validate_branch(root, name, || false)
@@ -13,7 +32,7 @@ pub(super) trait Runner {
     fn worktree(
         &self,
         root: &Path,
-        branch: Option<&str>,
+        branch: WorktreeBranch<'_>,
         dest: &Path,
         commit: &str,
     ) -> Result<(), String>;
@@ -76,7 +95,7 @@ impl Runner for Native<'_> {
     fn worktree(
         &self,
         root: &Path,
-        branch: Option<&str>,
+        branch: WorktreeBranch<'_>,
         dest: &Path,
         commit: &str,
     ) -> Result<(), String> {
@@ -84,12 +103,20 @@ impl Runner for Native<'_> {
         // This is an explicit checkout mutation: Git's normal checkout filters
         // and post-checkout hook still run, just as with an in-place switch.
         command.args(["worktree", "add"]);
-        if let Some(branch) = branch {
-            command.args(["-b", branch]);
-        } else {
-            command.arg("--detach");
-        }
-        command.arg("--").arg(dest).arg(commit);
+        let start = match branch {
+            WorktreeBranch::New(name) => {
+                command.args(["-b", name]);
+                commit
+            }
+            WorktreeBranch::Detached => {
+                command.arg("--detach");
+                commit
+            }
+            // Git refuses a branch already checked out elsewhere; the caller
+            // verifies the checked-out branch and commit afterwards.
+            WorktreeBranch::Existing(name) => name,
+        };
+        command.arg("--").arg(dest).arg(start);
         self.execute(&mut command, "git worktree add")
     }
 }

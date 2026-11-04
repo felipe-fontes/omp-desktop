@@ -334,7 +334,11 @@ fn configure_omp(
     }
     cmd.env("OMP_DESKTOP_CONTEXT_EPOCH", context_epoch);
     cmd.env("OMP_DESKTOP_EVIDENCE_BOOTSTRAP", evidence_bootstrap);
-    if let Some(policy) = super::branch_policy::for_workspace(resolved_cwd) {
+    if let Some(policy) = super::branch_policy::for_launch(
+        resolved_cwd,
+        launch.metadata_only,
+        launch.managed_worktree,
+    ) {
         cmd.arg("--append-system-prompt").arg(policy);
     }
     cmd.args(omp_args(
@@ -357,9 +361,9 @@ fn configure_omp(
 /// whole process tree (subagents, tool-call children) can be torn down as
 /// a unit — plain `Child::kill` only signals the direct `omp` process.
 ///
-/// Branch timing, intent and naming follow the user's task, not chat startup.
-/// Append the desktop policy without replacing system/project instructions or
-/// changing the existing context extensions and tool-approval mode.
+/// A Local Git process gets the desktop branch policy appended without
+/// replacing system/project instructions or changing the context extensions
+/// and tool-approval mode; a managed worktree's branch is native-owned.
 pub(super) fn spawn_omp(
     launch: super::Launch<'_>,
     context_epoch: &str,

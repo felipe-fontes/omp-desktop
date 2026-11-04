@@ -1,4 +1,6 @@
 //! Tool-free, bounded naming using the conversation's resolved omp profile.
+//! The same request reports the task's explicit Git instructions.
+use super::git_intent::{self, GitIntent};
 use super::{process, Admission, FirstPrompt, WorkspaceManager};
 use std::path::Path;
 use std::time::Duration;
@@ -79,7 +81,7 @@ pub(super) fn name_with_omp(
     prompt: &FirstPrompt,
     manager: &WorkspaceManager,
     ticket: &Admission,
-) -> Result<String, String> {
+) -> Result<GitIntent, String> {
     validate_prompt(prompt)?;
     if !data.is_absolute() {
         return Err("no durable app data folder is available for worktrees".into());
@@ -88,7 +90,20 @@ pub(super) fn name_with_omp(
         .create(data)
         .map_err(|e| format!("cannot create app data folder: {e}"))?;
     let mut cmd = crate::agent::spawn::omp_command()?;
-    cmd.current_dir(data).args(["--print", "--no-tools", "--no-extensions", "--no-skills", "--no-rules", "--no-context-files", "--no-session", "--no-title", "--no-lsp", "--no-pty", "--thinking=off", "--system-prompt=Return only a short lowercase kebab-case Git branch slug describing the task. Use 1-48 ASCII lowercase letters, digits and single hyphens; start with a letter, end with a letter or digit. No explanation."]);
+    cmd.current_dir(data).args([
+        "--print",
+        "--no-tools",
+        "--no-extensions",
+        "--no-skills",
+        "--no-rules",
+        "--no-context-files",
+        "--no-session",
+        "--no-title",
+        "--no-lsp",
+        "--no-pty",
+        "--thinking=off",
+    ]);
+    cmd.arg(format!("--system-prompt={}", git_intent::SYSTEM_PROMPT));
     if let Some(flag) = crate::agent::spawn::profile_flag(profile) {
         cmd.arg(flag);
     }
@@ -102,14 +117,15 @@ pub(super) fn name_with_omp(
         end -= 1;
     }
     cmd.arg(format!("Task: {}", &task[..end]));
-    run_naming(&mut cmd, manager, ticket)
+    run_naming(&mut cmd, manager, ticket, &task[..end])
 }
 
 fn run_naming(
     cmd: &mut std::process::Command,
     manager: &WorkspaceManager,
     ticket: &Admission,
-) -> Result<String, String> {
+    task: &str,
+) -> Result<GitIntent, String> {
     let output = process::run(
         cmd,
         || manager.check_ticket(ticket).is_err(),
@@ -127,28 +143,36 @@ fn run_naming(
     }
     let text = std::str::from_utf8(&output.stdout)
         .map_err(|_| "naming model returned non-UTF-8 output")?;
-    let slug = text.trim();
-    validate_slug(slug)?;
-    Ok(slug.to_owned())
+    git_intent::parse(text, task)
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
+    const TASK: &str = "Fix the parser from develop";
+
     #[test]
     fn naming_process_refuses_failures_bad_output_and_cancellation() {
         let manager = WorkspaceManager::default();
         let ticket = manager.ticket("naming").unwrap();
         let mut failure = crate::test_support::shell("echo failed >&2; exit 1");
-        assert!(run_naming(&mut failure, &manager, &ticket).is_err());
-        let mut invalid = crate::test_support::shell("printf '../bad\\n'");
-        assert!(run_naming(&mut invalid, &manager, &ticket).is_err());
+        assert!(run_naming(&mut failure, &manager, &ticket, TASK).is_err());
+        let mut invalid = crate::test_support::shell("printf '{\"slug\":\"../bad\"}\\n'");
+        assert!(run_naming(&mut invalid, &manager, &ticket, TASK).is_err());
+        let mut valid = crate::test_support::shell(
+            "printf '{\"slug\":\"fix-parser\",\"base\":\"develop\"}\\n'",
+        );
+        let intent = run_naming(&mut valid, &manager, &ticket, TASK).unwrap();
+        assert_eq!(
+            (intent.slug.as_str(), intent.base.as_deref()),
+            ("fix-parser", Some("develop"))
+        );
         let mut oversized = crate::test_support::shell("i=0; while [ \"$i\" -lt 4200 ]; do printf x; i=$((i + 1)); done; printf '\\nvalid-slug\\n'");
-        assert!(run_naming(&mut oversized, &manager, &ticket).is_err());
+        assert!(run_naming(&mut oversized, &manager, &ticket, TASK).is_err());
         manager.cancel_pending(&["naming"]);
-        let mut cancelled = crate::test_support::shell("printf valid-slug");
-        assert!(run_naming(&mut cancelled, &manager, &ticket).is_err());
+        let mut cancelled = crate::test_support::shell("printf '{\"slug\":\"valid-slug\"}'");
+        assert!(run_naming(&mut cancelled, &manager, &ticket, TASK).is_err());
     }
 
     #[test]
@@ -164,7 +188,7 @@ mod tests {
         std::thread::scope(|scope| {
             let worker = scope.spawn(|| {
                 let mut command = crate::test_support::shell(&script);
-                run_naming(&mut command, &manager, &ticket)
+                run_naming(&mut command, &manager, &ticket, TASK)
             });
             let started =
                 crate::test_support::wait_until(Duration::from_secs(5), || marker.exists());
@@ -238,7 +262,7 @@ mod tests {
             let worker = scope.spawn(|| {
                 let admission = manager.begin_naming(&ticket).unwrap();
                 let mut command = crate::test_support::shell(&script);
-                let result = run_naming(&mut command, &manager, &ticket);
+                let result = run_naming(&mut command, &manager, &ticket, TASK);
                 drop(admission);
                 result
             });
@@ -259,7 +283,7 @@ mod tests {
                     prompt: &prompt,
                 },
                 snapshot,
-                Some("repair-authentication"),
+                Some(git_intent::named("repair-authentication")),
                 context()
             )
             .is_err());
@@ -290,7 +314,7 @@ mod tests {
             let worker = scope.spawn(|| {
                 let admission = manager.begin_naming(&ticket).unwrap();
                 let mut command = crate::test_support::shell(&script);
-                let result = run_naming(&mut command, &manager, &ticket);
+                let result = run_naming(&mut command, &manager, &ticket, TASK);
                 finished.store(true, Ordering::SeqCst);
                 drop(admission);
                 result

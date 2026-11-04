@@ -1,5 +1,6 @@
 //! Serializes workspace preparation with tab registration and lifecycle.
 mod admission;
+mod git_intent;
 mod inspect;
 mod naming;
 pub mod process;
@@ -8,6 +9,7 @@ mod runner;
 mod tests;
 
 pub use admission::{Admission, WorkspaceManager};
+pub use git_intent::GitIntent;
 pub use inspect::WorkspaceInfo;
 pub use naming::Model;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -351,17 +353,17 @@ impl Registry {
         Err("conversation has no deferred first prompt".into())
     }
 
-    pub fn semantic_slug(
+    /// A Worktree plan reads the task's name and explicit Git instructions
+    /// before anything is created, even with a setup branch name, so a
+    /// conflicting instruction is refused rather than ignored. Local needs none.
+    pub fn first_intent(
         plan: &WorkspaceOptions,
         prompt: &FirstPrompt,
         profile: Option<&str>,
         context: &StartContext<'_>,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<GitIntent>, String> {
         if !plan.worktree {
             return Ok(None);
-        }
-        if let Some(branch) = &plan.branch_name {
-            return naming::branch_slug(branch).map(Some);
         }
         let data = context
             .data
@@ -373,7 +375,7 @@ impl Registry {
         &mut self,
         request: FirstRequest<'_>,
         expected: (Option<WorkspaceOptions>, u64),
-        slug: Option<&str>,
+        intent: Option<GitIntent>,
         context: StartContext<'_>,
     ) -> Result<Prepared, String> {
         context.manager.check_ticket(context.ticket)?;
@@ -396,9 +398,11 @@ impl Registry {
         };
         let source = tab.path.clone();
         plan.task.clone_from(&prompt.text);
-        let directory = if plan.worktree {
-            let slug = slug.ok_or_else(|| "worktree name is unavailable".to_string())?;
-            naming::validate_slug(slug)?;
+        let checkout = if plan.worktree {
+            let intent = intent.ok_or_else(|| "worktree name is unavailable".to_string())?;
+            naming::validate_slug(&intent.slug)?;
+            // Settled before any Git mutation; a conflict leaves the source as is.
+            let resolved = git_intent::resolve(plan.branch_name.take(), intent)?;
             let mut random = [0u8; 3];
             SystemRandom::new()
                 .fill(&mut random)
@@ -408,11 +412,8 @@ impl Registry {
                 suffix.push(char::from(HEX[usize::from(byte >> 4)]));
                 suffix.push(char::from(HEX[usize::from(byte & 15)]));
             }
-            let name = format!("{slug}-{suffix}");
-            if plan.branch_name.is_none() {
-                plan.branch_name = Some(format!("omp/{name}"));
-            }
-            Some(name)
+            let info = inspect::read(inspect::folder(&source)?)?;
+            Some(git_intent::apply(info, &mut plan, resolved, &suffix)?)
         } else {
             ensure_local_current(&source, &plan)?;
             None
@@ -424,7 +425,7 @@ impl Registry {
             context.data,
             &native,
             Some(id),
-            directory.as_deref(),
+            checkout.as_ref(),
         )?;
         next.deferred_source = Some(source);
         profile.clone_into(&mut next.profile);
@@ -559,7 +560,7 @@ impl Registry {
         data: Option<&Path>,
         runner: &impl runner::Runner,
         excluded: Option<&str>,
-        directory: Option<&str>,
+        checkout: Option<&git_intent::Checkout>,
     ) -> Result<Prepared, String> {
         if options.branch_name.is_some() && (!options.worktree || options.task.trim().is_empty()) {
             return Err("creating a branch requires a task and a worktree".to_string());
@@ -573,7 +574,7 @@ impl Registry {
             } else {
                 self.owners_excluding(&identity, excluded, false)?
             };
-            selected_repo(info, &options, owners, data, runner, directory)?
+            selected_repo(info, &options, owners, data, runner, checkout)?
         } else {
             if options.worktree || options.base_ref.is_some() || options.base_commit.is_some() {
                 return Err("a non-git folder has no branch or worktree".to_string());
@@ -650,7 +651,7 @@ fn selected_repo(
     owners: usize,
     data: Option<&Path>,
     runner: &impl runner::Runner,
-    directory: Option<&str>,
+    checkout: Option<&git_intent::Checkout>,
 ) -> Result<String, String> {
     let root = Path::new(
         info.repo_root
@@ -678,16 +679,23 @@ fn selected_repo(
     };
     if options.worktree {
         let commit = commit.ok_or_else(|| "a worktree requires a committed base".to_string())?;
-        if let Some(name) = options.branch_name.as_deref() {
-            validate_new_branch(root, name, runner)?;
-        }
+        let branch = match options.branch_name.as_deref() {
+            Some(name) if checkout.is_some_and(|checkout| checkout.existing) => {
+                runner::WorktreeBranch::Existing(name)
+            }
+            Some(name) => {
+                validate_new_branch(root, name, runner)?;
+                runner::WorktreeBranch::New(name)
+            }
+            None => runner::WorktreeBranch::Detached,
+        };
         return create_worktree(
             &info,
             root,
             data,
             commit,
-            options.branch_name.as_deref(),
-            directory,
+            branch,
+            checkout.map(|checkout| checkout.directory.as_str()),
             runner,
         );
     }
@@ -771,7 +779,7 @@ fn create_worktree(
     root: &Path,
     data: Option<&Path>,
     commit: &str,
-    branch: Option<&str>,
+    branch: runner::WorktreeBranch<'_>,
     directory: Option<&str>,
     runner: &impl runner::Runner,
 ) -> Result<String, String> {
@@ -814,7 +822,7 @@ fn create_worktree(
         return Err("generated worktree folder already exists; try again".to_string());
     }
     let artifacts = |error: String| {
-        branch.map_or_else(
+        branch.name().map_or_else(
             || format!("{error}. Worktree artifacts, if created, were retained at {}", dest.display()),
             |name| format!("{error}. Worktree artifacts, if created, were retained at {} and branch {name}", dest.display()),
         )
@@ -834,7 +842,7 @@ fn create_worktree(
         ));
     }
     let actual = inspect::read(dest_text).map_err(artifacts)?;
-    if actual.head.as_deref() != Some(commit) || actual.current_branch.as_deref() != branch {
+    if actual.head.as_deref() != Some(commit) || actual.current_branch.as_deref() != branch.name() {
         return Err(artifacts(
             "native worktree has an unexpected branch or commit".to_string(),
         ));

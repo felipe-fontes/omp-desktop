@@ -178,8 +178,8 @@ fn prepare_first_prompt<'a>(
     let naming = manager.begin_naming(context.ticket)?;
     // Model latency must not block unrelated tab metadata or lifecycle work.
     drop(registry);
-    let slug = if let Some(plan) = &plan {
-        conversation_workspace::Registry::semantic_slug(plan, first, profile, &context)?
+    let intent = if let Some(plan) = &plan {
+        conversation_workspace::Registry::first_intent(plan, first, profile, &context)?
     } else {
         None
     };
@@ -197,7 +197,7 @@ fn prepare_first_prompt<'a>(
             prompt: first,
         },
         (plan, revision),
-        slug.as_deref(),
+        intent,
         context,
     )?;
     Ok((registry, prepared))
@@ -387,6 +387,8 @@ fn spawn_registered_session(
             profile,
             mode,
             metadata_only: prepared.deferred_workspace.is_some(),
+            // Native binding (prepared or catalogued), never a renderer flag.
+            managed_worktree: workspace.as_ref().is_some_and(|binding| binding.worktree),
             config: overlay.as_deref(),
         },
         app.clone(), // the bridge's readers own an app handle

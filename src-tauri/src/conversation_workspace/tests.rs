@@ -1,3 +1,4 @@
+use super::git_intent::named;
 use super::{inspect, runner, Registry, WorkspaceManager, WorkspaceOptions};
 use crate::git_browser::fixture::{self, Repo};
 use crate::test_support::TempDir;
@@ -56,7 +57,7 @@ impl runner::Runner for GitWorktree {
     fn worktree(
         &self,
         root: &Path,
-        branch: Option<&str>,
+        branch: runner::WorktreeBranch<'_>,
         dest: &Path,
         commit: &str,
     ) -> Result<(), String> {
@@ -423,7 +424,7 @@ impl runner::Runner for PausingWorktree<'_> {
     fn worktree(
         &self,
         root: &Path,
-        branch: Option<&str>,
+        branch: runner::WorktreeBranch<'_>,
         dest: &Path,
         commit: &str,
     ) -> Result<(), String> {
@@ -946,7 +947,13 @@ impl runner::Runner for RejectingWorktree {
         panic!("isolation must not switch the source")
     }
 
-    fn worktree(&self, _: &Path, _: Option<&str>, _: &Path, _: &str) -> Result<(), String> {
+    fn worktree(
+        &self,
+        _: &Path,
+        _: runner::WorktreeBranch<'_>,
+        _: &Path,
+        _: &str,
+    ) -> Result<(), String> {
         Err("worktree runner reached".into())
     }
 }
@@ -1182,7 +1189,7 @@ fn first_prompt_creates_one_verified_semantic_worktree_and_retry_reuses_it() {
         .finish_first(
             transition(&source, &prompt),
             (plan, revision),
-            Some("repair-account-login"),
+            Some(named("repair-account-login")),
             deferred_context(&manager, &first_ticket, data.path()),
         )
         .unwrap();
@@ -1256,7 +1263,7 @@ fn first_prompt_refuses_unsafe_names_stale_profiles_and_cancelled_tabs_without_m
         manager: &manager,
         ticket: &ticket,
     };
-    assert!(Registry::semantic_slug(&plan, &prompt, None, &no_data).is_err());
+    assert!(Registry::first_intent(&plan, &prompt, None, &no_data).is_err());
     assert!(registry
         .first_plan("tab", &source, "wrong-profile", &prompt)
         .is_err());
@@ -1268,7 +1275,7 @@ fn first_prompt_refuses_unsafe_names_stale_profiles_and_cancelled_tabs_without_m
             .finish_first(
                 transition(&source, &prompt),
                 (saved.clone(), revision),
-                Some(bad),
+                Some(named(bad)),
                 deferred_context(&manager, &ticket, data.path())
             )
             .is_err());
@@ -1281,7 +1288,7 @@ fn first_prompt_refuses_unsafe_names_stale_profiles_and_cancelled_tabs_without_m
         .finish_first(
             transition(&source, &prompt),
             (saved, revision),
-            Some("fix-parser"),
+            Some(named("fix-parser")),
             deferred_context(&manager, &ticket, data.path())
         )
         .is_err());
@@ -1296,7 +1303,7 @@ fn first_prompt_refuses_unsafe_names_stale_profiles_and_cancelled_tabs_without_m
         .finish_first(
             transition(&source, &prompt),
             (saved, revision),
-            Some("fix-parser"),
+            Some(named("fix-parser")),
             deferred_context(&manager, &ticket, data.path())
         )
         .is_err());
@@ -1310,7 +1317,7 @@ fn first_prompt_refuses_unsafe_names_stale_profiles_and_cancelled_tabs_without_m
         .finish_first(
             transition(&source, &prompt),
             (saved, revision),
-            Some("fix-parser"),
+            Some(named("fix-parser")),
             deferred_context(&manager, &ticket, data.path())
         )
         .is_err());
@@ -1407,14 +1414,8 @@ fn manual_branch_override_uses_the_requested_base_and_exact_branch() {
         )
         .unwrap();
     let prompt = first_prompt("Repair authentication");
-    let slug = Registry::semantic_slug(
-        &plan,
-        &prompt,
-        None,
-        &deferred_context(&manager, &ticket, data.path()),
-    )
-    .unwrap()
-    .unwrap();
+    // The naming request still reads the task; it adds no instruction here.
+    let intent = named("repair-authentication");
     let snapshot = registry
         .first_plan("tab", &source, "default", &prompt)
         .unwrap();
@@ -1422,7 +1423,7 @@ fn manual_branch_override_uses_the_requested_base_and_exact_branch() {
         .finish_first(
             transition(&source, &prompt),
             snapshot,
-            Some(&slug),
+            Some(intent),
             deferred_context(&manager, &ticket, data.path()),
         )
         .unwrap();
@@ -1431,6 +1432,137 @@ fn manual_branch_override_uses_the_requested_base_and_exact_branch() {
     assert_eq!(actual.current_branch.as_deref(), Some("feature/manual-fix"));
     assert_eq!(actual.head, info.head);
     assert_eq!(repo.git(&["branch", "--show-current"]).trim(), "main");
+}
+
+/// One Worktree first prompt whose naming reply is `intent`; a refusal must
+/// leave the tab pending so the draft can be edited and sent again.
+fn first_with(
+    repo: &Repo,
+    data: &Path,
+    setup: Option<&str>,
+    intent: super::GitIntent,
+) -> Result<super::Prepared, String> {
+    let source = path(repo);
+    let info = super::inspect(&source).unwrap();
+    let mut plan = options(&info, "main", true, false);
+    plan.task.clear();
+    plan.branch_name = setup.map(str::to_owned);
+    let manager = WorkspaceManager::default();
+    let ticket = manager.ticket("tab").unwrap();
+    let mut registry = manager.lock();
+    registry
+        .prepare_deferred(
+            "tab",
+            &source,
+            plan,
+            deferred_context(&manager, &ticket, data),
+        )
+        .unwrap();
+    let prompt = first_prompt("Fix the parser");
+    let snapshot = registry
+        .first_plan("tab", &source, "default", &prompt)
+        .unwrap();
+    let result = registry.finish_first(
+        transition(&source, &prompt),
+        snapshot,
+        Some(intent),
+        deferred_context(&manager, &ticket, data),
+    );
+    let pending = registry.get("tab").unwrap().deferred_workspace.is_some();
+    drop(registry);
+    if result.is_err() {
+        assert!(pending);
+        assert!(manager.admit_command("tab", true).is_err());
+    }
+    result
+}
+
+fn heads(repo: &Repo) -> String {
+    repo.git(&[
+        "for-each-ref",
+        "--format=%(refname) %(objectname)",
+        "refs/heads",
+    ])
+}
+
+#[test]
+fn first_prompt_git_instructions_choose_branch_and_base_before_checkout() {
+    let Some(repo) = populated("first-prompt-intent") else {
+        return;
+    };
+    repo.git(&["switch", "--quiet", "-c", "develop"]);
+    repo.write("sub/file.txt", "develop\n");
+    repo.git(&["add", "."]);
+    repo.commit("develop", 1_700_000_100);
+    repo.git(&["switch", "--quiet", "main"]);
+    repo.git(&["branch", "feat/existing", "develop"]);
+    let develop = repo.git(&["rev-parse", "develop"]).trim().to_owned();
+    let main = repo.git(&["rev-parse", "main"]).trim().to_owned();
+    let data = TempDir::new("conversation-workspace", "first-prompt-intent");
+    let checkout = |ready: super::Prepared| super::inspect(&ready.path).unwrap();
+
+    let mut exact = named("fix-parser");
+    exact.branch = Some("feat/Exact-Name".into());
+    exact.base = Some("develop".into());
+    let info = checkout(first_with(&repo, data.path(), None, exact).unwrap());
+    assert_eq!(info.current_branch.as_deref(), Some("feat/Exact-Name"));
+    assert_eq!(info.head.as_deref(), Some(develop.as_str()));
+
+    let mut prefixed = named("fix-parser");
+    prefixed.prefix = Some("felipe".into());
+    let info = checkout(first_with(&repo, data.path(), None, prefixed).unwrap());
+    assert!(info
+        .current_branch
+        .unwrap()
+        .starts_with("felipe/fix-parser-"));
+    assert_eq!(info.head.as_deref(), Some(main.as_str()));
+
+    // Neither an existing branch nor "no new branch" creates a ref.
+    let refs = heads(&repo);
+    let mut existing = named("fix-parser");
+    existing.existing_branch = Some("feat/existing".into());
+    let info = checkout(first_with(&repo, data.path(), None, existing).unwrap());
+    assert_eq!(info.current_branch.as_deref(), Some("feat/existing"));
+    assert_eq!(info.head.as_deref(), Some(develop.as_str()));
+    let mut detached = named("fix-parser");
+    detached.no_new_branch = Some("no new branch".into());
+    let info = checkout(first_with(&repo, data.path(), None, detached).unwrap());
+    assert_eq!(info.current_branch, None);
+    assert_eq!(info.head.as_deref(), Some(main.as_str()));
+    assert_eq!(heads(&repo), refs);
+    assert_eq!(repo.git(&["branch", "--show-current"]).trim(), "main");
+}
+
+#[test]
+fn incompatible_first_prompt_git_instructions_mutate_nothing() {
+    let Some(repo) = populated("first-prompt-intent-refusal") else {
+        return;
+    };
+    let data = TempDir::new("conversation-workspace", "first-prompt-intent-refusal");
+    let worktrees = repo.git(&["worktree", "list", "--porcelain"]);
+    let refs = heads(&repo);
+    let mut no_worktree = named("fix-parser");
+    no_worktree.no_worktree = Some("work in this checkout".into());
+    let mut renamed = named("fix-parser");
+    renamed.branch = Some("feat/other".into());
+    let mut unknown_base = named("fix-parser");
+    unknown_base.base = Some("missing".into());
+    let mut checked_out = named("fix-parser");
+    checked_out.existing_branch = Some("main".into());
+    let mut absent = named("fix-parser");
+    absent.existing_branch = Some("feat/absent".into());
+    for (setup, intent) in [
+        (None, no_worktree),
+        (Some("feat/setup"), renamed),
+        (None, unknown_base),
+        (None, checked_out),
+        (None, absent),
+    ] {
+        assert!(first_with(&repo, data.path(), setup, intent).is_err());
+    }
+    assert!(!data.path().join("conversation-worktrees").exists());
+    assert_eq!(repo.git(&["worktree", "list", "--porcelain"]), worktrees);
+    assert_eq!(heads(&repo), refs);
 }
 
 #[test]
@@ -1498,7 +1630,7 @@ fn local_first_prompt_needs_no_naming_model_or_checkout() {
         ticket: &ticket,
     };
     assert_eq!(
-        Registry::semantic_slug(&plan, &prompt, None, &no_data).unwrap(),
+        Registry::first_intent(&plan, &prompt, None, &no_data).unwrap(),
         None
     );
     let snapshot = registry
