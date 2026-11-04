@@ -162,6 +162,12 @@
 .composer-pill:hover { border-color: var(--line-bright); background: var(--bg-hover); }
 .composer-pill.on { border-color: color-mix(in oklab, var(--amber) 50%, var(--line)); background: color-mix(in oklab, var(--amber) 12%, transparent); }
 
+.composer .workspace-choice[aria-pressed="true"] {
+  color: var(--fg);
+  border-color: color-mix(in oklab, var(--accent) 50%, var(--line));
+  background: color-mix(in oklab, var(--accent) 14%, var(--bg-elevated));
+}
+
 /* The agent yielded and a background job will wake it (run state
    `background`); the dot is the tab bar's. */
 .composer-bg-note {

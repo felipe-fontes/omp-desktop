@@ -53,6 +53,9 @@ pub struct OpenTab {
     /// Origin/base metadata is display-only; `path` remains the execution folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<crate::conversation_workspace::WorkspaceBinding>,
+    /// Unsent workspace choice, revalidated by native startup on restoration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_workspace: Option<crate::conversation_workspace::WorkspaceOptions>,
     /// App-private chat workspace identity, absent for ordinary projects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scratch_id: Option<String>,
@@ -243,6 +246,7 @@ mod tests {
             session_file: session_file.map(str::to_owned),
             name: Some("label".to_owned()),
             workspace: None,
+            deferred_workspace: None,
             scratch_id: None,
         }
     }
@@ -264,6 +268,32 @@ mod tests {
         assert_eq!(got.layout.tabs, vec![tab(&a, None), tab(&b, Some(&conv))]);
         assert_eq!(got.layout.active, Some(1));
         assert_eq!(got.skipped, Vec::<String>::new());
+    }
+
+    #[test]
+    fn unsent_workspace_choice_survives_layout_restore_without_creating_a_checkout() {
+        let (store, dir) = scratch_store();
+        let project = dir.folder("project");
+        let plan = crate::conversation_workspace::WorkspaceOptions {
+            base_ref: Some("refs/heads/main".into()),
+            base_commit: Some("a".repeat(40)),
+            worktree: true,
+            acknowledge_shared: false,
+            task: String::new(),
+            branch_name: Some("feature/manual".into()),
+        };
+        let mut unsent = tab(&project, None);
+        unsent.deferred_workspace = Some(plan.clone());
+        store
+            .save(&Layout {
+                tabs: vec![unsent],
+                active: Some(0),
+            })
+            .unwrap();
+        let restored = store.load(|_| false);
+        assert_eq!(restored.layout.tabs[0].path, project);
+        assert_eq!(restored.layout.tabs[0].deferred_workspace, Some(plan));
+        assert!(!Path::new(&project).join(".git").exists());
     }
 
     #[test]
@@ -491,6 +521,7 @@ mod tests {
                 session_file: Some(String::new()),
                 name: Some(String::new()),
                 workspace: None,
+                deferred_workspace: None,
                 scratch_id: Some(String::new()),
             }],
             active: Some(0),

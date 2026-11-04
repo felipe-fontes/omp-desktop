@@ -14,7 +14,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const win  = {};
 // The real busy predicate, loaded the same way: restartPlan reads it
 // late-bound from window.OMP_TURN_STATUS.
-for (const file of ["src/app/turn-status.js", "src/app/approval-mode.js"]) {
+for (const file of ["src/app/turn-status.js", "src/app/project-nav.js", "src/app/approval-mode.js"]) {
   // eslint-disable-next-line no-new-func
   new Function("window", readFileSync(join(root, file), "utf8"))(win);
 }
@@ -78,6 +78,16 @@ check("effectiveFor: a project without an override takes the default", () => {
   assert.equal(M.effectiveFor({ default: "always-ask", projects: {} }, Q), "always-ask");
 });
 
+check("effectiveFor: an execution-folder override wins, then the source project, then global", () => {
+  const actual = "/worktrees/feature";
+  const v = { default: "write", projects: { [P]: "yolo", [actual]: "always-ask" } };
+  assert.equal(M.effectiveFor(v, actual, P), "always-ask");
+  assert.equal(M.effectiveFor({ ...v, projects: { [P]: "yolo" } }, actual, P), "yolo");
+  assert.equal(M.effectiveFor({ ...v, projects: { [actual]: "invalid", [P]: "yolo" } }, actual, P), "yolo");
+  assert.equal(M.effectiveFor({ ...v, projects: {} }, actual, P), "write");
+  assert.equal(M.effectiveFor({ default: "invalid", projects: {} }, actual, P), "write");
+});
+
 // ── statusCell ────────────────────────────────────────────────────────────
 
 check("statusCell: running == effective shows the plain label", () => {
@@ -106,6 +116,22 @@ check("statusCell: no running mode yet (spawn in flight) shows the target, not p
   assert.deepEqual(M.statusCell(view, { path: P, approvalMode: null }),
     { label: "yolo", running: "yolo", target: "yolo", warn: true, pending: false });
   assert.deepEqual(M.statusCell(null, null), { label: "write", running: "write", target: "write", warn: false, pending: false });
+});
+
+check("statusCell: source inheritance and an execution-folder override show the actual target", () => {
+  const actual = "/worktrees/feature";
+  const v = { default: "write", projects: { [P]: "yolo" } };
+  const ready = { path: actual, workspace: { projectPath: P }, approvalMode: "write" };
+  const pending = { path: actual, sourceProjectPath: P, approvalMode: "write" };
+  for (const entry of [ready, pending]) {
+    assert.deepEqual(M.statusCell(v, entry),
+      { label: "write ⇢ yolo", running: "write", target: "yolo", warn: true, pending: true });
+  }
+  assert.deepEqual(M.statusCell({ ...v, projects: { [P]: "yolo", [actual]: "always-ask" } }, ready),
+    { label: "write ⇢ always ask", running: "write", target: "always ask", warn: false, pending: true });
+  assert.deepEqual(M.statusCell(v, { ...ready, sourceProjectPath: Q, approvalMode: null }),
+    { label: "yolo", running: "yolo", target: "yolo", warn: true, pending: false });
+  assert.equal(M.statusCell({ default: "write", projects: {} }, ready).target, "write");
 });
 
 // ── restartPlan ───────────────────────────────────────────────────────────
@@ -144,6 +170,22 @@ check("restartPlan: no sessions → empty plan", () => {
   assert.deepEqual(M.restartPlan(view, undefined), { now: [], later: [] });
 });
 
+check("restartPlan: source changes reach ready and pending workspaces but preparation defers restart", () => {
+  const actual = "/worktrees/specific";
+  const v = { default: "write", projects: { [P]: "yolo", [actual]: "always-ask" } };
+  const sessions = [
+    { id: "ready", path: "/worktrees/a", workspace: { projectPath: P }, approvalMode: "write", runState: "idle" },
+    { id: "specific", path: actual, workspace: { projectPath: P }, approvalMode: "yolo", runState: "idle" },
+    { id: "busy", path: "/worktrees/b", workspace: { projectPath: P }, approvalMode: "write", runState: "running" },
+    { id: "preparing", path: "/worktrees/c", sourceProjectPath: P, workspacePreparing: true, approvalMode: "write", runState: "idle" },
+    { id: "already-matches", path: "/worktrees/d", sourceProjectPath: P, workspacePreparing: true, approvalMode: "yolo", runState: "idle" },
+    { id: "other", path: Q, approvalMode: "write", runState: "idle" },
+    { id: "failed", path: "/worktrees/e", workspace: { projectPath: P }, approvalMode: "write", runState: "failed" },
+    { id: "spawning", path: "/worktrees/f", sourceProjectPath: P, approvalMode: null, runState: "idle" },
+  ];
+  assert.deepEqual(M.restartPlan(v, sessions), { now: ["ready", "specific"], later: ["busy", "preparing"] });
+});
+
 // ── projectRows ───────────────────────────────────────────────────────────
 
 check("projectRows: the active folder with an override shows it", () => {
@@ -166,6 +208,21 @@ check("projectRows: no folder lists only the overrides, by path, skipping unknow
   ]);
   assert.deepEqual(M.projectRows(view, ""), [{ path: P, value: "yolo", active: false }]);
   assert.deepEqual(M.projectRows(null, null), []);
+});
+
+check("projectRows: the grouped source is active even when the execution folder has its own override", () => {
+  const actual = "/worktrees/feature";
+  const v = { default: "write", projects: { [P]: "yolo", [actual]: "always-ask" } };
+  for (const entry of [
+    { path: actual, workspace: { projectPath: P } },
+    { path: actual, sourceProjectPath: P },
+  ]) {
+    const sourcePath = win.OMP_PROJECT_NAV.projectPath(entry);
+    assert.deepEqual(M.projectRows(v, sourcePath), [
+      { path: P, value: "yolo", active: true },
+      { path: actual, value: "always-ask", active: false },
+    ]);
+  }
 });
 
 console.log(`approval-mode: ${passed} checks passed`);

@@ -19,12 +19,12 @@ const answer = (text, timestamp, entryId) => ({ role: "assistant", content: [{ t
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
 function harness() {
-  const listeners = new Map(), journal = new Map(), commands = [], histories = new Map();
+  const listeners = new Map(), journal = new Map(), commands = [], histories = new Map(), pending = new Map();
   const timeout = (fn, ms) => { const timer = setTimeout(fn, ms); timer.unref(); return timer; };
   const ctx = vm.createContext({ console: { log() {}, warn() {}, error() {} }, setTimeout: timeout, clearTimeout, queueMicrotask, TextEncoder });
   ctx.window = ctx;
   ctx.timeNow = () => "00:00";
-  for (const file of ["constants", "slash-commands", "subagents", "background-tasks", "agent-context", "agent-context-sync", "cache-usage", "stream-delta", "session-title", "session-prefs", "message-queue", "ask-dialog", "approval", "approval-mode", "turn-status", "goal", "extension-widgets", "live-voice", "transcript-merge", "prompt-history", "project-nav", "live-context"]) {
+  for (const file of ["constants", "slash-commands", "subagents", "background-tasks", "agent-context", "agent-context-sync", "cache-usage", "stream-delta", "session-title", "session-prefs", "message-queue", "ask-dialog", "approval", "approval-mode", "turn-status", "goal", "extension-widgets", "live-voice", "transcript-merge", "prompt-history", "project-nav", "conversation-workspace", "live-context"]) {
     vm.runInContext(source(`app/${file}.js`), ctx, { filename: file });
   }
   vm.runInContext(source("design/tweaks/use-tweaks.js"), ctx, { filename: "use-tweaks.js" });
@@ -54,7 +54,24 @@ function harness() {
         if (args.sessionFile) scratchRow.sessionFile = args.sessionFile;
         return true;
       }
-      if (name === "start_session") return { approvalMode: "write", path: args.args.cwd, workspace: null };
+      if (name === "conversation_workspace_inspect") return {
+        path: args.path, projectPath: args.path, repoRoot: args.path,
+        currentBranch: "main", head: "a".repeat(40),
+        branches: [{ name: "main", refName: "refs/heads/main", commit: "a".repeat(40), remote: false }],
+        dirty: false, owners: 0, defaults: { baseRef: "refs/heads/main", worktree: false },
+      };
+      if (name === "stop_session") { journal.delete(args.sessionId); return null; }
+      if (name === "start_session") {
+        const { sessionId, cwd, deferredWorkspace, firstPrompt } = args.args;
+        if (deferredWorkspace) pending.set(sessionId, deferredWorkspace);
+        if (firstPrompt) assert.ok(pending.has(sessionId), "first prompt requires a pending workspace");
+        const prepared = firstPrompt ? pending.get(sessionId) : null;
+        if (firstPrompt) pending.delete(sessionId);
+        return {
+          approvalMode: "write", path: cwd, deferredWorkspace: deferredWorkspace ?? null,
+          workspace: prepared ? { projectPath: cwd, ...prepared } : null,
+        };
+      }
       if (name === "replay_events") return { dropped: false, events: (journal.get(args.sessionId) ?? []).filter(e => e.seq > args.afterSeq) };
       if (name === "conversation_history") return readHistory(args.sessionFile);
       if (name === "send_command") {
@@ -70,27 +87,28 @@ function harness() {
       return () => { if (listeners.get(name) === callback) listeners.delete(name); };
     } },
   };
-  const bridge = {
-    ...ctx.OMP_BRIDGE,
-    async openSession(cwd) {
-      const opened = ctx.OMP_BRIDGE.openSession(cwd);
-      await ctx.OMP_BRIDGE.startConversationSetup(snapshot.conversationSetup.id, null);
-      return opened;
-    },
-  };
+  const bridge = ctx.OMP_BRIDGE;
   return { ctx, bridge, emit, reply, commands, histories,
+    async openReadySession(cwd) {
+      const id = await bridge.openSession(cwd);
+      assert.ok(snapshot.sessions.find(tab => tab.id === id).deferredWorkspace);
+      assert.equal(await bridge.send("Initial coding request"), true);
+      assert.equal(snapshot.sessions.find(tab => tab.id === id).deferredWorkspace, null);
+      bridge.getState().messages = [];
+      return id;
+    },
     setMoveState: value => { moveState = value; },
     readHistory: fn => { readHistory = fn; }, snapshot: () => snapshot };
 }
 
 await check("long conversations keep their earliest prompt across refresh and tab switches", async () => {
   const h = harness();
-  const a = await h.bridge.openSession("/tmp/navigation-a");
+  const a = await h.openReadySession("/tmp/navigation-a");
   const history = Array.from({ length: 180 }, (_, i) => [user(`prompt ${i}`, i * 2 + 1), answer(`answer ${i}`, i * 2 + 2)]).flat();
   h.emit(a, { type: "response", command: "get_messages", success: true, data: { messages: history } });
   assert.equal(h.snapshot().messages[0].text, "prompt 0");
   assert.equal(h.snapshot().messages.at(-1).blocks[0].text, "answer 179");
-  const b = await h.bridge.openSession("/tmp/navigation-b");
+  const b = await h.openReadySession("/tmp/navigation-b");
   await h.bridge.activateSession(a);
   h.emit(a, { type: "response", command: "get_messages", success: true, data: { messages: history.slice(-4) } });
   assert.equal(h.snapshot().messages[0].text, "prompt 0");
@@ -100,7 +118,7 @@ await check("long conversations keep their earliest prompt across refresh and ta
 
 await check("saved history restores pre-compaction turns and entry IDs without duplicating live boundaries", async () => {
   const h = harness();
-  const id = await h.bridge.openSession("/tmp/navigation-compacted");
+  const id = await h.openReadySession("/tmp/navigation-compacted");
   const file = "/sessions/current.jsonl";
   const compact = { role: "compactionSummary", entryId: "c1", summary: "Earlier work", tokensBefore: 120000, timestamp: 5, firstKeptEntryId: "u2" };
   const rpcSummary = { role: "compactionSummary", summary: "Earlier work", tokensBefore: 120000, timestamp: 5 };
@@ -148,7 +166,7 @@ await check("repository-free chats keep history and workspace identity through r
 
 await check("automatic compaction keeps the earlier transcript and one visible boundary", async () => {
   const h = harness();
-  const id = await h.bridge.openSession("/tmp/navigation-live-compaction");
+  const id = await h.openReadySession("/tmp/navigation-live-compaction");
   h.emit(id, { type: "response", command: "get_messages", success: true, data: { messages: [user("before", 1), answer("earlier answer", 2)] } });
   h.emit(id, { type: "auto_compaction_start", action: "context-full", reason: "threshold" });
   const pendingId = h.snapshot().messages.at(-1)._id;
@@ -168,11 +186,11 @@ await check("automatic compaction keeps the earlier transcript and one visible b
 
 await check("late saved reads never replace a different tab and read failures keep live history", async () => {
   const h = harness();
-  const a = await h.bridge.openSession("/tmp/navigation-stale-a");
+  const a = await h.openReadySession("/tmp/navigation-stale-a");
   let release;
   h.readHistory(() => new Promise(resolve => { release = resolve; }));
   h.emit(a, { type: "response", command: "get_state", success: true, data: { sessionFile: "/sessions/a.jsonl", messageCount: 1 } });
-  const b = await h.bridge.openSession("/tmp/navigation-stale-b");
+  const b = await h.openReadySession("/tmp/navigation-stale-b");
   release({ messages: [user("belongs to a", 1, "u1")], fork: { number: 9, parentSession: "a-parent" } });
   await tick();
   assert.equal(h.snapshot().activeSessionId, b);
@@ -191,7 +209,7 @@ await check("late saved reads never replace a different tab and read failures ke
 
 await check("rewind and fork refuse active work and serialize pending conversation changes", async () => {
   const h = harness();
-  const id = await h.bridge.openSession("/tmp/navigation-moves");
+  const id = await h.openReadySession("/tmp/navigation-moves");
   h.emit(id, { type: "response", command: "get_messages", success: true, data: { messages: [user("chosen question", 1, "u1"), answer("old answer", 2, "a1")] } });
   for (const busy of [{ isStreaming: true }, { isCompacting: true }, { isSettled: false }, { hasPendingAsyncWork: true }]) {
     h.emit(id, { type: "response", command: "get_state", success: true, data: busy });
@@ -218,7 +236,7 @@ await check("rewind and fork refuse active work and serialize pending conversati
 
 await check("a fresh native state prevents a rewind racing an admitted turn", async () => {
   const h = harness();
-  const id = await h.bridge.openSession("/tmp/navigation-admitted");
+  const id = await h.openReadySession("/tmp/navigation-admitted");
   h.emit(id, { type: "response", command: "get_messages", success: true, data: { messages: [user("keep", 1, "u1")] } });
   h.setMoveState({ isStreaming: false, isSettled: false, queuedMessageCount: 1 });
   const result = await h.bridge.branchAt("u1");
@@ -230,14 +248,14 @@ await check("a fresh native state prevents a rewind racing an admitted turn", as
 
 await check("a successful rewind retains its draft's owning tab and selected images", async () => {
   const h = harness();
-  const a = await h.bridge.openSession("/tmp/navigation-draft-a");
+  const a = await h.openReadySession("/tmp/navigation-draft-a");
   const prompt = user("re-ask this", 1, "u1");
   prompt.content.push({ type: "image", data: "saved-image", mimeType: "image/png" });
   h.emit(a, { type: "response", command: "get_messages", success: true, data: { messages: [prompt, answer("old answer", 2, "a1")] } });
   const rewind = h.bridge.branchAt("u1");
   await tick();
   const command = h.commands.findLast(c => c.type === "branch");
-  await h.bridge.openSession("/tmp/navigation-draft-b");
+  await h.openReadySession("/tmp/navigation-draft-b");
   h.reply(command, { cancelled: false, text: "re-ask this" });
   await h.bridge.activateSession(a);
   const result = await rewind;
@@ -250,7 +268,7 @@ await check("a successful rewind retains its draft's owning tab and selected ima
 
 await check("late saved history cannot replace the latest request's cache usage", async () => {
   const h = harness();
-  const id = await h.bridge.openSession("/tmp/navigation-cache");
+  const id = await h.openReadySession("/tmp/navigation-cache");
   const earlier = { ...answer("earlier", 1, "a1"), provider: "local", model: "earlier", usage: { input: 10, output: 1, cacheRead: 90, cacheWrite: 0 } };
   h.emit(id, { type: "response", command: "get_messages", success: true, data: { messages: [earlier] } });
   let release;

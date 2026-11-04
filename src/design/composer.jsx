@@ -37,7 +37,7 @@ function hintKeyFor(actionId, fallback) {
 // ── The composer (input + plan/steer modes + send) ────────────────────
 // `submitKey` ("enter" | "ctrl+enter") and `pasteCollapseLines` come from the
 // tweaks (Settings › Composer); the defaults match TWEAK_DEFAULTS.
-function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePlan, planBlocked = "", goalMode = false, goalTint = false, onToggleGoal, goalBlocked = "", goalStrip = null, onOpenCmd, onOpenModel, currentModel, thinking, onLoadThinkingLevels, onSetThinking, isStreaming, backgroundWork = false, conversationMoving = false, pendingRequests = [], onOpenPending, onAbort, onApprove, annotationCount = 0, microcopy, onFollowUp, draftInsert, promptHistory = [], promptInsert, targetedDraftInserts = [], onAckDraftInserts, queue, queueSending, onRemoveQueued, onPromoteQueued, onSendQueuedNow, browserChips = [], onRemoveBrowserChip, onBrowserChipClick, submitKey = "enter", pasteCollapseLines = 5, liveVoice, liveError, onLiveAction, codexLogin = null, voiceSpectrum = null, dictation, dictationError, onDictationAction, dictationCompleted, onAckDictation }) {
+function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePlan, planBlocked = "", goalMode = false, goalTint = false, onToggleGoal, goalBlocked = "", goalStrip = null, onOpenCmd, onOpenModel, currentModel, thinking, onLoadThinkingLevels, onSetThinking, isStreaming, backgroundWork = false, conversationMoving = false, pendingRequests = [], onOpenPending, onAbort, onApprove, annotationCount = 0, microcopy, onFollowUp, draftInsert, promptHistory = [], promptInsert, targetedDraftInserts = [], onAckDraftInserts, queue, queueSending, onRemoveQueued, onPromoteQueued, onSendQueuedNow, browserChips = [], onRemoveBrowserChip, onBrowserChipClick, submitKey = "enter", pasteCollapseLines = 5, liveVoice, liveError, onLiveAction, codexLogin = null, voiceSpectrum = null, dictation, dictationError, onDictationAction, dictationCompleted, onAckDictation, workspace, onConfigureWorkspace, onCancelWorkspace }) {
   // Drafts are per tab (issue #28). The composer stays mounted across tab
   // switches and keeps one draft per session id (app/session-ui.js
   // DRAFT_IDLE): text, pending image attachments (sent alongside the next
@@ -49,6 +49,7 @@ function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePla
   // image preparation landing after a switch: it goes back to the tab it
   // was started in.
   const [drafts, setDrafts] = React.useState({});
+  const submissions = React.useRef(new Set());
   const draft = draftEntryOf(drafts, sessionId, DRAFT_IDLE);
   const { text, attachments, pendingImages } = draft;
   // What the draft can send. A goal needs its objective as text; a steer
@@ -426,23 +427,31 @@ function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePla
   // literal draft (plan §7: Ctrl+Q/Ctrl+Enter sends a follow-up even while a
   // '/' command is being typed), never silently reroute into executing the
   // highlighted palette command instead.
-  const sendWith = (dispatcher, { followUp = false } = {}) => {
-    if (conversationMoving) return; // keep the draft until the file change settles
+  const sendWith = async (dispatcher, { followUp = false } = {}) => {
+    if (conversationMoving || workspace?.workspacePreparing || workspace?.workspaceConfiguring || workspace?.workspaceRestartRequired || submissions.current.has(sessionId)) return;
     if (showSlash && !followUp) { execCmd(filtered[clampedIdx]); return; }
-    if (pendingImages > 0) return; // a paste/pick is still preparing — its image would ship on the *next* message instead
-    // A follow-up (`onFollowUp` dispatcher) requires non-empty text.
+    if (pendingImages > 0) return;
     if (!(followUp ? hasText : sendable)) return;
+    const target = sessionId;
     const images = attachments.map(a => a.image);
-    dispatcher(expandPastes(text.trim(), draft.pastes), images);
-    // Back to an empty draft: text, attachments and collapsed pastes all
-    // went out with this message, and the reset ends any prompt-history
-    // recall. The in-flight image count is kept: an async-clipboard paste
-    // can have queued its increment after the render this send read, and
-    // its decrement still lands later.
-    updateDraft(sessionId, d => (d.pendingImages ? { ...DRAFT_IDLE, pendingImages: d.pendingImages } : DRAFT_IDLE));
-    setMentionDismissedKey(null);
-    setSlashDismissedKey(null);
-    requestAnimationFrame(() => taRef.current?.focus());
+    submissions.current.add(target);
+    try {
+      const sent = await dispatcher(expandPastes(text.trim(), draft.pastes), images);
+      if (sent === false) return;
+      updateOpenDraft(target, d => {
+        if (d.text !== draft.text || d.attachments !== draft.attachments || d.pastes !== draft.pastes) return d;
+        return d.pendingImages ? { ...DRAFT_IDLE, pendingImages: d.pendingImages } : DRAFT_IDLE;
+      });
+      if (sessionIdRef.current === target) {
+        setMentionDismissedKey(null);
+        setSlashDismissedKey(null);
+        requestAnimationFrame(() => taRef.current?.focus());
+      }
+    } catch (error) {
+      console.error("[composer] submission failed:", error);
+    } finally {
+      submissions.current.delete(target);
+    }
   };
 
   // ✎ on a queued message (QueueStrip): omp removes it first, and only a
@@ -699,6 +708,25 @@ function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePla
 
       {voiceSpectrum && <VoiceSpectrum source={voiceSpectrum} />}
 
+      {(workspace?.workspaceChoiceAvailable || workspace?.workspacePreparing || workspace?.workspaceConfiguring || workspace?.workspaceError) && (
+        <div className="nc-detail" role="status">
+          {workspace.workspaceConfiguring ? "Saving workspace options…" : workspace.workspacePreparing ? (
+            <>Preparing workspace… <button type="button" className="btn ghost" onClick={onCancelWorkspace}>Cancel send</button></>
+          ) : workspace.workspaceChoiceAvailable ? (
+            <>
+              <button type="button" className="btn ghost workspace-choice" aria-pressed={!workspace.workspaceSelection?.worktree}
+                title="Work directly in the current checkout" onClick={() => onConfigureWorkspace(false)}>Local</button>
+              <button type="button" className="btn ghost workspace-choice" aria-pressed={!!workspace.workspaceSelection?.worktree}
+                title="Create a separate Git worktree and branch on the first message; the source checkout stays unchanged"
+                onClick={() => onConfigureWorkspace(true)}>Worktree</button>
+              <button type="button" className="btn ghost" onClick={() => onConfigureWorkspace(null)}
+                title="Choose a base branch, explicit branch name or project defaults">Workspace options</button>
+            </>
+          ) : null}
+          {workspace.workspaceError && <span role="alert">{workspace.workspaceError}</span>}
+        </div>
+      )}
+
       <div className="composer-row">
         <button className="btn icon ghost" title="attach image" onClick={() => fileInputRef.current?.click()}>
           <Icon name="image" size={13} />
@@ -744,7 +772,7 @@ function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePla
         {isStreaming ? (
           <>
             {steerable && (
-              <button className={`btn outlined${goalMode ? " goal-resume" : ""}`} onClick={send} disabled={conversationMoving || pendingImages > 0}
+              <button className={`btn outlined${goalMode ? " goal-resume" : ""}`} onClick={send} disabled={conversationMoving || workspace?.workspacePreparing || workspace?.workspaceConfiguring || workspace?.workspaceRestartRequired || pendingImages > 0}
                 style={goalMode ? undefined : { color: "var(--amber)", borderColor: "color-mix(in oklab, var(--amber) 40%, var(--line))" }}>
                 <Icon name={goalMode ? "goal" : "arrow"} size={10} color={goalMode ? "var(--lilac)" : "var(--amber)"} /> {goalMode ? "start goal" : "steer"}
               </button>
@@ -763,7 +791,8 @@ function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePla
         ) : (
           <>
             {planMode && (
-              <button className="btn outlined" onClick={onApprove} disabled={conversationMoving}
+              <button className="btn outlined" onClick={onApprove} disabled={conversationMoving || !!workspace?.deferredWorkspace || !!workspace?.workspacePreparing || !!workspace?.workspaceConfiguring || !!workspace?.workspaceRestartRequired}
+                title={workspace?.deferredWorkspace ? "Send a first message before approving a plan." : undefined}
                 style={{ color: "var(--amber)", borderColor: "color-mix(in oklab, var(--amber) 40%, var(--line))" }}>
                 <Icon name="play" size={10} color="var(--amber)" /> approve
               </button>
@@ -774,7 +803,7 @@ function Composer({ sessionId, sessionIds, onSend, onPick, planMode, onTogglePla
               </button>
             ) : (
             <button className={`btn primary${goalMode ? " goal-start" : ""}`} onClick={send}
-              disabled={conversationMoving || !sendable || pendingImages > 0} title={conversationMoving ? "Changing conversation…" : undefined}>
+              disabled={conversationMoving || workspace?.workspacePreparing || workspace?.workspaceConfiguring || workspace?.workspaceRestartRequired || !sendable || pendingImages > 0} title={conversationMoving ? "Changing conversation…" : undefined}>
               {goalMode
                 ? "start goal"
                 : planMode

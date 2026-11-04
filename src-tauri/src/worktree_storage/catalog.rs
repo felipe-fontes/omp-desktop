@@ -197,8 +197,15 @@ pub(super) fn valid_workspace_root(root: &Path, worktrees: &Path) -> bool {
     let Some(name) = root.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    name.strip_prefix("conversation-")
-        .is_some_and(|s| valid_hex(s, 32))
+    name.strip_prefix("conversation-").is_some_and(|s| {
+        !s.is_empty()
+            && s.len() <= 80
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !s.starts_with('-')
+            && !s.ends_with('-')
+            && !s.contains("--")
+    })
 }
 
 pub(super) fn session(profile: &str, file: &Path) -> Result<Alias, String> {

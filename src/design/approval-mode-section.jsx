@@ -79,10 +79,10 @@ function ApprovalModeSection({ view, activeProject, sessions, query }) {
   const [busy, setBusy]     = React.useState(false);
   const [result, setResult] = React.useState(null);
 
-  const path = activeProject?.path || null;
+  const path = activeProject?.path ? window.OMP_PROJECT_NAV.projectPath(activeProject) : null;
   const projects = AM.projectRows(view, path);
   const fallback = AM.effectiveFor(view, null); // the global default
-  const effective = AM.effectiveFor(view, path);
+  const effective = AM.effectiveForTab(view, activeProject);
   const shown = AM.MODES.find(m => m.value === effective);
   const modeOptions = AM.MODES.map(m => ({ value: m.value, label: m.label }));
   const projectOptions = [{ value: "default", label: "inherit" }, ...modeOptions];

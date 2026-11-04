@@ -171,6 +171,38 @@ impl TerminalManager {
         }
     }
 
+    /// A workspace move cannot leave a shell or its descendants in the old
+    /// folder. Retire an exited shell's leftover process tree before moving.
+    /// The caller holds the workspace lifecycle guard.
+    pub fn prepare_workspace_change(&self, id: &str) -> Result<(), String> {
+        let retired = {
+            let mut tabs = self.tabs();
+            let Some(tab) = tabs.get_mut(id) else {
+                return Ok(());
+            };
+            match &tab.slot {
+                Slot::Idle => return Ok(()),
+                Slot::Spawning { .. } => {
+                    return Err("close the terminal before changing the workspace".into())
+                }
+                Slot::Live(pty) if matches!(pty.state(), ShellState::Running) => {
+                    return Err("close the terminal before changing the workspace".into());
+                }
+                Slot::Live(_) => {}
+            }
+            let retired = match std::mem::replace(&mut tab.slot, Slot::Idle) {
+                Slot::Live(pty) => Some(pty),
+                _ => None,
+            };
+            drop(tabs);
+            retired
+        };
+        if let Some(pty) = retired {
+            pty.close();
+        }
+        Ok(())
+    }
+
     /// Every registered tab.
     pub fn tab_ids(&self) -> Vec<String> {
         self.tabs().keys().cloned().collect()

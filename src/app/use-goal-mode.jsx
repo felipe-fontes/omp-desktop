@@ -102,10 +102,11 @@ function useGoalMode({ bridge, tabId, sessionIds, goal, planMode, profileId, run
     const res = await bridge?.goalStart(typed.text, budget, out.images, out.text);
     if (res?.ok) {
       update(id, () => _UG_IDLE);
-      return;
+      return true;
     }
     update(id, d => ({ ...d, mode: true, error: res?.error ?? "Could not start the goal." }));
     if (idsRef.current?.includes(id)) onRestoreDraft?.(typed, { tabId: id, shown: tabRef.current === id });
+    return false;
   };
 
   const strip = tabId && shown ? (

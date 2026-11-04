@@ -1,3 +1,4 @@
+use super::git_intent::named;
 use super::{inspect, runner, Registry, WorkspaceManager, WorkspaceOptions};
 use crate::git_browser::fixture::{self, Repo};
 use crate::test_support::TempDir;
@@ -56,7 +57,7 @@ impl runner::Runner for GitWorktree {
     fn worktree(
         &self,
         root: &Path,
-        branch: Option<&str>,
+        branch: runner::WorktreeBranch<'_>,
         dest: &Path,
         commit: &str,
     ) -> Result<(), String> {
@@ -309,7 +310,7 @@ fn concurrent_new_tabs_cannot_both_claim_an_unacknowledged_workspace() {
             .count()
     });
     assert_eq!(successes, 1);
-    assert_eq!(super::status(&manager, &root).unwrap().owners, 1);
+    assert_eq!(super::status(&manager, &root, None).unwrap().owners, 1);
 }
 
 #[test]
@@ -323,6 +324,77 @@ fn closing_a_tab_cancels_its_already_queued_start() {
     assert!(manager.check_ticket(&start).is_err());
     assert!(manager.check_ticket(&shell).is_err());
     assert!(manager.check_ticket(&unrelated).is_ok());
+}
+
+#[test]
+fn first_attempt_cancellation_is_ordered_scoped_and_does_not_cancel_shells() {
+    let manager = WorkspaceManager::default();
+    manager.register_pending("tab");
+    let shell = manager.ticket("tab").unwrap();
+    assert!(manager.cancel_first("unknown", 1).is_err());
+    assert!(manager.cancel_first("tab", 0).is_err());
+    assert!(manager.first_ticket("tab", 0).is_err());
+
+    // Cancel can overtake start; the cancelled attempt is never admitted.
+    assert!(manager.cancel_first("tab", 1).unwrap());
+    assert!(manager.first_ticket("tab", 1).is_err());
+    let second = manager.first_ticket("tab", 2).unwrap();
+    assert!(manager.first_ticket("tab", 2).is_err());
+    assert!(manager.first_ticket("tab", 3).is_err());
+    assert!(!manager.cancel_first("tab", 1).unwrap());
+    assert!(manager.check_ticket(&second).is_ok());
+    assert!(manager.check_ticket(&shell).is_ok());
+    manager.commit_first("tab", 2, &second, || Ok(())).unwrap();
+    assert!(!manager.cancel_first("tab", 2).unwrap());
+    drop(second);
+
+    let third = manager.first_ticket("tab", 3).unwrap();
+    assert!(manager.cancel_first("tab", 3).unwrap());
+    assert!(manager.check_ticket(&third).is_err());
+    let mut committed = false;
+    assert!(manager
+        .commit_first("tab", 3, &third, || {
+            committed = true;
+            Ok(())
+        })
+        .is_err());
+    assert!(!committed);
+    assert!(manager.check_ticket(&shell).is_ok());
+    drop(third);
+    assert!(manager.first_ticket("tab", 3).is_err());
+    let fourth = manager.first_ticket("tab", 4).unwrap();
+    manager.cancel_pending(&["tab"]);
+    assert!(manager.check_ticket(&fourth).is_err());
+    drop(fourth);
+
+    manager.release_task_admission(&["tab"]);
+    assert!(manager.cancel_first("tab", 5).is_err());
+    manager.register_pending("tab");
+    assert!(manager.first_ticket("tab", 1).is_ok());
+}
+
+#[test]
+fn committed_first_attempt_wins_a_concurrent_late_cancellation() {
+    let manager = WorkspaceManager::default();
+    manager.register_pending("tab");
+    let ticket = manager.first_ticket("tab", 1).unwrap();
+    let entered = Barrier::new(2);
+    let finish = Barrier::new(2);
+    std::thread::scope(|scope| {
+        let committing = scope.spawn(|| {
+            manager.commit_first("tab", 1, &ticket, || {
+                entered.wait();
+                finish.wait();
+                Ok(())
+            })
+        });
+        entered.wait();
+        let cancelling = scope.spawn(|| manager.cancel_first("tab", 1));
+        finish.wait();
+        committing.join().unwrap().unwrap();
+        assert!(!cancelling.join().unwrap().unwrap());
+        assert!(manager.check_ticket(&ticket).is_ok());
+    });
 }
 
 #[test]
@@ -352,7 +424,7 @@ impl runner::Runner for PausingWorktree<'_> {
     fn worktree(
         &self,
         root: &Path,
-        branch: Option<&str>,
+        branch: runner::WorktreeBranch<'_>,
         dest: &Path,
         commit: &str,
     ) -> Result<(), String> {
@@ -875,7 +947,13 @@ impl runner::Runner for RejectingWorktree {
         panic!("isolation must not switch the source")
     }
 
-    fn worktree(&self, _: &Path, _: Option<&str>, _: &Path, _: &str) -> Result<(), String> {
+    fn worktree(
+        &self,
+        _: &Path,
+        _: runner::WorktreeBranch<'_>,
+        _: &Path,
+        _: &str,
+    ) -> Result<(), String> {
         Err("worktree runner reached".into())
     }
 }
@@ -1007,4 +1085,632 @@ fn non_git_sharing_requires_acknowledgement() {
     assert!(registry
         .prepare("ack", &root, Some(selection(true)), None)
         .is_ok());
+}
+
+fn deferred_context<'a>(
+    manager: &'a WorkspaceManager,
+    ticket: &'a super::Admission,
+    data: &'a Path,
+) -> super::StartContext<'a> {
+    super::StartContext {
+        data: Some(data),
+        manager,
+        ticket,
+    }
+}
+
+fn first_prompt(text: &str) -> super::FirstPrompt {
+    super::FirstPrompt {
+        text: text.to_owned(),
+        model: None,
+        attempt: 1,
+    }
+}
+
+fn transition<'a>(source: &'a str, prompt: &'a super::FirstPrompt) -> super::FirstRequest<'a> {
+    super::FirstRequest {
+        id: "tab",
+        cwd: source,
+        profile: "default",
+        prompt,
+    }
+}
+
+fn assert_semantic_checkout(repo: &Repo, source: &str, ready: &super::Prepared, data: &Path) {
+    assert!(ready.deferred_workspace.is_none());
+    assert_ne!(ready.path, source);
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("sub/file.txt")).unwrap(),
+        "source edit\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&ready.path).join("file.txt")).unwrap(),
+        "base\n"
+    );
+    let target = Path::new(&ready.path).parent().unwrap();
+    assert!(target
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("conversation-repair-account-login-"));
+    let branch = super::inspect(&ready.path).unwrap().current_branch.unwrap();
+    assert!(branch.starts_with("omp/repair-account-login-"));
+    let mut store = crate::worktree_storage::Store::load(Some(data.to_path_buf()));
+    assert!(store
+        .register(
+            "default",
+            Path::new(&ready.path),
+            Path::new(source),
+            None,
+            1
+        )
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn first_prompt_creates_one_verified_semantic_worktree_and_retry_reuses_it() {
+    let Some(repo) = populated("first-prompt-semantic") else {
+        return;
+    };
+    let data = TempDir::new("conversation-workspace", "first-prompt-semantic");
+    let source = crate::external_open::canonical_folder(&repo.path().join("sub")).unwrap();
+    let info = super::inspect(&source).unwrap();
+    let mut plan = options(&info, "main", true, false);
+    plan.task.clear();
+    repo.write("sub/file.txt", "source edit\n");
+    let before = repo.git(&["worktree", "list", "--porcelain"]);
+    let manager = WorkspaceManager::default();
+    let ticket = manager.ticket("tab").unwrap();
+    let mut registry = manager.lock();
+    let pending = registry
+        .prepare_deferred(
+            "tab",
+            &source,
+            plan,
+            deferred_context(&manager, &ticket, data.path()),
+        )
+        .unwrap();
+    assert_eq!(pending.path, source);
+    assert!(pending.workspace.is_none());
+    assert!(pending.deferred_workspace.is_some());
+    assert!(!data.path().join("conversation-worktrees").exists());
+    assert_eq!(repo.git(&["worktree", "list", "--porcelain"]), before);
+    assert!(manager.admit_command("tab", true).is_err());
+    assert!(manager.admit_command("tab", false).is_ok());
+    assert!(registry.admit_terminal("tab").is_err());
+
+    let prompt = first_prompt("Repair account login");
+    let first_ticket = manager.first_ticket("tab", prompt.attempt).unwrap();
+    let (plan, revision) = registry
+        .first_plan("tab", &source, "default", &prompt)
+        .unwrap();
+    let ready = registry
+        .finish_first(
+            transition(&source, &prompt),
+            (plan, revision),
+            Some(named("repair-account-login")),
+            deferred_context(&manager, &first_ticket, data.path()),
+        )
+        .unwrap();
+    assert_semantic_checkout(&repo, &source, &ready, data.path());
+    // A canceled spawn leaves the verified checkout reserved for this tab.
+    assert!(manager.cancel_first("tab", prompt.attempt).unwrap());
+    assert!(manager
+        .commit_first("tab", prompt.attempt, &first_ticket, || {
+            registry.first_spawned("tab", &manager)
+        })
+        .is_err());
+    assert!(registry.can_respawn("tab").is_err());
+    drop(first_ticket);
+    let retry_ticket = manager.first_ticket("tab", 2).unwrap();
+
+    // Even an edited draft after cancellation reuses the already created checkout.
+    let after = repo.git(&["worktree", "list", "--porcelain"]);
+    let mut revised = first_prompt("Repair account login and add tests");
+    revised.attempt = 2;
+    let (plan, revision) = registry
+        .first_plan("tab", &source, "default", &revised)
+        .unwrap();
+    let retry = registry
+        .finish_first(
+            transition(&source, &revised),
+            (plan, revision),
+            None,
+            deferred_context(&manager, &retry_ticket, data.path()),
+        )
+        .unwrap();
+    assert_eq!(retry.path, ready.path);
+    assert_eq!(repo.git(&["worktree", "list", "--porcelain"]), after);
+    assert!(manager.admit_command("tab", true).is_err());
+    manager
+        .commit_first("tab", revised.attempt, &retry_ticket, || {
+            registry.first_spawned("tab", &manager)
+        })
+        .unwrap();
+    assert!(registry
+        .first_plan("tab", &source, "default", &prompt)
+        .is_err());
+    assert!(manager.admit_command("tab", true).is_ok());
+    assert!(registry.admit_terminal("tab").is_ok());
+    drop(registry);
+}
+
+#[test]
+fn first_prompt_refuses_unsafe_names_stale_profiles_and_cancelled_tabs_without_mutation() {
+    let Some(repo) = populated("first-prompt-refusals") else {
+        return;
+    };
+    let data = TempDir::new("conversation-workspace", "first-prompt-refusals");
+    let source = path(&repo);
+    let info = super::inspect(&source).unwrap();
+    let mut plan = options(&info, "main", true, false);
+    plan.task.clear();
+    let manager = WorkspaceManager::default();
+    let ticket = manager.ticket("tab").unwrap();
+    let mut registry = manager.lock();
+    registry
+        .prepare_deferred(
+            "tab",
+            &source,
+            plan.clone(),
+            deferred_context(&manager, &ticket, data.path()),
+        )
+        .unwrap();
+    let prompt = first_prompt("Fix the parser");
+    let no_data = super::StartContext {
+        data: None,
+        manager: &manager,
+        ticket: &ticket,
+    };
+    assert!(Registry::first_intent(&plan, &prompt, None, &no_data).is_err());
+    assert!(registry
+        .first_plan("tab", &source, "wrong-profile", &prompt)
+        .is_err());
+    let (saved, revision) = registry
+        .first_plan("tab", &source, "default", &prompt)
+        .unwrap();
+    for bad in ["../escape", "-bad", "a--b", "BAD", "a/b"] {
+        assert!(registry
+            .finish_first(
+                transition(&source, &prompt),
+                (saved.clone(), revision),
+                Some(named(bad)),
+                deferred_context(&manager, &ticket, data.path())
+            )
+            .is_err());
+    }
+    // Even changing away and back invalidates a naming result from an older choice.
+    registry
+        .set_deferred("tab", plan.clone(), &manager, || Ok(()))
+        .unwrap();
+    assert!(registry
+        .finish_first(
+            transition(&source, &prompt),
+            (saved, revision),
+            Some(named("fix-parser")),
+            deferred_context(&manager, &ticket, data.path())
+        )
+        .is_err());
+    plan.branch_name = Some("../invalid".into());
+    registry
+        .set_deferred("tab", plan.clone(), &manager, || Ok(()))
+        .unwrap();
+    let (saved, revision) = registry
+        .first_plan("tab", &source, "default", &prompt)
+        .unwrap();
+    assert!(registry
+        .finish_first(
+            transition(&source, &prompt),
+            (saved, revision),
+            Some(named("fix-parser")),
+            deferred_context(&manager, &ticket, data.path())
+        )
+        .is_err());
+    assert!(!data.path().join("conversation-worktrees").exists());
+    assert_eq!(repo.git(&["branch", "--show-current"]).trim(), "main");
+    manager.cancel_pending(&["tab"]);
+    let (saved, revision) = registry
+        .first_plan("tab", &source, "default", &prompt)
+        .unwrap();
+    assert!(registry
+        .finish_first(
+            transition(&source, &prompt),
+            (saved, revision),
+            Some(named("fix-parser")),
+            deferred_context(&manager, &ticket, data.path())
+        )
+        .is_err());
+    registry.release(&["tab"]);
+    assert!(registry
+        .first_plan("tab", &source, "default", &prompt)
+        .is_err());
+    drop(registry);
+    assert!(!data.path().join("conversation-worktrees").exists());
+}
+
+#[test]
+fn local_selection_needs_acknowledgement_and_never_switches_or_creates_a_worktree() {
+    let Some(repo) = populated("first-prompt-local") else {
+        return;
+    };
+    let data = TempDir::new("conversation-workspace", "first-prompt-local");
+    let source = path(&repo);
+    let info = super::inspect(&source).unwrap();
+    let plan = options(&info, "main", true, false);
+    repo.write("sub/file.txt", "local edit\n");
+    let manager = WorkspaceManager::default();
+    let ticket = manager.ticket("tab").unwrap();
+    let mut registry = manager.lock();
+    registry
+        .prepare_deferred(
+            "tab",
+            &source,
+            plan,
+            deferred_context(&manager, &ticket, data.path()),
+        )
+        .unwrap();
+    let mut local = options(&info, "main", false, false);
+    local.task.clear();
+    assert!(registry
+        .set_deferred("tab", local.clone(), &manager, || Ok(()))
+        .is_err());
+    local.acknowledge_shared = true;
+    assert!(registry
+        .set_deferred("tab", local.clone(), &manager, || Err(
+            "terminal is running".into()
+        ))
+        .is_err());
+    assert!(manager.admit_command("tab", true).is_err());
+    let ready = registry
+        .set_deferred("tab", local.clone(), &manager, || Ok(()))
+        .unwrap();
+    assert!(ready.deferred_workspace.is_none());
+    assert!(!ready.workspace.unwrap().worktree);
+    assert!(registry.admit_terminal("tab").is_ok());
+    let isolated = options(&info, "main", true, false);
+    let pending = registry
+        .set_deferred("tab", isolated, &manager, || Ok(()))
+        .unwrap();
+    assert!(pending.workspace.is_none());
+    assert!(pending.deferred_workspace.is_some());
+    assert!(manager.admit_command("tab", true).is_err());
+    registry
+        .set_deferred("tab", local.clone(), &manager, || Ok(()))
+        .unwrap();
+    assert!(manager.admit_command("tab", true).is_ok());
+    assert!(registry
+        .set_deferred("tab", local, &manager, || Ok(()))
+        .is_err());
+    drop(registry);
+    assert!(!data.path().join("conversation-worktrees").exists());
+    assert_eq!(repo.git(&["branch", "--show-current"]).trim(), "main");
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("sub/file.txt")).unwrap(),
+        "local edit\n"
+    );
+}
+
+#[test]
+fn manual_branch_override_uses_the_requested_base_and_exact_branch() {
+    let Some(repo) = populated("first-prompt-manual") else {
+        return;
+    };
+    let data = TempDir::new("conversation-workspace", "first-prompt-manual");
+    let source = path(&repo);
+    let info = super::inspect(&source).unwrap();
+    let mut plan = options(&info, "main", true, false);
+    plan.task.clear();
+    plan.branch_name = Some("feature/manual-fix".into());
+    let manager = WorkspaceManager::default();
+    let ticket = manager.ticket("tab").unwrap();
+    let mut registry = manager.lock();
+    registry
+        .prepare_deferred(
+            "tab",
+            &source,
+            plan.clone(),
+            deferred_context(&manager, &ticket, data.path()),
+        )
+        .unwrap();
+    let prompt = first_prompt("Repair authentication");
+    // The naming request still reads the task; it adds no instruction here.
+    let intent = named("repair-authentication");
+    let snapshot = registry
+        .first_plan("tab", &source, "default", &prompt)
+        .unwrap();
+    let ready = registry
+        .finish_first(
+            transition(&source, &prompt),
+            snapshot,
+            Some(intent),
+            deferred_context(&manager, &ticket, data.path()),
+        )
+        .unwrap();
+    drop(registry);
+    let actual = super::inspect(&ready.path).unwrap();
+    assert_eq!(actual.current_branch.as_deref(), Some("feature/manual-fix"));
+    assert_eq!(actual.head, info.head);
+    assert_eq!(repo.git(&["branch", "--show-current"]).trim(), "main");
+}
+
+/// One Worktree first prompt whose naming reply is `intent`; a refusal must
+/// leave the tab pending so the draft can be edited and sent again.
+fn first_with(
+    repo: &Repo,
+    data: &Path,
+    setup: Option<&str>,
+    intent: super::GitIntent,
+) -> Result<super::Prepared, String> {
+    let source = path(repo);
+    let info = super::inspect(&source).unwrap();
+    let mut plan = options(&info, "main", true, false);
+    plan.task.clear();
+    plan.branch_name = setup.map(str::to_owned);
+    let manager = WorkspaceManager::default();
+    let ticket = manager.ticket("tab").unwrap();
+    let mut registry = manager.lock();
+    registry
+        .prepare_deferred(
+            "tab",
+            &source,
+            plan,
+            deferred_context(&manager, &ticket, data),
+        )
+        .unwrap();
+    let prompt = first_prompt("Fix the parser");
+    let snapshot = registry
+        .first_plan("tab", &source, "default", &prompt)
+        .unwrap();
+    let result = registry.finish_first(
+        transition(&source, &prompt),
+        snapshot,
+        Some(intent),
+        deferred_context(&manager, &ticket, data),
+    );
+    let pending = registry.get("tab").unwrap().deferred_workspace.is_some();
+    drop(registry);
+    if result.is_err() {
+        assert!(pending);
+        assert!(manager.admit_command("tab", true).is_err());
+    }
+    result
+}
+
+fn heads(repo: &Repo) -> String {
+    repo.git(&[
+        "for-each-ref",
+        "--format=%(refname) %(objectname)",
+        "refs/heads",
+    ])
+}
+
+#[test]
+fn first_prompt_git_instructions_choose_branch_and_base_before_checkout() {
+    let Some(repo) = populated("first-prompt-intent") else {
+        return;
+    };
+    repo.git(&["switch", "--quiet", "-c", "develop"]);
+    repo.write("sub/file.txt", "develop\n");
+    repo.git(&["add", "."]);
+    repo.commit("develop", 1_700_000_100);
+    repo.git(&["switch", "--quiet", "main"]);
+    repo.git(&["branch", "feat/existing", "develop"]);
+    let develop = repo.git(&["rev-parse", "develop"]).trim().to_owned();
+    let main = repo.git(&["rev-parse", "main"]).trim().to_owned();
+    let data = TempDir::new("conversation-workspace", "first-prompt-intent");
+    let checkout = |ready: super::Prepared| super::inspect(&ready.path).unwrap();
+
+    let mut exact = named("fix-parser");
+    exact.branch = Some("feat/Exact-Name".into());
+    exact.base = Some("develop".into());
+    let info = checkout(first_with(&repo, data.path(), None, exact).unwrap());
+    assert_eq!(info.current_branch.as_deref(), Some("feat/Exact-Name"));
+    assert_eq!(info.head.as_deref(), Some(develop.as_str()));
+
+    let mut prefixed = named("fix-parser");
+    prefixed.prefix = Some("felipe".into());
+    let info = checkout(first_with(&repo, data.path(), None, prefixed).unwrap());
+    assert!(info
+        .current_branch
+        .unwrap()
+        .starts_with("felipe/fix-parser-"));
+    assert_eq!(info.head.as_deref(), Some(main.as_str()));
+
+    // Neither an existing branch nor "no new branch" creates a ref.
+    let refs = heads(&repo);
+    let mut existing = named("fix-parser");
+    existing.existing_branch = Some("feat/existing".into());
+    let info = checkout(first_with(&repo, data.path(), None, existing).unwrap());
+    assert_eq!(info.current_branch.as_deref(), Some("feat/existing"));
+    assert_eq!(info.head.as_deref(), Some(develop.as_str()));
+    let mut detached = named("fix-parser");
+    detached.no_new_branch = Some("no new branch".into());
+    let info = checkout(first_with(&repo, data.path(), None, detached).unwrap());
+    assert_eq!(info.current_branch, None);
+    assert_eq!(info.head.as_deref(), Some(main.as_str()));
+    assert_eq!(heads(&repo), refs);
+    assert_eq!(repo.git(&["branch", "--show-current"]).trim(), "main");
+}
+
+#[test]
+fn incompatible_first_prompt_git_instructions_mutate_nothing() {
+    let Some(repo) = populated("first-prompt-intent-refusal") else {
+        return;
+    };
+    let data = TempDir::new("conversation-workspace", "first-prompt-intent-refusal");
+    let worktrees = repo.git(&["worktree", "list", "--porcelain"]);
+    let refs = heads(&repo);
+    let mut no_worktree = named("fix-parser");
+    no_worktree.no_worktree = Some("work in this checkout".into());
+    let mut renamed = named("fix-parser");
+    renamed.branch = Some("feat/other".into());
+    let mut unknown_base = named("fix-parser");
+    unknown_base.base = Some("missing".into());
+    let mut checked_out = named("fix-parser");
+    checked_out.existing_branch = Some("main".into());
+    let mut absent = named("fix-parser");
+    absent.existing_branch = Some("feat/absent".into());
+    for (setup, intent) in [
+        (None, no_worktree),
+        (Some("feat/setup"), renamed),
+        (None, unknown_base),
+        (None, checked_out),
+        (None, absent),
+    ] {
+        assert!(first_with(&repo, data.path(), setup, intent).is_err());
+    }
+    assert!(!data.path().join("conversation-worktrees").exists());
+    assert_eq!(repo.git(&["worktree", "list", "--porcelain"]), worktrees);
+    assert_eq!(heads(&repo), refs);
+}
+
+#[test]
+fn advisory_ownership_excludes_only_the_calling_pending_tab() {
+    let Some(repo) = populated("first-prompt-advisory") else {
+        return;
+    };
+    let data = TempDir::new("conversation-workspace", "first-prompt-advisory");
+    let source = path(&repo);
+    let info = super::inspect(&source).unwrap();
+    let manager = WorkspaceManager::default();
+    let ticket = manager.ticket("tab").unwrap();
+    {
+        let mut registry = manager.lock();
+        registry
+            .prepare_deferred(
+                "tab",
+                &source,
+                options(&info, "main", true, false),
+                deferred_context(&manager, &ticket, data.path()),
+            )
+            .unwrap();
+        registry.prepare("other", &source, None, None).unwrap();
+    }
+    assert_eq!(super::status(&manager, &source, None).unwrap().owners, 2);
+    assert_eq!(
+        super::status(&manager, &source, Some("tab"))
+            .unwrap()
+            .owners,
+        1
+    );
+    assert_eq!(
+        super::status(&manager, &source, Some("other"))
+            .unwrap()
+            .owners,
+        2
+    );
+}
+
+#[test]
+fn local_first_prompt_needs_no_naming_model_or_checkout() {
+    let Some(repo) = populated("first-prompt-local-send") else {
+        return;
+    };
+    let data = TempDir::new("conversation-workspace", "first-prompt-local-send");
+    let source = path(&repo);
+    let info = super::inspect(&source).unwrap();
+    let mut plan = options(&info, "main", false, false);
+    plan.task.clear();
+    let manager = WorkspaceManager::default();
+    let ticket = manager.ticket("tab").unwrap();
+    let mut registry = manager.lock();
+    registry
+        .prepare_deferred(
+            "tab",
+            &source,
+            plan.clone(),
+            deferred_context(&manager, &ticket, data.path()),
+        )
+        .unwrap();
+    let prompt = first_prompt("Investigate the local files");
+    let no_data = super::StartContext {
+        data: None,
+        manager: &manager,
+        ticket: &ticket,
+    };
+    assert_eq!(
+        Registry::first_intent(&plan, &prompt, None, &no_data).unwrap(),
+        None
+    );
+    let snapshot = registry
+        .first_plan("tab", &source, "default", &prompt)
+        .unwrap();
+    let ready = registry
+        .finish_first(transition(&source, &prompt), snapshot, None, no_data)
+        .unwrap();
+    drop(registry);
+    assert_eq!(ready.path, source);
+    assert!(!ready.workspace.unwrap().worktree);
+    assert!(!data.path().join("conversation-worktrees").exists());
+    assert_eq!(repo.git(&["branch", "--show-current"]).trim(), "main");
+}
+
+#[test]
+fn restored_local_plan_cannot_reuse_old_sharing_acknowledgement() {
+    let Some(repo) = populated("first-prompt-restored-consent") else {
+        return;
+    };
+    let data = TempDir::new("conversation-workspace", "first-prompt-restored-consent");
+    let source = path(&repo);
+    let info = super::inspect(&source).unwrap();
+    repo.write("sub/file.txt", "unsaved edit\n");
+    let mut saved = options(&info, "main", false, true);
+    saved.task.clear();
+    let manager = WorkspaceManager::default();
+    let ticket = manager.ticket("tab").unwrap();
+    let mut registry = manager.lock();
+    let pending = registry
+        .prepare_deferred(
+            "tab",
+            &source,
+            saved.clone(),
+            deferred_context(&manager, &ticket, data.path()),
+        )
+        .unwrap();
+    assert!(!pending.deferred_workspace.unwrap().acknowledge_shared);
+    let prompt = first_prompt("Inspect the edit");
+    let snapshot = registry
+        .first_plan("tab", &source, "default", &prompt)
+        .unwrap();
+    assert!(registry
+        .finish_first(
+            transition(&source, &prompt),
+            snapshot,
+            None,
+            deferred_context(&manager, &ticket, data.path())
+        )
+        .is_err());
+    assert!(manager.admit_command("tab", true).is_err());
+    assert!(registry
+        .set_deferred("tab", saved, &manager, || Ok(()))
+        .is_ok());
+    drop(registry);
+    assert!(manager.admit_command("tab", true).is_ok());
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("sub/file.txt")).unwrap(),
+        "unsaved edit\n"
+    );
+}
+
+#[test]
+fn task_admission_does_not_wait_for_an_unrelated_checkout_guard() {
+    let manager = WorkspaceManager::default();
+    manager.register_pending("pending");
+    let held = manager.lock();
+    std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let manager = &manager;
+        scope.spawn(move || {
+            tx.send((
+                manager.admit_command("pending", false).is_ok(),
+                manager.admit_command("pending", true).is_err(),
+                manager.admit_command("other", true).is_ok(),
+            ))
+            .unwrap();
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        assert_eq!(result.unwrap(), (true, true, true));
+    });
 }

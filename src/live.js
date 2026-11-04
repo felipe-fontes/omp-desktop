@@ -342,6 +342,10 @@
   // Completed captures wait here until the mounted composer consumes them;
   // React may coalesce snapshots across a tab switch or several captures.
   let _dictationCompleted = [];
+  const _firstPromptOps = new Map();
+  const _workspaceSelectionOps = new Set();
+  const _loginRequests = new Set();
+  const _workspacePreferenceCycles = new Map();
   // The capture the user stopped with "send on stop" on: its completion is
   // tagged `send`, so the composer sends that tab's draft once it holds the
   // text. Stops for a tab switch, Settings or a close never set it.
@@ -469,7 +473,7 @@
       // runState: active tab reads live state; background tabs read their
       // cached snapshot (never activated yet = "idle" defaults).
       sessions:        _sessionsView(),
-      activeSessionId,
+      activeSessionId: activeSessionId ?? [..._firstPromptOps.keys(), ..._workspaceSelectionOps].reverse().find(id => sessionRegistry.has(id)) ?? null,
       // Active tab's prompt history only — never persisted, see promptHistories above.
       promptHistory:   promptHistories.get(activeSessionId) ?? [],
       profiles,
@@ -1686,9 +1690,11 @@
    *
    *  The launch boundary and actual-folder adoption are covered by
    *  tests/test-conversation-workspace-bridge.mjs. */
-  async function _spawnSession(id, cwd, { resume = null, profile, workspace = null, userInitiated = false }) {
+  async function _spawnSession(id, cwd, { resume = null, profile, workspace = null, deferredWorkspace = null, firstPrompt = null, userInitiated = false }) {
     const started = await window.__TAURI__.core.invoke("start_session", {
-      args: { sessionId: id, cwd: cwd ?? "", resume, profile, userInitiated, ...(workspace ? { workspace } : {}) },
+      args: { sessionId: id, cwd: cwd ?? "", resume, profile, userInitiated,
+        ...(workspace ? { workspace } : {}), ...(deferredWorkspace ? { deferredWorkspace } : {}),
+        ...(firstPrompt ? { firstPrompt } : {}) },
     });
     const actualCwd = started.path;
     if (typeof actualCwd !== "string") throw new Error("Agent startup did not return its working folder");
@@ -1707,12 +1713,16 @@
     // All folder consumers, including the watcher below, use that binding.
     const spawned = sessionRegistry.get(id);
     if (spawned) {
-      const binding = started.workspace ?? spawned.workspace ?? null;
-      const sourceName = _tabNameFor(binding?.projectPath || actualCwd, "new session");
+      const binding = started.workspace ?? (!started.deferredWorkspace && spawned.workspace?.worktree === false
+        ? spawned.workspace : null);
+      const sourceName = _tabNameFor(binding?.projectPath || spawned.sourceProjectPath || actualCwd, "new session");
       const defaultName = _tabNameFor(cwd, "new session");
       sessionRegistry.set(id, {
         ...spawned, path: actualCwd, preparing: false, processStartedAt: Date.now(),
         workspace: binding,
+        deferredWorkspace: started.deferredWorkspace ?? null,
+        workspaceSelection: started.deferredWorkspace ?? spawned.workspaceSelection,
+        workspaceChoiceAvailable: spawned.workspaceChoiceAvailable && !(firstPrompt && binding?.worktree),
         name: spawned.preparing && spawned.name === defaultName ? sourceName : spawned.name,
         approvalMode: AMODE.isMode(started.approvalMode) ? started.approvalMode : null,
       });
@@ -1770,21 +1780,19 @@
    *  unconditional `sessions.remove(id)`, so if it were still queued when
    *  `start_session` installed the fresh incarnation under the same id, it
    *  would reap the *new* process instead of the dead one. */
-  function _killSessionProcess(id) {
+  async function _killSessionProcess(id) {
     if (id === activeSessionId) {
       _cancelLiveRequests();
       state.liveVoice = LIVE.EMPTY;
       _cancelDictationRequests();
       state.dictation = DICTATION.EMPTY;
     }
-    let stopped = Promise.resolve();
     if (window.__TAURI__) {
-      stopped = window.__TAURI__.core.invoke("stop_session", { sessionId: id }).catch(() => {});
-      window.__TAURI__.core.invoke("stop_git_watch", { sessionId: id }).catch(() => {});
+      await window.__TAURI__.core.invoke("stop_session", { sessionId: id });
+      await window.__TAURI__.core.invoke("stop_git_watch", { sessionId: id }).catch(() => {});
     }
     _dropGitListener(id);
     sessionSnapshots.delete(id);
-    return stopped;
   }
 
   /** End a tab for good in Rust (`close_tab`: its omp process, browser, git
@@ -1899,10 +1907,14 @@
    *  The dictation-before-restart ordering is covered by the fake IPC bridge
    *  in test-live-voice.mjs; the remaining ordering relies on the comments
    *  at each await and the pure profile/approval-mode decisions. */
-  async function _respawnSession(id, { profile, resume = null, fresh = false, reason = null }) {
+  async function _respawnSession(id, { profile, resume = null, fresh = false, reason = null, firstPrompt = null, workspaceChoiceRestart = false }) {
     if (!window.__TAURI__) return { ok: false, error: "not connected" };
     const entry = sessionRegistry.get(id);
     if (!entry) return { ok: false, error: "unknown tab" };
+    if (_workspaceSelectionOps.has(id) && !workspaceChoiceRestart) return { ok: false, error: "Wait for workspace options to finish saving." };
+    if (_firstPromptOps.has(id) && !firstPrompt) return { ok: false, error: "Wait for workspace preparation to finish." };
+    if (_loginRequests.has(id)) return { ok: false, error: "Finish signing in before restarting this conversation." };
+    if (entry.deferredWorkspace || entry.workspaceChoiceAvailable) resume = null;
     const what = reason || (fresh ? "Profile switch" : "Approval mode change");
     // Re-entrancy: this call spans two awaits, and a second respawn of the
     // same tab would read `wasActive` as false (call 1 already nulled the
@@ -1913,6 +1925,14 @@
     if (_respawning.has(id)) {
       return { ok: false, error: "omp is already restarting in this tab" };
     }
+    const previousState = id === activeSessionId ? state : sessionSnapshots.get(id);
+    const previousModel = entry.selectedWorkspaceModel || previousState?.model;
+    const preservedPrefs = (entry.deferredWorkspace || entry.workspaceChoiceAvailable) ? {
+      model: entry.pendingWorkspacePreferences?.model || (previousModel?.provider && previousModel?.id
+        ? { provider: previousModel.provider, id: previousModel.id } : null),
+      thinking: entry.pendingWorkspacePreferences?.thinking ?? entry.selectedWorkspaceThinking ?? previousState?.thinkingLevel ?? null,
+    } : null;
+    let restartPrefs = firstPrompt ? null : preservedPrefs;
     _respawning.add(id);
     try {
       if (id === activeSessionId && (state.dictation.active || _dictationStopPending)) {
@@ -1930,7 +1950,11 @@
       // the backend's session map before `_spawnSession` installs the new
       // one under the same id, or the late remove would reap the fresh
       // process. See `_killSessionProcess`.
-      await _killSessionProcess(id);
+      try {
+        await _killSessionProcess(id);
+      } catch (e) {
+        return { ok: false, error: `Could not stop the current agent: ${String(e?.message ?? e)}` };
+      }
       // The tab may have been closed inside that round-trip: `closeSession`
       // has no `_respawning` guard, so it can `sessionRegistry.delete`
       // this id while we are waiting. Writing an entry back below would
@@ -1960,11 +1984,16 @@
         // Fresh conversation: folder label and a new auto-rename, same as
         // `new_session` (`_freshConversationFields`). The killed process
         // will not deliver an in-flight `/rename` note.
-        ? { ...current, profile, branch: null, approvalMode: null, ..._freshConversationFields(current) }
+        ? { ...current, profile, branch: null, approvalMode: null, ..._freshConversationFields(current),
+          ...(restartPrefs ? { selectedWorkspaceModel: restartPrefs.model, selectedWorkspaceThinking: restartPrefs.thinking } : {}) }
         // Same conversation: name, file and auto-rename budget carry over;
         // only an in-flight `/rename` dies with the process (its note can
         // never arrive, so the flag would block every later refresh).
-        : { ...current, profile, approvalMode: null, autoRenameInFlight: false });
+        : { ...current, profile, approvalMode: null, autoRenameInFlight: false,
+          ...(firstPrompt || workspaceChoiceRestart || entry.deferredWorkspace || entry.workspaceChoiceAvailable
+            ? { sessionFile: null, fork: null, autoRenameSessionId: null } : {}),
+          ...(restartPrefs ? { selectedWorkspaceModel: restartPrefs.model, selectedWorkspaceThinking: restartPrefs.thinking } : {}) });
+      const detachIntent = _switchIntent + (wasActive ? 1 : 0);
       if (wasActive) await _detachActiveSession();
       // After the detach, which nulls `activeSessionId` synchronously — so no
       // later `_saveCurrentSession` can re-add it. A resurrected snapshot
@@ -1980,10 +2009,39 @@
       // re-activating here the UI keeps rendering an active tab whose
       // `_send` calls go to `sessionId: null`.
       let spawnError = null;
+      const firstOp = firstPrompt ? _firstPromptOps.get(id) : null;
+      if (firstOp?.cancelled) {
+        await firstOp.cancelPromise;
+        restartPrefs = preservedPrefs;
+      }
+      if (!sessionRegistry.has(id)) {
+        const survivors = [...sessionRegistry.keys()];
+        if (activeSessionId === null && survivors.length) await _switchToSession(survivors[survivors.length - 1]);
+        else notify();
+        return { ok: false, error: "tab closed" };
+      }
+      const dispatchedFirstPrompt = !!firstPrompt && !firstOp?.cancelled;
       try {
-        await _spawnSession(id, entry.path, { profile, resume });
+        await _spawnSession(id, entry.path, { profile, resume, firstPrompt: dispatchedFirstPrompt ? firstPrompt : null });
       } catch (e) {
         spawnError = e?.message ?? String(e);
+      }
+      if (firstOp?.cancelled) {
+        await firstOp.cancelPromise;
+        restartPrefs = preservedPrefs;
+      }
+      let firstPromptError = null;
+      if (spawnError && dispatchedFirstPrompt && sessionRegistry.has(id)) {
+        firstPromptError = spawnError;
+        // Native permits a metadata restart only while the original source
+        // plan is still pending. A retained prepared target rejects it.
+        try {
+          await _spawnSession(id, entry.path, { profile, resume: null });
+          restartPrefs = preservedPrefs;
+          spawnError = null;
+        } catch (e) {
+          spawnError = `${firstPromptError}; restoring metadata agent failed: ${e?.message ?? String(e)}`;
+        }
       }
       // omp writes a conversation's file lazily, with its first assistant
       // message, so a tab that has not had a reply yet names a file that
@@ -2023,6 +2081,19 @@
         }
         return spawnError ? { ok: false, error: spawnError } : { ok: true };
       }
+      if (!spawnError && restartPrefs) {
+        try {
+          if (restartPrefs.model && sessionRegistry.has(id)) await window.__TAURI__.core.invoke("send_command", {
+            sessionId: id, json: JSON.stringify({ type: "set_model", provider: restartPrefs.model.provider, modelId: restartPrefs.model.id }),
+          });
+          if (restartPrefs.thinking && sessionRegistry.has(id)) await window.__TAURI__.core.invoke("send_command", {
+            sessionId: id, json: JSON.stringify({ type: "set_thinking_level", level: restartPrefs.thinking }),
+          });
+        } catch (e) {
+          const current = sessionRegistry.get(id);
+          if (current) sessionRegistry.set(id, { ...current, workspaceError: String(e?.message ?? e) });
+        }
+      }
       if (savedVoice) {
         if (id === activeSessionId) state.liveVoice = savedVoice;
         else if (sessionSnapshots.has(id)) sessionSnapshots.set(id, { ...sessionSnapshots.get(id), liveVoice: savedVoice });
@@ -2030,9 +2101,9 @@
       }
       // The folder is now open under `profile`, so it belongs in that
       // profile's recents (a mode restart keeps the profile: nothing new).
-      if (fresh && !spawnError && entry.path && !entry.scratchId) void _touchRecent(entry.workspace?.projectPath || entry.path, profile);
+      if (fresh && !spawnError && entry.path && !entry.scratchId) void _touchRecent(window.OMP_PROJECT_NAV.projectPath(entry), profile);
 
-      if (wasActive && activeSessionId === null) {
+      if (wasActive && activeSessionId === null && _switchIntent === detachIntent) {
         // Reclaim focus only if nothing else took the active slot while the
         // spawn was in flight - the user can click another tab during those
         // awaits, and `_switchGen` can't guard this call because it is the
@@ -2063,7 +2134,9 @@
         }
       }
       notify();
-      return spawnError ? { ok: false, error: spawnError } : { ok: true };
+      return firstPromptError && !firstOp?.cancelled
+        ? { ok: false, error: spawnError ?? firstPromptError }
+        : spawnError ? { ok: false, error: spawnError } : { ok: true };
     } finally {
       _respawning.delete(id);
     }
@@ -2090,13 +2163,13 @@
     const { now, later } = AMODE.restartPlan(approvalModes, sessions);
     const byId = new Map(sessions.map(s => [s.id, s]));
     const todo = now.filter(id => {
-      if (_respawning.has(id)) return false; // its spawn resolves the mode afresh
-      const target = AMODE.effectiveFor(approvalModes, byId.get(id).path || null);
+      if (_respawning.has(id) || _firstPromptOps.has(id) || _workspaceSelectionOps.has(id) || _loginRequests.has(id)) return false;
+      const target = AMODE.effectiveForTab(approvalModes, byId.get(id));
       return _modeRestartMissed.get(id) !== target;
     });
     const results = await Promise.all(todo.map(async id => {
       const entry = sessionRegistry.get(id);
-      const target = AMODE.effectiveFor(approvalModes, entry?.path || null);
+      const target = AMODE.effectiveForTab(approvalModes, entry);
       const r = entry
         ? await _respawnSession(id, { profile: entry.profile, resume: entry.sessionFile || null })
         : { ok: false };
@@ -2250,8 +2323,8 @@
    *  in `_tabNameFor`. */
   async function _startSession(cwd, {
     resume = null, name = null, profile, activate = true, remember = true,
-    workspace = null, workspaceBinding = null, userInitiated = true,
-    scratchId = null, managing = false,
+    workspace = null, workspaceBinding = null, deferredWorkspace = null, userInitiated = true,
+    scratchId = null, managing = false, sourceProjectPath = null,
   }) {
     if (scratchId) {
       const row = (await window.__TAURI__.core.invoke("scratch_list", { profile })).find(r => r.id === scratchId);
@@ -2262,16 +2335,21 @@
       remember = false;
       resume ||= row.sessionFile || null;
     }
+    if (deferredWorkspace && !sourceProjectPath && cwd) {
+      const inspected = await _invokeResult("conversation_workspace_inspect", { path: cwd, profile });
+      if (inspected.ok) sourceProjectPath = inspected.value?.projectPath || null;
+    }
     _lastSessionMs = Math.max(Date.now(), _lastSessionMs + 1);
     const id = `session-${_lastSessionMs}`;
-    const tabName = name || _tabNameFor(workspaceBinding?.projectPath || cwd, resume ? "resumed" : "new session");
+    const tabName = name || _tabNameFor(workspaceBinding?.projectPath || sourceProjectPath || cwd, resume ? "resumed" : "new session");
     const color = resume ? "var(--cyan)" : "var(--lilac)";
     // Register in tab list before starting omp so the tab shows immediately.
     // Register with null branch — chip hidden until git resolves. `repoRoot`:
     // the repository's work tree, shared by every tab on a folder of it.
     sessionRegistry.set(id, {
       id, name: tabName, path: cwd ?? "", color, branch: null, repoRoot: null, gitRevision: 0, profile, scratchId,
-      preparing: true, workspace: workspaceBinding,
+      preparing: true, workspace: workspaceBinding, deferredWorkspace, sourceProjectPath,
+      workspaceChoiceAvailable: !!deferredWorkspace, workspaceSelection: deferredWorkspace,
       // The approval mode `start_session` spawned this tab's current omp
       // with (set by `_spawnSession`); null while no process runs it.
       approvalMode: null,
@@ -2297,7 +2375,7 @@
       autoRenameSessionId: null,
     });
     try {
-      await _spawnSession(id, cwd, { resume, profile, workspace, userInitiated });
+      await _spawnSession(id, cwd, { resume, profile, workspace, deferredWorkspace, userInitiated });
     } catch (e) {
       // A dangling/unlisted profile (inherited from another tab, deleted by
       // a second window, or a hand-edited profiles.json) makes the
@@ -2322,7 +2400,7 @@
     }
     // Only a folder that actually spawned is remembered.
     const opened = sessionRegistry.get(id);
-    const recentPath = opened?.workspace?.projectPath || opened?.path;
+    const recentPath = opened?.workspace?.projectPath || opened?.sourceProjectPath || opened?.path;
     if (recentPath && remember && !scratchId) void _touchRecent(recentPath, profile);
     if (activate) await _switchToSession(id);
     else notify(); // tab list changed
@@ -2367,13 +2445,32 @@
     };
   }
 
-  /** Queue a fresh launch without starting an agent. The requesting UI/OS/widget
-   *  waits for its own successful tab id, or null when the user cancels. */
-  function _requestConversationSetup(path, profile, configure = false) {
+  async function _openFreshConversation(path, profile) {
+    if (!path) return _openReported(path, { profile });
+    const inspected = await _invokeResult("conversation_workspace_inspect", { path, profile });
+    if (!inspected.ok || !inspected.value) {
+      const error = new Error(inspected.error || "Could not inspect the project folder");
+      _reportOpenFailure(error);
+      throw error;
+    }
+    const info = inspected.value;
+    if (!info.repoRoot) return _openReported(path, { profile });
+    const worktree = info.defaults ? !!info.defaults.worktree : true;
+    const currentRef = info.currentBranch ? `refs/heads/${info.currentBranch}` : (info.head ? "HEAD" : null);
+    const baseRef = worktree ? (info.defaults?.baseRef ?? currentRef) : currentRef;
+    const branch = (info.branches || []).find(item => item.refName === baseRef);
+    const baseCommit = branch?.commit ?? (baseRef === currentRef ? info.head : null);
+    return _openReported(path, { profile, sourceProjectPath: info.projectPath || path, deferredWorkspace: {
+      baseRef, baseCommit: baseCommit || null, worktree, acknowledgeShared: false,
+    } });
+  }
+
+  function _requestConversationSetup(path, profile, configure = false, sessionId = null, preferredWorktree = null) {
+    if (!configure && !sessionId) return _openFreshConversation(path, profile);
     if (!window.__TAURI__) return Promise.reject(new Error("not connected"));
     return new Promise(resolve => {
       conversationSetups.push({
-        view: { id: `setup-${++_lastSetupId}`, path, profile, ...(configure ? { configure: true } : {}) }, resolve, busy: false,
+        view: { id: `setup-${++_lastSetupId}`, path, profile, ...(configure ? { configure: true } : {}), ...(sessionId ? { sessionId, workspace: sessionRegistry.get(sessionId)?.workspaceSelection, preferredWorktree } : {}) }, resolve, busy: false,
       });
       notify();
     });
@@ -2397,11 +2494,7 @@
     try {
       await _requestConversationSetup(path, _activeProfileId());
     } catch (e) {
-      // `_startProjectSession` already rolled the tab back, so the only
-      // thing left is telling the user: the OS has no UI to report into and
-      // silently ignoring a double-clicked folder looks like a hang.
       console.error(`[live] folder open failed for '${path}':`, e);
-      _reportOpenFailure(e);
     }
   }
 
@@ -2898,6 +2991,11 @@
     // level, like get_state's.
     if (type === "thinking_level_changed") {
       const level = _effectiveThinking(ev.thinkingLevel);
+      const entry = sessionRegistry.get(activeSessionId);
+      if (entry?.deferredWorkspace || entry?.workspaceChoiceAvailable || entry?.pendingWorkspacePreferences) {
+        sessionRegistry.set(activeSessionId, { ...entry, selectedWorkspaceThinking: level,
+          ...(entry.pendingWorkspacePreferences ? { pendingWorkspacePreferences: { ...entry.pendingWorkspacePreferences, thinking: level } } : {}) });
+      }
       if (level !== state.thinkingLevel) {
         state.thinkingLevel = level;
         notify();
@@ -3749,6 +3847,13 @@
   // The `send_command` hand-off to the active tab, shared by `_send` and
   // `_sendWithResponse`; callers check the connection and handle failure.
   function _invokeSend(cmd) {
+    if ((_workspaceSelectionOps.has(activeSessionId) || sessionRegistry.get(activeSessionId)?.workspaceRestartRequired) && ["prompt", "steer", "follow_up", "goal", "live_start", "new_session", "compact"].includes(cmd.type)) {
+      return Promise.reject(new Error("Wait for workspace options to finish saving."));
+    }
+    const pending = sessionRegistry.get(activeSessionId)?.deferredWorkspace;
+    if (pending && ["prompt", "steer", "follow_up", "goal", "live_start", "new_session", "compact"].includes(cmd.type)) {
+      return Promise.reject(new Error("Send a first message to prepare this workspace before starting a task."));
+    }
     const scratchId = sessionRegistry.get(activeSessionId)?.scratchId;
     if (scratchId && _scratchOperations.has(scratchId) && ["prompt", "steer", "follow_up", "new_session"].includes(cmd.type)) {
       return Promise.reject(new Error("Chat workspace is being managed"));
@@ -4071,17 +4176,18 @@
    *
    *  Side-effectful end to end (IPC, both tab stores); the row and note
    *  shapes are pure and tested in test-message-queue.mjs. */
-  function _sendQueued(kind, text, images, send) {
+  function _sendQueued(kind, text, images, send, canSend = null) {
     const origin = activeSessionId;
     if (!origin) return Promise.resolve(false);
+    if (canSend && !canSend()) return Promise.resolve(false);
     const id = ++_queueSendSeq;
     _disarmAutoRename(text);
     _recordPrompt(text);
     state.queueSending = [...state.queueSending, QUEUE.sendingEntry(id, kind, text, images.length, state.queue, state.queueSending)];
-    notify();
     // Resolves to whether the IPC hand-off succeeded; omp's RPC response is
     // processed asynchronously so a tab switch never stalls remote callers.
     const sent = send();
+    notify();
     sent.then(() => { _dropSending(origin, id); return true; }, e => {
       if (!e?.timedOut) {
         const reason = e?.message ?? String(e);
@@ -4093,7 +4199,10 @@
       _dropSending(origin, id);
       return Boolean(e?.timedOut);
     });
-    return sent.handedOff ?? sent.then(() => true, () => false);
+    return (sent.handedOff ?? sent.then(() => true, () => false)).then(ok => {
+      if (ok) _retireWorkspaceChoice(origin);
+      return ok;
+    });
   }
 
   /** Remove a "sending" row from its tab, wherever that tab's state lives
@@ -4183,17 +4292,184 @@
     }
   }
 
+  // Keep the user's latest cycle result with a retryable workspace plan.
+  // A retry waits for in-flight cycles before it captures the naming model.
+  function _cycleWorkspacePreference(type) {
+    const id = activeSessionId;
+    const entry = sessionRegistry.get(id);
+    if (!entry || _firstPromptOps.has(id) || _workspaceSelectionOps.has(id) || _respawning.has(id)) return;
+    if (!entry.deferredWorkspace && !entry.pendingWorkspacePreferences && !entry.workspaceChoiceAvailable) {
+      _send({ type });
+      return;
+    }
+    const request = _sendWithResponse({ type }, QUICK_CMD_TIMEOUT_MS, "workspace-preference-", data => {
+      const current = sessionRegistry.get(id);
+      if (!current || activeSessionId !== id) return;
+      if (type === "cycle_model" && data?.model?.provider && data.model.id) {
+        const model = { provider: data.model.provider, id: data.model.id };
+        sessionRegistry.set(id, { ...current, selectedWorkspaceModel: model,
+          ...(current.pendingWorkspacePreferences ? { pendingWorkspacePreferences: { ...current.pendingWorkspacePreferences, model } } : {}) });
+        state.model = _buildModelEntry(data.model);
+        state.models = state.models.map(m => ({ ...m, current: m.id === data.model.id }));
+        _invalidateContext(data.model);
+        void _agentContextSync().loadMain().catch(() => {});
+      } else if (type === "cycle_thinking_level" && data?.level != null) {
+        const thinking = data.level;
+        sessionRegistry.set(id, { ...current, selectedWorkspaceThinking: thinking,
+          ...(current.pendingWorkspacePreferences ? { pendingWorkspacePreferences: { ...current.pendingWorkspacePreferences, thinking } } : {}) });
+        state.thinkingLevel = thinking;
+      }
+      notify();
+    });
+    const pending = _workspacePreferenceCycles.get(id) || new Set();
+    _workspacePreferenceCycles.set(id, pending);
+    const settled = request.then(() => null, error => String(error?.message ?? error));
+    pending.add(settled);
+    void settled.then(() => {
+      pending.delete(settled);
+      if (!pending.size && _workspacePreferenceCycles.get(id) === pending) _workspacePreferenceCycles.delete(id);
+    });
+  }
+
+  // Preparation belongs to the originating tab, not whichever tab is selected
+  // when the native checkout finishes. An abandoned submission never sends.
+  async function _prepareFirstPrompt(text) {
+    const id = activeSessionId;
+    const entry = sessionRegistry.get(id);
+    if (!entry) return { ok: false, error: "No conversation is selected." };
+    if (_workspaceSelectionOps.has(id)) return { ok: false, error: "Wait for workspace options to finish saving." };
+    if (entry.workspaceRestartRequired) return { ok: false, error: "Retry workspace options before starting a task." };
+    if (_firstPromptOps.has(id)) return { ok: false, error: "Workspace preparation is already in progress." };
+    if (!entry.deferredWorkspace && !entry.pendingWorkspacePreferences) return { ok: true };
+    if (entry.deferredWorkspace && !String(text ?? "").trim()) {
+      const error = "Enter a message before preparing this workspace.";
+      sessionRegistry.set(id, { ...entry, workspaceError: error });
+      notify();
+      return { ok: false, error };
+    }
+    const attempt = (entry.firstPromptAttempt ?? 0) + 1;
+    if (attempt > 0xffffffff) return { ok: false, error: "This conversation has exhausted workspace preparation attempts." };
+    const op = { attempt, cancelled: false, handedOff: false };
+    let awaitingHandoff = false;
+    _firstPromptOps.set(id, op);
+    sessionRegistry.set(id, { ...entry, firstPromptAttempt: attempt, workspacePreparing: true, workspaceError: null });
+    notify();
+    try {
+      while (_workspacePreferenceCycles.get(id)?.size) {
+        const results = await Promise.all([..._workspacePreferenceCycles.get(id)]);
+        const failure = results.find(result => result !== null);
+        if (failure) throw new Error(`Could not change the workspace preference: ${failure}`);
+      }
+      if (op.cancelled || activeSessionId !== id || !sessionRegistry.has(id))
+        return { ok: false, error: "Conversation changed before the message could be sent." };
+      const currentEntry = sessionRegistry.get(id);
+      const prefs = currentEntry.pendingWorkspacePreferences || {
+        model: currentEntry.selectedWorkspaceModel || (state.model?.provider && state.model?.id
+          ? { provider: state.model.provider, id: state.model.id } : null),
+        thinking: currentEntry.selectedWorkspaceThinking ?? state.thinkingLevel,
+      };
+      sessionRegistry.set(id, { ...currentEntry, pendingWorkspacePreferences: prefs });
+      if (currentEntry.deferredWorkspace) {
+        const result = await _respawnSession(id, {
+          profile: currentEntry.profile, reason: "Workspace preparation",
+          firstPrompt: { text: String(text), model: prefs.model, attempt: op.attempt },
+        });
+        if (!result.ok) throw new Error(result.error);
+      }
+      if (!sessionRegistry.has(id)) return { ok: false, error: "Tab closed." };
+      if (op.cancelled) return { ok: false, error: "Message cancelled." };
+      if (activeSessionId !== id) return { ok: false, error: "Conversation changed before the message could be sent." };
+      const generation = _switchGen;
+      const current = () => !op.cancelled && activeSessionId === id && _switchGen === generation && sessionRegistry.has(id);
+      if (prefs.model) {
+        const applied = await _sendWithResponse({ type: "set_model", provider: prefs.model.provider, modelId: prefs.model.id }, QUICK_CMD_TIMEOUT_MS);
+        if (!current()) return { ok: false, error: "Conversation changed before the message could be sent." };
+        if (applied?.id) {
+          state.model = _buildModelEntry(applied);
+          state.models = state.models.map(m => ({ ...m, current: m.id === applied.id }));
+          notify();
+        }
+      }
+      if (prefs.thinking) {
+        await _sendWithResponse({ type: "set_thinking_level", level: prefs.thinking }, QUICK_CMD_TIMEOUT_MS);
+        if (!current()) return { ok: false, error: "Conversation changed before the message could be sent." };
+      }
+      const ready = sessionRegistry.get(id);
+      sessionRegistry.set(id, { ...ready, pendingWorkspacePreferences: null });
+      awaitingHandoff = true;
+      return { ok: true, op };
+    } catch (e) {
+      const error = String(e?.message ?? e);
+      const current = sessionRegistry.get(id);
+      if (current) sessionRegistry.set(id, { ...current, workspaceError: error });
+      return { ok: false, error };
+    } finally {
+      if (!awaitingHandoff) _finishFirstPrompt(id, op);
+    }
+  }
+
+  function _finishFirstPrompt(id, op) {
+    if (!op || _firstPromptOps.get(id) !== op) return;
+    if (op.cancelPromise && !op.cancelSettled) {
+      void op.cancelPromise.then(() => _finishFirstPrompt(id, op));
+      return;
+    }
+    _firstPromptOps.delete(id);
+    const entry = sessionRegistry.get(id);
+    if (entry) sessionRegistry.set(id, { ...entry, workspacePreparing: false });
+    notify();
+  }
+
+  function _cancelFirstPrompt(id, op) {
+    if (op.cancelled) return;
+    op.cancelled = true;
+    op.cancelPromise = _invokeResult("conversation_workspace_cancel", { sessionId: id, attempt: op.attempt }).then(result => {
+      if (!result.ok) {
+        const entry = sessionRegistry.get(id);
+        if (entry) {
+          sessionRegistry.set(id, { ...entry, workspaceError: `Could not cancel workspace preparation: ${result.error}` });
+          notify();
+        }
+      }
+      op.cancelSettled = true;
+    });
+  }
+
+  async function _handoffFirstPrompt(id, op, text, images, streamingBehavior, canSend) {
+    try {
+      if (op.cancelled || activeSessionId !== id || !sessionRegistry.has(id)) return false;
+      if (canSend && !canSend()) return false;
+      op.handedOff = true;
+      op.handoff = _sendPrompt(text, images, streamingBehavior, canSend);
+      return await op.handoff;
+    } finally {
+      _finishFirstPrompt(id, op);
+    }
+  }
+
+  function _retireWorkspaceChoice(id) {
+    const entry = sessionRegistry.get(id);
+    if (!entry?.workspaceChoiceAvailable) return;
+    sessionRegistry.set(id, { ...entry, workspaceChoiceAvailable: false });
+    notify();
+  }
+
   /** `OMP_BRIDGE.send`: the user bubble at once, then `prompt`. A
    *  `streamingBehavior` tells omp what to do if a turn is running by the
    *  time the prompt arrives; idle, omp ignores it and runs the prompt. */
   function _sendPrompt(text, images, streamingBehavior, canSend, confirmAdmission = false) {
+    const origin = activeSessionId;
+    if (canSend && !canSend()) return Promise.resolve(false);
     state.messages = [...state.messages, { kind: "user", time: timeNow(), text, images: images ?? [] }];
     _disarmAutoRename(text);
     _recordPrompt(text);
-    notify();
-    if (canSend && !canSend()) return Promise.resolve(false);
     const frame = { type: "prompt", message: text, images: images ?? [], ...(streamingBehavior ? { streamingBehavior } : {}) };
-    return confirmAdmission ? _sendWithResponse(frame).then(() => true) : _send(frame);
+    const sent = confirmAdmission ? _sendWithResponse(frame).then(() => true) : _send(frame);
+    notify();
+    return sent.then(ok => {
+      if (ok) _retireWorkspaceChoice(origin);
+      return ok;
+    });
   }
 
   /** A predicate that stays true while `sessionId` is still the selected,
@@ -4270,6 +4546,12 @@
   }
 
   function _liveStart() {
+    const visibleId = activeSessionId ?? [..._firstPromptOps.keys(), ..._workspaceSelectionOps].reverse().find(id => sessionRegistry.has(id));
+    const workspace = sessionRegistry.get(visibleId);
+    if (workspace?.workspacePreparing || workspace?.workspaceConfiguring || workspace?.workspaceRestartRequired)
+      return Promise.resolve({ ok: false, error: "Wait for workspace preparation or options to finish before starting live voice." });
+    if (workspace?.deferredWorkspace)
+      return Promise.resolve({ ok: false, error: "Send a first message or choose Local in workspace options before starting live voice." });
     const refusal = _voiceStartRefusal(state.dictation.active || !!_dictationStopPending, "Voice to text");
     if (refusal) return Promise.resolve({ ok: false, error: refusal });
     if (state.liveVoice.active) {
@@ -4287,9 +4569,13 @@
         // be trimmed or miss activity that happened while this tab was away.
         const data = await (op.history = _sendWithResponse({ type: "get_messages" }, QUICK_CMD_TIMEOUT_MS, "live-history-"));
         if (id !== activeSessionId || gen !== _liveGen || !state.liveVoice.active) return { ok: false, error: "Live voice session ended" };
+        if (_workspaceSelectionOps.has(id)) throw new Error("Wait for workspace options to finish before starting live voice.");
         if (!Array.isArray(data?.messages)) throw new Error("Invalid conversation history response");
         const instructions = window.OMP_LIVE_CONTEXT.instructions({ messages: data.messages, voice: state.liveVoice.transcripts, project: sessionRegistry.get(id)?.path || "" });
         op.request = _sendWithResponse({ type: "live_start", instructions }, 0);
+        // Native marks the workspace used before it writes live_start, even
+        // if the subsequent transport or agent response fails.
+        _retireWorkspaceChoice(id);
         await op.request;
         op.acceptFrames = true;
         if (id !== activeSessionId || gen !== _liveGen || !state.liveVoice.active) {
@@ -4547,9 +4833,21 @@
     // The bubble shows at once; omp's echo (`message_start`) ties it to the
     // persisted message. A command omp runs locally sends no echo, so its
     // bubble keeps no `ts` and the get_messages merge leaves it in place.
-    send(text, images) {
+    async send(text, images, rawText = text, canSend = null) {
+      const origin = activeSessionId;
+      if (!origin) return false;
+      if (sessionRegistry.get(origin)?.workspaceRestartRequired) return false;
+      if (_respawning.has(origin) && !_firstPromptOps.has(origin)) return false;
+      if (sessionRegistry.get(origin)?.deferredWorkspace || sessionRegistry.get(origin)?.pendingWorkspacePreferences || _firstPromptOps.has(origin) || _workspaceSelectionOps.has(origin)) {
+        const prepared = await _prepareFirstPrompt(rawText);
+        if (!prepared.ok) return false;
+        if (activeSessionId !== origin) { _finishFirstPrompt(origin, prepared.op); return false; }
+        _noteWorkspaceUse();
+        return _handoffFirstPrompt(origin, prepared.op, text, images, undefined, canSend);
+      }
+      if (canSend && !canSend()) return false;
       _noteWorkspaceUse();
-      return _sendPrompt(text, images);
+      return _sendPrompt(text, images, undefined, canSend);
     },
     // Monitoring is read-only. Only the selected, fully settled tab may
     // receive remediation; recheck here after the asynchronous GitHub read.
@@ -4573,7 +4871,7 @@
       const ready = () => {
         const entry = sessionRegistry.get(sessionId);
         return (
-          canSend() && current() && !!entry?.path &&
+          canSend() && current() && !!entry?.path && !entry.deferredWorkspace && !entry.workspacePreparing && !entry.workspaceConfiguring &&
           !userAbortInFlight && !entry.autoRenameInFlight &&
           state.rpcState?.isSettled === true && runStateCached(state) === "idle" &&
           !state.queueSending.length && !(state.rpcState?.queuedMessageCount > 0) &&
@@ -4599,8 +4897,28 @@
     // switch, and the abort response is what releases a cancelled
     // auto-rename. See `_releaseAutoRenameAfterAbort`.
     abort() {
+      const id = activeSessionId ?? [..._firstPromptOps.keys()].reverse().find(key => sessionRegistry.has(key));
+      const op = _firstPromptOps.get(id);
+      if (op && !op.handedOff) { _cancelFirstPrompt(id, op); return Promise.resolve(true); }
+      if (op?.handoff) { op.cancelled = true; return op.handoff.then(sent => {
+        if (!sent || !sessionRegistry.has(id)) return false;
+        if (id === activeSessionId) userAbortInFlight = true;
+        return window.__TAURI__.core.invoke("send_command", { sessionId: id, json: JSON.stringify({ type: "abort" }) }).then(() => true, () => false);
+      }); }
       userAbortInFlight = true;
       return _send({ type: "abort" });
+    },
+    cancelWorkspacePreparation(sessionId) {
+      const op = _firstPromptOps.get(sessionId);
+      if (!op) return false;
+      if (!op.handedOff) { _cancelFirstPrompt(sessionId, op); return true; }
+      op.cancelled = true;
+      void op.handoff?.then(sent => {
+        if (sent && sessionRegistry.has(sessionId)) return window.__TAURI__.core.invoke("send_command", {
+          sessionId, json: JSON.stringify({ type: "abort" }),
+        });
+      }).catch(e => console.warn("[live] could not abort prepared prompt:", e));
+      return true;
     },
     /** Stops omp's automatic retries of the active tab's failed request.
      *  While omp waits between attempts `abort_retry` ends the run on the
@@ -4629,20 +4947,44 @@
     // annotations merged into `text` never change its classification
     // (OMP_BROWSER.annotationText neutralises page data and comments).
     // See `_sendQueued` for how the message shows until omp delivers it.
-    followUp(text, images) {
+    async followUp(text, images, rawText = text, canSend = null) {
+      const origin = activeSessionId;
+      if (!origin) return false;
+      if (sessionRegistry.get(origin)?.workspaceRestartRequired) return false;
+      if (_respawning.has(origin) && !_firstPromptOps.has(origin)) return false;
+      if (sessionRegistry.get(origin)?.deferredWorkspace || sessionRegistry.get(origin)?.pendingWorkspacePreferences || _firstPromptOps.has(origin) || _workspaceSelectionOps.has(origin)) {
+        const prepared = await _prepareFirstPrompt(rawText);
+        if (!prepared.ok) return false;
+        if (activeSessionId !== origin) { _finishFirstPrompt(origin, prepared.op); return false; }
+        _noteWorkspaceUse();
+        return _handoffFirstPrompt(origin, prepared.op, text, images, "followUp", canSend);
+      }
+      if (canSend && !canSend()) return false;
       _noteWorkspaceUse();
       const imgs = images ?? [];
       const isCmd = isCommandInvocation(state.commands, text);
       return _sendQueued("followUp", text, imgs, () =>
-        _sendWithResponse(queuedFrame("followUp", text, imgs, isCmd)),
+        _sendWithResponse(queuedFrame("followUp", text, imgs, isCmd)), canSend,
       );
     },
-    steer(text, images) {
+    async steer(text, images, rawText = text, canSend = null) {
+      const origin = activeSessionId;
+      if (!origin) return false;
+      if (sessionRegistry.get(origin)?.workspaceRestartRequired) return false;
+      if (_respawning.has(origin) && !_firstPromptOps.has(origin)) return false;
+      if (sessionRegistry.get(origin)?.deferredWorkspace || sessionRegistry.get(origin)?.pendingWorkspacePreferences || _firstPromptOps.has(origin) || _workspaceSelectionOps.has(origin)) {
+        const prepared = await _prepareFirstPrompt(rawText);
+        if (!prepared.ok) return false;
+        if (activeSessionId !== origin) { _finishFirstPrompt(origin, prepared.op); return false; }
+        _noteWorkspaceUse();
+        return _handoffFirstPrompt(origin, prepared.op, text, images, "steer", canSend);
+      }
+      if (canSend && !canSend()) return false;
       _noteWorkspaceUse();
       const imgs = images ?? [];
       const isCmd = isCommandInvocation(state.commands, text);
       return _sendQueued("steering", text, imgs, () =>
-        _sendWithResponse(queuedFrame("steer", text, imgs, isCmd)),
+        _sendWithResponse(queuedFrame("steer", text, imgs, isCmd)), canSend,
       );
     },
     /** ✕ / ✎ on a queue-strip row (`queue`: "steering" | "followUp"):
@@ -4713,14 +5055,33 @@
       const message = String(prompt ?? "").trim() || text;
       const origin = activeSessionId;
       if (!origin) return { ok: false, error: "Not connected" };
+      if (sessionRegistry.get(origin)?.workspaceRestartRequired) return { ok: false, error: "Retry workspace options before starting a task." };
+      if (_respawning.has(origin) && !_firstPromptOps.has(origin)) return { ok: false, error: "Wait for the agent to finish restarting." };
+      let firstOp = null;
+      try {
+      if (sessionRegistry.get(origin)?.deferredWorkspace || sessionRegistry.get(origin)?.pendingWorkspacePreferences || _firstPromptOps.has(origin) || _workspaceSelectionOps.has(origin)) {
+        const prepared = await _prepareFirstPrompt(text);
+        if (!prepared.ok) return prepared;
+        if (activeSessionId !== origin || prepared.op?.cancelled) {
+          _finishFirstPrompt(origin, prepared.op);
+          return { ok: false, error: "Conversation changed before the goal could start." };
+        }
+        firstOp = prepared.op;
+      }
       const wasStreaming = state.isStreaming;
       try {
-        const data = await _sendWithResponse({
+        const request = _sendWithResponse({
           type: "goal",
           op: "create",
           objective: text,
           ...(tokenBudget ? { token_budget: tokenBudget } : {}),
         });
+        if (firstOp) {
+          firstOp.handedOff = true;
+          firstOp.handoff = request.handedOff;
+        }
+        const data = await request;
+        _retireWorkspaceChoice(origin);
         if (origin === activeSessionId) _applyGoalResult(data);
       } catch (e) {
         // No answer is not a refusal: omp may still create the goal, whose
@@ -4733,11 +5094,14 @@
           };
         return { ok: false, error: String(e?.message ?? e) };
       }
+      if (firstOp?.cancelled) return { ok: false, error: "Goal send cancelled; check the conversation before retrying." };
       if (origin !== activeSessionId) return { ok: true };
       const bridge = window.OMP_BRIDGE;
       if (wasStreaming) {
-        bridge.steer(message, imgs);
-        return { ok: true };
+        _finishFirstPrompt(origin, firstOp);
+        firstOp = null;
+        const sent = await bridge.steer(message, imgs);
+        return sent ? { ok: true } : { ok: false, error: "The goal started, but its message could not be sent." };
       }
       let rpcState = null;
       try {
@@ -4748,6 +5112,7 @@
           e,
         );
       }
+      if (firstOp?.cancelled) return { ok: false, error: "Goal send cancelled; check the conversation before retrying." };
       if (origin !== activeSessionId) return { ok: true };
       // Nothing started, but omp is not settled either (a background job or
       // queued follow-ups): a turn may begin any moment, so the objective
@@ -4759,10 +5124,13 @@
       // first prompt, with the same `streamingBehavior` fallback. When omp
       // started on its own, the objective is already in the goal: only what
       // it does not carry (images, browser annotations) is steered in.
+      let sent = true;
       if (GOAL.ompStartedTurn(rpcState)) {
-        if (imgs.length > 0 || message !== text) bridge.steer(message, imgs);
+        _finishFirstPrompt(origin, firstOp);
+        firstOp = null;
+        if (imgs.length > 0 || message !== text) sent = await bridge.steer(message, imgs);
       } else if (rpcState?.isSettled === false) {
-        _sendQueued("steering", message, imgs, () =>
+        sent = await _sendQueued("steering", message, imgs, () =>
           _sendWithResponse({
             type: "prompt",
             message,
@@ -4770,8 +5138,11 @@
             streamingBehavior: "steer",
           }),
         );
-      } else _sendPrompt(message, imgs, "steer");
-      return { ok: true };
+      } else sent = await _sendPrompt(message, imgs, "steer");
+      return sent ? { ok: true } : { ok: false, error: "The goal started, but its message could not be sent." };
+      } finally {
+        _finishFirstPrompt(origin, firstOp);
+      }
     },
     /** `pause` / `resume` / `drop` the active tab's goal. */
     goalOp(op) {
@@ -4851,6 +5222,12 @@
       if (rest) sessionRegistry.set(id, { ...cur, renameNotes: rest });
     },
     setModel(model) {
+      const entry = sessionRegistry.get(activeSessionId);
+      if (entry?.deferredWorkspace || entry?.workspaceChoiceAvailable || entry?.pendingWorkspacePreferences) {
+        const selected = { provider: model.provider, id: model.id };
+        sessionRegistry.set(activeSessionId, { ...entry, selectedWorkspaceModel: selected,
+          ...(entry.pendingWorkspacePreferences ? { pendingWorkspacePreferences: { ...entry.pendingWorkspacePreferences, model: selected } } : {}) });
+      }
       _invalidateContext(model);
       _send({ type: "set_model", provider: model.provider, modelId: model.id });
     },
@@ -4865,10 +5242,10 @@
       return _invokeSafe("model_usage_list", { profile }, []);
     },
     cycleModel() {
-      _send({ type: "cycle_model" });
+      _cycleWorkspacePreference("cycle_model");
     },
     cycleThinking() {
-      _send({ type: "cycle_thinking_level" });
+      _cycleWorkspacePreference("cycle_thinking_level");
     },
     /** The thinking levels the active tab's model supports, `off` first:
      *  omp's own list, which leaves out its `auto` selector. */
@@ -4885,6 +5262,11 @@
      *  response carries nothing; the level omp applied (it may clamp the
      *  pick) arrives before it, as `thinking_level_changed`. */
     setThinkingLevel(level) {
+      const entry = sessionRegistry.get(activeSessionId);
+      if (entry?.deferredWorkspace || entry?.workspaceChoiceAvailable || entry?.pendingWorkspacePreferences) {
+        sessionRegistry.set(activeSessionId, { ...entry, selectedWorkspaceThinking: level,
+          ...(entry.pendingWorkspacePreferences ? { pendingWorkspacePreferences: { ...entry.pendingWorkspacePreferences, thinking: level } } : {}) });
+      }
       return _sendWithResponse(
         { type: "set_thinking_level", level },
         QUICK_CMD_TIMEOUT_MS,
@@ -5023,20 +5405,27 @@
      * @param {string} providerId
      */
     async login(providerId) {
-      const seededProfile = sessionRegistry.get(activeSessionId)?.profile;
-      const res = await _sendWithResponse(
-        { type: "login", providerId },
-        300000,
-      );
-      if (seededProfile) {
-        await _invokeSafe(
-          "clear_profile_bootstrap",
-          { id: seededProfile },
-          null,
-        );
+      const id = activeSessionId;
+      if (!id || !sessionRegistry.has(id)) throw new Error("Not connected");
+      if (_workspaceSelectionOps.has(id) || _firstPromptOps.has(id) || _respawning.has(id))
+        throw new Error("Wait for workspace preparation or options to finish before signing in.");
+      if (_loginRequests.has(id)) throw new Error("A sign-in is already in progress in this conversation.");
+      const entry = sessionRegistry.get(id);
+      const seededProfile = entry?.profile;
+      const processStartedAt = entry?.processStartedAt;
+      const generation = _switchGen;
+      _loginRequests.add(id);
+      try {
+        const res = await _sendWithResponse({ type: "login", providerId }, 300000);
+        if (seededProfile) {
+          await _invokeSafe("clear_profile_bootstrap", { id: seededProfile }, null);
+        }
+        if (activeSessionId === id && _switchGen === generation && sessionRegistry.get(id)?.processStartedAt === processStartedAt) _refreshCodexLogin();
+        return res;
+      } finally {
+        _loginRequests.delete(id);
+        if (sessionRegistry.has(id)) void _applyApprovalModes();
       }
-      _refreshCodexLogin();
-      return res;
     },
 
     /**
@@ -5220,6 +5609,9 @@
      *  `remote` one gets a local branch tracking it). The HEAD watcher then
      *  reports the new branch (`git://branch/{id}`). */
     gitSwitchBranch(name, remote) {
+      const visibleId = activeSessionId ?? [..._firstPromptOps.keys(), ..._workspaceSelectionOps].reverse().find(id => sessionRegistry.has(id));
+      if (sessionRegistry.get(visibleId)?.deferredWorkspace || sessionRegistry.get(visibleId)?.workspaceRestartRequired || _firstPromptOps.has(visibleId) || _workspaceSelectionOps.has(visibleId))
+        return Promise.resolve({ ok: false, error: "Choose the base branch in workspace options before the first message." });
       return _gitBrowserInvoke("workspace_switch_branch", { name, remote });
     },
 
@@ -5253,6 +5645,8 @@
       return _evidenceController().mutate(input);
     },
     async requestEvidence(input) {
+      if (sessionRegistry.get(activeSessionId)?.deferredWorkspace)
+        throw new Error("Send a first message before requesting evidence.");
       const client = _evidenceController();
       const requestId = input.requestId || input.newRequestId;
       if (!requestId) throw new Error("An Evidence request needs a saved or newly allocated identity.");
@@ -5452,6 +5846,10 @@
      *  x `rows`; a live or starting shell is returned as is. Resolves
      *  `{ ok: true, status }` (Rust's `TerminalStatus`) or `{ ok: false, error }`. */
     async terminalOpen(sessionId, cols, rows) {
+      if (_workspaceSelectionOps.has(sessionId) || sessionRegistry.get(sessionId)?.workspaceRestartRequired)
+        return { ok: false, error: "Wait for workspace options to finish saving before opening a terminal." };
+      if (sessionRegistry.get(sessionId)?.deferredWorkspace || _firstPromptOps.has(sessionId))
+        return { ok: false, error: "Send a first message before opening a terminal in this workspace." };
       const res = await _invokeResult("terminal_open", {
         sessionId,
         cols,
@@ -5695,13 +6093,63 @@
     configureProjectWorkspace(path, profile = _activeProfileId()) {
       return _requestConversationSetup(path, profile, true);
     },
+    configureConversationWorkspace(sessionId, preferredWorktree = null) {
+      const entry = sessionRegistry.get(sessionId);
+      if (!entry?.workspaceChoiceAvailable || _firstPromptOps.has(sessionId) || _workspaceSelectionOps.has(sessionId) || _respawning.has(sessionId)) return Promise.resolve(null);
+      if (conversationSetups.some(request => request.view.sessionId === sessionId)) return Promise.resolve(null);
+      return _requestConversationSetup(entry.path, entry.profile, false, sessionId, preferredWorktree);
+    },
+
+    async setConversationWorkspace(sessionId, workspace) {
+      const entry = sessionRegistry.get(sessionId);
+      if (!entry?.workspaceChoiceAvailable || _firstPromptOps.has(sessionId) || _workspaceSelectionOps.has(sessionId) || _respawning.has(sessionId))
+        return { ok: false, error: "This conversation can no longer change its workspace." };
+      if (_loginRequests.has(sessionId))
+        return { ok: false, error: "Finish signing in before changing workspace options." };
+      _workspaceSelectionOps.add(sessionId);
+      sessionRegistry.set(sessionId, { ...entry, workspaceConfiguring: true });
+      notify();
+      try {
+        while (_workspacePreferenceCycles.get(sessionId)?.size) {
+          const results = await Promise.all([..._workspacePreferenceCycles.get(sessionId)]);
+          const failure = results.find(result => result !== null);
+          if (failure) return { ok: false, error: `Could not change the workspace preference: ${failure}` };
+        }
+        if (!sessionRegistry.has(sessionId)) return { ok: false, error: "Tab closed." };
+        const result = await _invokeResult("conversation_workspace_set_deferred", { sessionId, workspace });
+        if (!result.ok) return result;
+        const current = sessionRegistry.get(sessionId);
+        if (!current) return { ok: false, error: "Tab closed." };
+        sessionRegistry.set(sessionId, { ...current, workspace: result.value?.workspace ?? null,
+          deferredWorkspace: result.value?.deferredWorkspace ?? null, workspaceSelection: result.value?.deferredWorkspace ?? workspace,
+          workspaceRestartRequired: true, workspaceError: null });
+        const restarted = await _respawnSession(sessionId, {
+          profile: current.profile, reason: "Workspace options change", workspaceChoiceRestart: true,
+        });
+        if (!sessionRegistry.has(sessionId)) return { ok: false, error: "Tab closed." };
+        if (!restarted.ok) {
+          const latest = sessionRegistry.get(sessionId);
+          sessionRegistry.set(sessionId, { ...latest, workspaceError: `${restarted.error} Retry workspace options before sending.` });
+          return restarted;
+        }
+        sessionRegistry.set(sessionId, { ...sessionRegistry.get(sessionId), workspaceRestartRequired: false });
+        return result;
+      } finally {
+        _workspaceSelectionOps.delete(sessionId);
+        const current = sessionRegistry.get(sessionId);
+        if (current) sessionRegistry.set(sessionId, { ...current, workspaceConfiguring: false });
+        notify();
+        if (current) void _applyApprovalModes();
+      }
+    },
+
 
     inspectConversationWorkspace(path, profile = _activeProfileId()) {
       return _invokeResult("conversation_workspace_inspect", { path, profile });
     },
 
-    conversationWorkspaceStatus(path) {
-      return _invokeResult("conversation_workspace_status", { path });
+    conversationWorkspaceStatus(path, sessionId = null) {
+      return _invokeResult("conversation_workspace_status", { path, ...(sessionId ? { sessionId } : {}) });
     },
 
     setProjectWorkspaceDefaults(path, profile, { baseRef, worktree }) {
@@ -5725,19 +6173,17 @@
       if (request.busy)
         return { ok: false, error: "Conversation is already starting" };
       request.busy = true;
-      try {
-        const id = await _startProjectSession(request.view.path, {
-          profile: request.view.profile,
-          workspace,
-        });
-        conversationSetups.shift();
-        request.resolve(id);
-        notify();
-        return { ok: true, sessionId: id };
-      } catch (error) {
+      const id = request.view.sessionId;
+      const result = id ? await this.setConversationWorkspace(id, workspace)
+        : { ok: false, error: "Conversation is no longer available" };
+      if (!result.ok) {
         request.busy = false;
-        return { ok: false, error: String(error?.message ?? error) };
+        return result;
       }
+      conversationSetups.shift();
+      request.resolve(id);
+      notify();
+      return { ok: true, sessionId: id };
     },
 
     cancelConversationSetup(requestId) {
@@ -6068,6 +6514,8 @@
     async closeSession(id, { worktreeAction = null, throwOnFailure = false } = {}) {
       if (!sessionRegistry.has(id) || _closingVoiceTabs.has(id)) return false;
       _closingVoiceTabs.add(id);
+      const pendingSend = _firstPromptOps.get(id);
+      if (pendingSend) pendingSend.cancelled = true;
       try {
         if (
           id === activeSessionId &&
@@ -6128,7 +6576,8 @@
      *  whether the tab was closed. */
     async closeSessionGuarded(id) {
       if (!sessionRegistry.has(id) || worktreeCloseConfirm) return false;
-      if (sessionRegistry.get(id)?.preparing) return window.OMP_BRIDGE.closeSession(id);
+      if (sessionRegistry.get(id)?.preparing || sessionRegistry.get(id)?.workspacePreparing)
+        return window.OMP_BRIDGE.closeSession(id);
       const confirm = PREFS.tabCloseConfirm(sessionPrefs, _sessionsView(), id);
       if (confirm && !(await _askClose(confirm))) return false;
       if (!sessionRegistry.has(id)) return false;

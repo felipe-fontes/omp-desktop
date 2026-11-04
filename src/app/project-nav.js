@@ -39,7 +39,7 @@
 
   /** Source project for a tab, without changing its execution folder. */
   function projectPath(tab) {
-    return tab.path ? (tab.workspace?.projectPath || tab.path) : tab.path;
+    return tab.path ? (tab.workspace?.projectPath || tab.sourceProjectPath || tab.path) : tab.path;
   }
 
   /** Collapse legacy worktree-to-worktree bindings to their source project.
@@ -301,14 +301,19 @@
   function tabLayout(tabs, activeId) {
     const active = tabs.findIndex(t => t.id === activeId);
     return {
-      tabs: tabs.map(t => ({
-        path: t.path || "",
-        profile: t.profile ?? null,
-        sessionFile: t.sessionFile || null,
-        name: t.name || null,
-        ...(t.workspace ? { workspace: t.workspace } : {}),
-        ...(t.scratchId ? { scratchId: t.scratchId } : {}),
-      })),
+      tabs: tabs.map(t => {
+        const deferred = t.deferredWorkspace ||
+          (t.workspaceChoiceAvailable && t.workspaceSelection?.worktree === false ? t.workspaceSelection : null);
+        return {
+          path: t.path || "",
+          profile: t.profile ?? null,
+          sessionFile: deferred ? null : (t.sessionFile || null),
+          name: t.name || null,
+          ...(t.workspace ? { workspace: t.workspace } : {}),
+          ...(deferred ? { deferredWorkspace: deferred.worktree ? deferred : { ...deferred, acknowledgeShared: false } } : {}),
+          ...(t.scratchId ? { scratchId: t.scratchId } : {}),
+        };
+      }),
       active: active < 0 ? null : active,
     };
   }
@@ -319,7 +324,7 @@
    *  a conversation no longer there). Fallback names and styling are
    *  `_startProjectSession`'s, as for any other open. */
   function restoreSpec(tab) {
-    const resume = tab.sessionFile || null;
+    const resume = tab.deferredWorkspace ? null : (tab.sessionFile || null);
     return {
       cwd: tab.path || "",
       resume,
@@ -328,6 +333,8 @@
       // profile its process actually runs under.
       profile: tab.profile || DEFAULT_PROFILE_ID,
       ...(tab.workspace ? { workspaceBinding: tab.workspace } : {}),
+      ...(tab.deferredWorkspace ? { deferredWorkspace: tab.deferredWorkspace.worktree
+        ? tab.deferredWorkspace : { ...tab.deferredWorkspace, acknowledgeShared: false } } : {}),
       ...(tab.scratchId ? { scratchId: tab.scratchId } : {}),
     };
   }

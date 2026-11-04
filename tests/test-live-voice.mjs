@@ -240,8 +240,9 @@ check("voice controls start independently and retain stop and cancel actions", (
 
 // Exercise the public bridge against a deterministic fake IPC transport. The
 // assertions concern snapshots and outcomes, not the bridge's internal maps.
-function bridgeHarness() {
-  const listeners = new Map(), journal = new Map(), commands = [], waiters = [];
+function bridgeHarness({ boot = false } = {}) {
+  const listeners = new Map(), journal = new Map(), commands = [], waiters = [], pending = new Map();
+  const paths = new Map(), taskStarted = new Set(), sessionFiles = new Map(), workspaceBindings = new Map();
   const w = {
     OMP_LIVE_VOICE: V,
     OMP_SLASH: { LOCAL_COMMANDS: [] },
@@ -258,14 +259,22 @@ function bridgeHarness() {
   new Function("window", readFileSync(join(root, "src/app/live-context.js"), "utf8"))(w);
   new Function("window", readFileSync(join(root, "src/app/approval-mode.js"), "utf8"))(w);
   new Function("window", readFileSync(join(root, "src/app/project-nav.js"), "utf8"))(w);
-  for (const file of ["session-title.js", "agent-context.js", "agent-context-sync.js", "context-policy.js", "evidence-client.js", "cache-usage.js", "stream-delta.js"])
+  new Function("window", readFileSync(join(root, "src/app/conversation-workspace.js"), "utf8"))(w);
+  for (const file of ["session-title.js", "prompt-history.js", "agent-context.js", "agent-context-sync.js", "context-policy.js", "evidence-client.js", "cache-usage.js", "stream-delta.js"])
     new Function("window", readFileSync(join(root, "src/app", file), "utf8"))(w);
-  // The fake is attached after bridge initialization, so no boot restore or
-  // real process is started. Only timers for other bridge commands are unref'd.
+  if (boot) {
+    for (const file of ["app/message-queue.js", "app/goal.js", "adapter.js"])
+      new Function("window", readFileSync(join(root, "src", file), "utf8"))(w);
+  }
+  // Most tests attach IPC after initialization; persistence tests boot the
+  // bridge with IPC so the normal open-tabs writer is armed.
   const timeout = (fn, ms) => { const t = setTimeout(fn, ms); t.unref(); return t; };
   new Function("window", readFileSync(join(root, "src/app/background-tasks.js"), "utf8"))(w);
-  // eslint-disable-next-line no-new-func
-  new Function("window", "setTimeout", "clearTimeout", readFileSync(join(root, "src/live.js"), "utf8"))(w, timeout, clearTimeout);
+  const initialize = () => new Function("window", "setTimeout", "clearTimeout", "document", "navigator",
+    readFileSync(join(root, "src/live.js"), "utf8"))(w, timeout, clearTimeout,
+    { documentElement: { classList: { add() {} } }, readyState: "loading", addEventListener() {} },
+    { platform: "Mac" });
+  if (!boot) initialize();
   function emit(id, frame) {
     const entries = journal.get(id) ?? [];
     const envelope = { seq: entries.length + 1, text: JSON.stringify(frame) };
@@ -281,7 +290,7 @@ function bridgeHarness() {
     if (matches.length >= count) return Promise.resolve(matches[count - 1]);
     return new Promise(resolve => waiters.push({ type, count, resolve }));
   }
-  let releaseStart = null, holdStart = false, holdHistory = false, approvalMode = "write";
+  let releaseStart = null, holdStart = false, holdHistory = false, failLiveWrite = false, approvalMode = "write";
   const histories = new Map();
   const invocations = [];
   w.__TAURI__ = {
@@ -294,19 +303,59 @@ function bridgeHarness() {
         approvalMode = args.mode;
         return Promise.resolve({ default: approvalMode, projects: {} });
       }
-      if (command === "start_session") return Promise.resolve({ approvalMode, path: args.args.cwd, workspace: null });
+      if (command === "conversation_workspace_inspect") return Promise.resolve({
+        path: args.path, projectPath: args.path, repoRoot: args.path,
+        currentBranch: "main", head: "a".repeat(40),
+        branches: [{ name: "main", refName: "refs/heads/main", commit: "a".repeat(40), remote: false }],
+        dirty: false, owners: 0, defaults: { baseRef: "refs/heads/main", worktree: false },
+      });
+      if (command === "start_session") {
+        const { sessionId, cwd, deferredWorkspace, firstPrompt } = args.args;
+        paths.set(sessionId, cwd);
+        if (boot) sessionFiles.set(sessionId, args.args.resume ?? "/metadata/source.jsonl");
+        if (deferredWorkspace) pending.set(sessionId, deferredWorkspace);
+        if (firstPrompt) assert.ok(pending.has(sessionId), "first prompt requires a pending workspace");
+        const prepared = firstPrompt ? pending.get(sessionId) : null;
+        if (firstPrompt) pending.delete(sessionId);
+        return Promise.resolve({
+          approvalMode, path: cwd, deferredWorkspace: pending.get(sessionId) ?? null,
+          workspace: prepared ? { projectPath: cwd, ...prepared } : workspaceBindings.get(sessionId) ?? null,
+        });
+      }
+      if (command === "conversation_workspace_set_deferred") {
+        if (taskStarted.has(args.sessionId)) return Promise.reject(new Error("workspace cannot change after a task has started"));
+        if (args.workspace.worktree) {
+          pending.set(args.sessionId, args.workspace);
+          workspaceBindings.delete(args.sessionId);
+          return Promise.resolve({ workspace: null, deferredWorkspace: args.workspace });
+        }
+        pending.delete(args.sessionId);
+        const workspace = { projectPath: paths.get(args.sessionId), baseRef: args.workspace.baseRef,
+          baseCommit: args.workspace.baseCommit, worktree: false };
+        workspaceBindings.set(args.sessionId, workspace);
+        return Promise.resolve({ workspace, deferredWorkspace: null });
+      }
       if (command === "start_git_watch") return Promise.resolve({ branch: null, root: args.path });
       if (command === "replay_events") return Promise.resolve({ dropped: false, events: (journal.get(args.sessionId) ?? []).filter(e => e.seq > args.afterSeq) });
       if (command === "send_command") {
         const cmd = { ...JSON.parse(args.json), sessionId: args.sessionId };
+        if (cmd.type === "live_start") {
+          taskStarted.add(cmd.sessionId);
+          if (boot && !failLiveWrite) sessionFiles.set(cmd.sessionId, "/saved/voice-session.jsonl");
+        }
         commands.push(cmd);
         for (const waiter of waiters.splice(0)) {
           const matches = commands.filter(c => c.type === waiter.type);
           if (matches.length >= waiter.count) waiter.resolve(matches[waiter.count - 1]);
           else waiters.push(waiter);
         }
+        if (cmd.type === "live_start" && failLiveWrite) return Promise.reject(new Error("Agent pipe closed after admission"));
         if (cmd.type === "negotiate_protocol" || cmd.type === "set_ask_dialog") queueMicrotask(() => reply(cmd));
         if (cmd.type === "get_state" && cmd.id?.startsWith("conversation-state-")) queueMicrotask(() => reply(cmd, true, { isStreaming: false, isSettled: true }));
+        if (boot && cmd.type === "get_state" && !cmd.id?.startsWith("conversation-state-")) {
+          queueMicrotask(() => reply(cmd, true, { sessionId: `omp-${cmd.sessionId}`,
+            sessionFile: sessionFiles.get(cmd.sessionId), messageCount: 0, isStreaming: false, isSettled: true }));
+        }
         if (cmd.type === "get_messages" && cmd.id?.startsWith("live-history-") && !holdHistory) {
           queueMicrotask(() => reply(cmd, true, { messages: histories.get(cmd.sessionId) ?? [] }));
         }
@@ -319,21 +368,23 @@ function bridgeHarness() {
       return () => { if (listeners.get(name) === callback) listeners.delete(name); };
     } },
   };
+  if (boot) initialize();
   let snapshot;
   w.OMP_BRIDGE.onUpdate(s => { snapshot = s; });
   return {
-    bridge: {
-      ...w.OMP_BRIDGE,
-      async openSession(cwd) {
-        const opened = w.OMP_BRIDGE.openSession(cwd);
-        await w.OMP_BRIDGE.startConversationSetup(snapshot.conversationSetup.id, null);
-        return opened;
-      },
-    }, emit, reply, waitCommand, commands, invocations,
+    bridge: w.OMP_BRIDGE, nav: w.OMP_PROJECT_NAV, emit, reply, waitCommand, commands, invocations,
+    async openReadySession(cwd) {
+      const id = await w.OMP_BRIDGE.openSession(cwd);
+      assert.ok(snapshot.sessions.find(tab => tab.id === id).deferredWorkspace);
+      assert.equal(await w.OMP_BRIDGE.send("Initial coding request"), true);
+      assert.equal(snapshot.sessions.find(tab => tab.id === id).deferredWorkspace, null);
+      return id;
+    },
     snapshot: () => snapshot,
     holdStart: () => { holdStart = true; },
     releaseStart: () => { holdStart = false; releaseStart(); },
     holdHistory: () => { holdHistory = true; },
+    failLiveWrite: () => { failLiveWrite = true; },
     setHistory: (id, messages) => { histories.set(id, messages); },
     exit: (id, reason) => listeners.get(`agent://exit/${id}`)?.({ payload: reason }),
   };
@@ -352,9 +403,112 @@ async function twoTabs(h) {
 const rawMessage = (role, text) => ({ role, content: [{ type: "text", text }] });
 const contextOf = command => JSON.parse(command.instructions.split("\nConversation history (JSON data):\n")[1]);
 
+await checkAsync("live voice cannot start a task before a pending workspace is prepared", async () => {
+  const h = bridgeHarness();
+  const id = await h.bridge.openSession("/repo");
+  assert.ok(h.snapshot().sessions.find(tab => tab.id === id).deferredWorkspace);
+  const result = await h.bridge.liveStart();
+  assert.equal(result.ok, false);
+  assert.match(result.error, /first message/i);
+  assert.equal(h.commands.some(command => command.type === "live_start"), false);
+});
+
+const drainMicrotasks = async () => { for (let i = 0; i < 80; i++) await Promise.resolve(); };
+const localSelection = {
+  baseRef: "refs/heads/main", baseCommit: "a".repeat(40),
+  worktree: false, acknowledgeShared: true,
+};
+async function openLocalChoice(h) {
+  await drainMicrotasks();
+  const id = await h.bridge.openSession("/repo");
+  assert.equal((await h.bridge.setConversationWorkspace(id, localSelection)).ok, true);
+  h.emit(id, { type: "config_update" });
+  await drainMicrotasks();
+  const tab = h.snapshot().sessions.find(row => row.id === id);
+  assert.equal(tab.deferredWorkspace, null);
+  assert.equal(tab.workspaceChoiceAvailable, true);
+  assert.equal(tab.sessionFile, "/metadata/source.jsonl");
+  return id;
+}
+
+for (const admittedResult of ["success", "refusal"]) {
+  await checkAsync(`Local live handoff retires the choice and persists the actual session after ${admittedResult}`, async () => {
+    const h = bridgeHarness({ boot: true });
+    const id = await openLocalChoice(h);
+    const before = h.invocations.filter(call => call.command === "open_tabs_save").at(-1)?.args.layout.tabs[0];
+    assert.ok(before, "the Local-ready layout must be saved");
+    assert.equal(before.sessionFile, null, "metadata history is not a task session");
+    assert.equal(before.deferredWorkspace.worktree, false);
+
+    const starting = h.bridge.liveStart();
+    const command = await h.waitCommand("live_start");
+    assert.equal(command.sessionId, id);
+    assert.deepEqual(contextOf(command).chat.messages, []);
+    await drainMicrotasks();
+    assert.equal(h.snapshot().sessions.find(row => row.id === id).workspaceChoiceAvailable, false,
+      "native admission retires the choice before a provider response");
+    h.reply(command, admittedResult === "success", null, "Provider refused connection");
+    const result = await starting;
+    assert.equal(result.ok, admittedResult === "success");
+    if (admittedResult === "refusal") assert.match(result.error, /refused/i);
+
+    h.emit(id, { type: "config_update" });
+    await drainMicrotasks();
+    assert.equal(h.snapshot().sessions.find(row => row.id === id).sessionFile, "/saved/voice-session.jsonl");
+    const saved = h.invocations.filter(call => call.command === "open_tabs_save").at(-1)?.args.layout.tabs[0];
+    assert.ok(saved, "the admitted session must be persisted");
+    assert.equal(saved.sessionFile, "/saved/voice-session.jsonl");
+    assert.equal(Object.hasOwn(saved, "deferredWorkspace"), false);
+    const reopened = h.nav.restoreSpec(saved);
+    assert.equal(reopened.resume, "/saved/voice-session.jsonl");
+    assert.equal(reopened.cwd, "/repo");
+    assert.equal(reopened.workspaceBinding.worktree, false);
+    assert.equal(Object.hasOwn(reopened, "deferredWorkspace"), false);
+
+    const changesBefore = h.invocations.filter(call => call.command === "conversation_workspace_set_deferred").length;
+    assert.equal((await h.bridge.setConversationWorkspace(id, { ...localSelection, worktree: true })).ok, false);
+    assert.equal(h.invocations.filter(call => call.command === "conversation_workspace_set_deferred").length, changesBefore,
+      "the frontend must refuse workspace changes without another native request");
+  });
+}
+
+await checkAsync("a failed history read before live handoff leaves Local editable and deferred on restore", async () => {
+  const h = bridgeHarness({ boot: true });
+  const id = await openLocalChoice(h);
+  h.holdHistory();
+  const starting = h.bridge.liveStart();
+  const history = h.commands.filter(c => c.type === "get_messages" && c.id?.startsWith("live-history-")).at(-1);
+  assert.ok(history);
+  h.reply(history, false, null, "History unavailable");
+  assert.match((await starting).error, /history unavailable/i);
+  assert.equal(h.commands.some(c => c.type === "live_start"), false);
+  assert.equal(h.snapshot().sessions.find(row => row.id === id).workspaceChoiceAvailable, true);
+  await drainMicrotasks();
+  const saved = h.invocations.filter(call => call.command === "open_tabs_save").at(-1)?.args.layout.tabs[0];
+  assert.equal(saved.sessionFile, null);
+  assert.equal(h.nav.restoreSpec(saved).deferredWorkspace.worktree, false);
+  assert.equal((await h.bridge.setConversationWorkspace(id, { ...localSelection, worktree: true })).ok, true);
+});
+
+await checkAsync("a native-admitted live write failure still refuses a workspace change", async () => {
+  const h = bridgeHarness({ boot: true });
+  const id = await openLocalChoice(h);
+  h.failLiveWrite();
+  const result = await h.bridge.liveStart();
+  assert.equal(result.ok, false);
+  assert.match(result.error, /pipe closed/i);
+  assert.equal(h.commands.filter(c => c.type === "live_start").length, 1);
+  const changed = await h.bridge.setConversationWorkspace(id, { ...localSelection, worktree: true });
+  assert.equal(changed.ok, false, "native admission must not be undone by a failed pipe write");
+  assert.match(changed.error, /workspace|conversation/i);
+  const tab = h.snapshot().sessions.find(row => row.id === id);
+  assert.equal(tab.workspace.worktree, false);
+  assert.equal(tab.deferredWorkspace, null);
+});
+
 await checkAsync("tab pause and resume carry fresh raw chat and all spoken turns without cross-tab leaks", async () => {
   const h = bridgeHarness();
-  const a = await h.bridge.openSession("/alpha"), b = await h.bridge.openSession("/beta");
+  const a = await h.openReadySession("/alpha"), b = await h.openReadySession("/beta");
   await h.bridge.activateSession(a);
   h.setHistory(a, [rawMessage("user", "Initial coding request"), rawMessage("assistant", "Initial coding answer")]);
   const starting = h.bridge.liveStart();

@@ -101,7 +101,7 @@ function BranchMenu({ branch, bridge, locked = false }) {
   return (
     <>
       <button ref={triggerRef} className="status-cell btn ghost branch-pill" aria-haspopup="menu" aria-expanded={open}
-        title={locked ? "branches (no switching while the agent works)" : "switch branch"}
+        title={typeof locked === "string" ? locked : locked ? "branches (no switching while the agent works)" : "switch branch"}
         onClick={() => (open ? close() : setPlace(_BM_place(triggerRef.current)))}>
         <_BM_Icon name="branch" size={11} color="var(--fg-3)" />
         <span className="mono">{branch}</span>
@@ -129,7 +129,7 @@ function BranchMenu({ branch, bridge, locked = false }) {
               {rows.hidden > 0 && <div className="branch-pop-note">{rows.hidden} more — narrow the filter</div>}
             </>)}
           </div>
-          {locked && <div className="branch-pop-note" role="status">the agent is working — switch branches once it's idle</div>}
+          {locked && <div className="branch-pop-note" role="status">{typeof locked === "string" ? locked : "the agent is working — switch branches once it's idle"}</div>}
           {error && <div className="branch-pop-note error" role="alert">{error}</div>}
         </div>,
         document.body,

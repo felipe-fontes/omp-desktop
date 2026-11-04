@@ -5,12 +5,34 @@ use std::time::Duration;
 
 const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The branch a new worktree checks out.
+#[derive(Clone, Copy)]
+pub(super) enum WorktreeBranch<'a> {
+    Detached,
+    /// Created at the commit (`-b`), never an existing name.
+    New(&'a str),
+    /// An existing local branch whose tip is the commit.
+    Existing(&'a str),
+}
+
+impl<'a> WorktreeBranch<'a> {
+    pub(super) const fn name(self) -> Option<&'a str> {
+        match self {
+            Self::Detached => None,
+            Self::New(name) | Self::Existing(name) => Some(name),
+        }
+    }
+}
+
 pub(super) trait Runner {
+    fn validate_branch(&self, root: &Path, name: &str) -> Result<(), String> {
+        validate_branch(root, name, || false)
+    }
     fn switch(&self, root: &Path, branch: &str) -> Result<(), String>;
     fn worktree(
         &self,
         root: &Path,
-        branch: Option<&str>,
+        branch: WorktreeBranch<'_>,
         dest: &Path,
         commit: &str,
     ) -> Result<(), String>;
@@ -49,6 +71,13 @@ impl<'a> Native<'a> {
 }
 
 impl Runner for Native<'_> {
+    fn validate_branch(&self, root: &Path, name: &str) -> Result<(), String> {
+        validate_branch(root, name, || {
+            self.cancellation
+                .is_some_and(|(manager, ticket)| manager.check_ticket(ticket).is_err())
+        })
+    }
+
     fn switch(&self, root: &Path, branch: &str) -> Result<(), String> {
         let mut command = git(root)?;
         command.args([
@@ -66,7 +95,7 @@ impl Runner for Native<'_> {
     fn worktree(
         &self,
         root: &Path,
-        branch: Option<&str>,
+        branch: WorktreeBranch<'_>,
         dest: &Path,
         commit: &str,
     ) -> Result<(), String> {
@@ -74,17 +103,25 @@ impl Runner for Native<'_> {
         // This is an explicit checkout mutation: Git's normal checkout filters
         // and post-checkout hook still run, just as with an in-place switch.
         command.args(["worktree", "add"]);
-        if let Some(branch) = branch {
-            command.args(["-b", branch]);
-        } else {
-            command.arg("--detach");
-        }
-        command.arg("--").arg(dest).arg(commit);
+        let start = match branch {
+            WorktreeBranch::New(name) => {
+                command.args(["-b", name]);
+                commit
+            }
+            WorktreeBranch::Detached => {
+                command.arg("--detach");
+                commit
+            }
+            // Git refuses a branch already checked out elsewhere; the caller
+            // verifies the checked-out branch and commit afterwards.
+            WorktreeBranch::Existing(name) => name,
+        };
+        command.arg("--").arg(dest).arg(start);
         self.execute(&mut command, "git worktree add")
     }
 }
 
-pub(super) fn validate_branch(root: &Path, name: &str) -> Result<(), String> {
+fn validate_branch(root: &Path, name: &str, cancelled: impl Fn() -> bool) -> Result<(), String> {
     // Git's --branch form accepts previous-checkout expressions. Those expand
     // to another name and are not an explicit branch name.
     if name.is_empty() || name.starts_with("@{-") || name.starts_with("refs/heads/") {
@@ -92,7 +129,7 @@ pub(super) fn validate_branch(root: &Path, name: &str) -> Result<(), String> {
     }
     let mut command = git(root)?;
     command.args(["check-ref-format", "--branch", name]);
-    let output = process::run(&mut command, || false, CHECKOUT_TIMEOUT)?;
+    let output = process::run(&mut command, cancelled, CHECKOUT_TIMEOUT)?;
     if !output.status.success() {
         return Err("invalid branch name".to_string());
     }

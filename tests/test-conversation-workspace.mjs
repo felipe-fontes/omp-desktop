@@ -255,7 +255,11 @@ test("launch selection uses stored defaults without replacing missing refs", () 
   });
   assert.deepEqual(W.initialSelection(repo()), {
     refName: main.refName,
-    worktree: false,
+    worktree: true,
+  });
+  assert.deepEqual(W.initialSelection(repo({ defaults: null })), {
+    refName: main.refName,
+    worktree: true,
   });
   assert.deepEqual(
     W.initialSelection(
@@ -339,7 +343,7 @@ test("detached HEAD is a one-conversation base, never a project default", () => 
   const info = repo({ currentBranch: null, head: "d".repeat(40) });
   assert.deepEqual(W.initialSelection(info), {
     refName: "HEAD",
-    worktree: false,
+    worktree: true,
   });
   assert.match(
     W.defaultsDecision(info, "HEAD", true).error,

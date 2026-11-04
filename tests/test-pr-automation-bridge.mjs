@@ -28,7 +28,8 @@ function harness() {
     journal = new Map(),
     commands = [],
     reads = [],
-    prompts = [];
+    prompts = [],
+    pending = new Map();
   const w = {
     OMP_SLASH: { LOCAL_COMMANDS: [] },
     OMP_SUBAGENTS: {
@@ -57,6 +58,7 @@ function harness() {
     "app/cache-usage.js",
     "app/stream-delta.js",
     "app/project-nav.js",
+    "app/conversation-workspace.js",
     "app/live-context.js",
     "app/agent-context.js",
     "app/agent-context-sync.js",
@@ -99,9 +101,25 @@ function harness() {
   w.__TAURI__ = {
     core: {
       async invoke(command, args) {
-        if (command === "start_session") return {
-          approvalMode: "write", path: args.args.cwd, workspace: null,
+        if (command === "conversation_workspace_inspect") return {
+          path: args.path, projectPath: args.path, repoRoot: args.path,
+          currentBranch: "feature", head: "a".repeat(40),
+          branches: [{ name: "feature", refName: "refs/heads/feature", commit: "a".repeat(40), remote: false }],
+          dirty: false, owners: 0,
+          defaults: { baseRef: "refs/heads/feature", worktree: false },
         };
+        if (command === "start_session") {
+          const { sessionId, cwd, deferredWorkspace, firstPrompt } = args.args;
+          if (deferredWorkspace) pending.set(sessionId, deferredWorkspace);
+          if (firstPrompt) assert.ok(pending.has(sessionId), "first prompt requires a pending workspace");
+          const prepared = firstPrompt ? pending.get(sessionId) : null;
+          if (firstPrompt) pending.delete(sessionId);
+          return {
+            approvalMode: "write", path: cwd,
+            deferredWorkspace: deferredWorkspace ?? null,
+            workspace: prepared ? { projectPath: cwd, ...prepared } : null,
+          };
+        }
         if (command === "start_git_watch") return { branch: "feature", root: args.path };
         if (command === "stop_session") {
           journal.delete(args.sessionId);
@@ -150,14 +168,7 @@ function harness() {
       },
     },
   };
-  const bridge = {
-    ...w.OMP_BRIDGE,
-    async openSession(cwd, profile) {
-      const opened = w.OMP_BRIDGE.openSession(cwd, profile);
-      await w.OMP_BRIDGE.startConversationSetup(snapshot.conversationSetup.id, null);
-      return opened;
-    },
-  };
+  const bridge = w.OMP_BRIDGE;
   bridge.onUpdate((value) => {
     snapshot = value;
   });
@@ -178,6 +189,16 @@ function harness() {
     STALE: w.OMP_PR_AUTOMATION.STALE,
     bridge,
     emit,
+    async openReadySession(cwd, profile) {
+      const id = await bridge.openSession(cwd, profile);
+      assert.ok(snapshot.sessions.find((session) => session.id === id).deferredWorkspace);
+      const priorPrompts = prompts.length;
+      assert.equal(await bridge.send("Initial coding request"), true);
+      assert.equal(snapshot.sessions.find((session) => session.id === id).deferredWorkspace, null);
+      assert.deepEqual(prompts.slice(priorPrompts), [{ sessionId: id, text: "Initial coding request" }]);
+      prompts.splice(priorPrompts, 1);
+      return id;
+    },
     reply,
     setBranch,
     clean,
@@ -234,11 +255,23 @@ await check(
   },
 );
 
+await check("automatic fixes cannot become the first prompt of a pending workspace", async () => {
+  const h = harness();
+  const id = await h.bridge.openSession("/project");
+  await flush();
+  h.clean();
+  h.setResult(snapshot());
+  assert.ok(h.snapshot().sessions.find((session) => session.id === id).deferredWorkspace);
+  assert.equal(await h.bridge.prAutomationSend(id, "Fix CI", snapshot(), permit), false);
+  assert.deepEqual(h.prompts, []);
+  assert.ok(h.snapshot().sessions.find((session) => session.id === id).deferredWorkspace);
+});
+
 await check(
   "publication revalidates the PR, branch and HEAD against a fresh native snapshot",
   async () => {
     const h = harness(),
-      id = await h.bridge.openSession("/project");
+      id = await h.openReadySession("/project");
     await flush();
     h.clean();
     const expected = snapshot();
@@ -279,7 +312,7 @@ await check(
   "a prompt omp accepted counts as sent even after switching tabs",
   async () => {
     const h = harness();
-    const a = await h.bridge.openSession("/a");
+    const a = await h.openReadySession("/a");
     await flush();
     h.clean();
     h.setResult(snapshot());
@@ -298,7 +331,7 @@ await check(
   "idle, queue, ask and goal guards prevent automatic fix publication",
   async () => {
     const h = harness(),
-      id = await h.bridge.openSession("/project");
+      id = await h.openReadySession("/project");
     await flush();
     h.setResult(snapshot());
     h.clean();
@@ -343,7 +376,7 @@ await check(
   "a branch change during native revalidation cancels publication",
   async () => {
     const h = harness(),
-      id = await h.bridge.openSession("/project");
+      id = await h.openReadySession("/project");
     await flush();
     h.clean();
     let release;
@@ -369,7 +402,7 @@ await check(
   "becoming busy during native revalidation cancels publication",
   async () => {
     const h = harness(),
-      id = await h.bridge.openSession("/project");
+      id = await h.openReadySession("/project");
     await flush();
     h.clean();
     let release;
@@ -395,7 +428,7 @@ await check(
   "revoking Auto-fix during native revalidation prevents the handoff",
   async () => {
     const h = harness(),
-      id = await h.bridge.openSession("/project");
+      id = await h.openReadySession("/project");
     await flush();
     h.clean();
     let release,
@@ -422,9 +455,9 @@ await check(
   "a busy background tab in the same project blocks automatic fixes",
   async () => {
     const h = harness(),
-      a = await h.bridge.openSession("/project");
+      a = await h.openReadySession("/project");
     await flush();
-    const b = await h.bridge.openSession("/project");
+    const b = await h.openReadySession("/project");
     await flush();
     h.emit(b, { type: "turn_start" });
     await h.bridge.activateSession(a);
@@ -443,7 +476,7 @@ await check(
   "tab switches discard in-flight discovery and reject publication to another tab",
   async () => {
     const h = harness(),
-      a = await h.bridge.openSession("/a");
+      a = await h.openReadySession("/a");
     await flush();
     let release;
     h.setResult(
@@ -452,7 +485,7 @@ await check(
       }),
     );
     const stale = h.bridge.prAutomationSnapshot(a);
-    const b = await h.bridge.openSession("/b");
+    const b = await h.openReadySession("/b");
     await flush();
     await h.bridge.activateSession(a);
     await flush();
@@ -469,8 +502,8 @@ await check(
   "a tab being left cannot start discovery or automatic fixes",
   async () => {
     const h = harness();
-    const a = await h.bridge.openSession("/a");
-    const b = await h.bridge.openSession("/b");
+    const a = await h.openReadySession("/a");
+    const b = await h.openReadySession("/b");
     await h.bridge.activateSession(a);
     await flush();
     h.clean();
@@ -488,7 +521,7 @@ await check(
 
 await check("a branch change invalidates in-flight discovery", async () => {
   const h = harness(),
-    id = await h.bridge.openSession("/project");
+    id = await h.openReadySession("/project");
   await flush();
   let release;
   h.setResult(
@@ -507,7 +540,7 @@ await check(
   async () => {
     for (const command of ["new_session", "fork"]) {
       const h = harness(),
-        id = await h.bridge.openSession("/project");
+        id = await h.openReadySession("/project");
       await flush();
       let release;
       h.setResult(
@@ -534,7 +567,7 @@ await check(
   async () => {
     const h = harness();
     await h.bridge.createProfile("Other");
-    const id = await h.bridge.openSession("/project");
+    const id = await h.openReadySession("/project");
     await flush();
     let release;
     h.setResult(
@@ -555,7 +588,7 @@ await check(
 );
 await check("local changes are independent of GitHub and stale on branch change", async () => {
   const h = harness();
-  const id = await h.bridge.openSession("/project");
+  const id = await h.openReadySession("/project");
   await flush();
   const changes = { changed: 2, truncated: false };
   h.setChangesResult(changes);

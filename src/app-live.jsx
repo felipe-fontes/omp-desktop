@@ -153,7 +153,7 @@ function App() {
   // Command errors belong to the tab, just like the bridge's voice snapshot.
   const [liveErrors, setLiveErrors] = React.useState({});
   const liveActionSeq = React.useRef({});
-  const openVoiceTabs = React.useRef([]);
+  const openSessionIds = React.useRef([]);
   const visibleVoiceTab = React.useRef("");
 
   // ── Tab list — driven by bridge session registry ──────────────────────────
@@ -365,7 +365,7 @@ function App() {
     refreshChats();
     return () => { chatsRequest.current++; };
   }, [refreshChats, chatSessionsKey]);
-  openVoiceTabs.current = sessionIds;
+  openSessionIds.current = sessionIds;
   // A tab seen for the first time starts with the `defaultSide` setting;
   // tabs already open keep theirs when the setting changes.
   const seenSideIds = React.useRef(new Set());
@@ -391,7 +391,7 @@ function App() {
     seqs.current[id] = seq;
     setErrors(m => ({ ...m, [id]: null }));
     const fail = error => {
-      if (seqs.current[id] === seq && openVoiceTabs.current.includes(id)) {
+      if (seqs.current[id] === seq && openSessionIds.current.includes(id)) {
         setErrors(m => ({ ...m, [id]: error || `${label} failed.` }));
       }
     };
@@ -580,11 +580,11 @@ function App() {
   };
   const startGoal = (msg, images, route) => {
     const out = takeBrowserChips(msg, images, route);
-    goalUi.start({ text: msg, images, chips: out.chips }, out);
+    return goalUi.start({ text: msg, images, chips: out.chips }, out);
   };
-  const handleSend = (text, images) => {
+  const handleSend = async (text, images) => {
     const hasAnnotations = Object.keys(plan.annotations).length > 0;
-    if (!text.trim() && !hasAnnotations && !(images && images.length > 0) && !browser.chips.length) return;
+    if (!text.trim() && !hasAnnotations && !(images && images.length > 0) && !browser.chips.length) return false;
     let msg = text.trim();
     // A slash command (typed by hand, or inserted by picking a non-desktop
     // entry from the `/` popup or the ⌘K bridge) must reach omp with its
@@ -603,8 +603,7 @@ function App() {
     // prompt (not in the stored objective); a refusal hands the typed
     // draft back, chips included.
     if (route.via === "goal") {
-      startGoal(msg, images, route);
-      return;
+      return startGoal(msg, images, route);
     }
     if (plan.mode && !route.isCmd) {
       if (hasAnnotations) {
@@ -617,7 +616,6 @@ function App() {
           }).join('\n\n');
         const parts = ['Line comments:\n' + lineComments, text.trim()].filter(Boolean);
         msg = parts.join('\n\n');
-        updatePlan(markPlanSent); // annotations imply plan is already in progress; spends them
       } else if (!plan.started) {
         // First clean send — wrap in intent framing. trimEnd() matters for an
         // image-only send (empty text): INTENT_FRAMING's template ends in a
@@ -625,16 +623,27 @@ function App() {
         // and the server's message_start echo arrives already .trim()med
         // (live.js) — an untrimmed local echo would fail that dedup compare
         // and double-render the bubble.
-        updatePlan(markPlanSent);
         msg = INTENT_FRAMING(text.trim()).trimEnd();
       }
     }
     // Browser annotations join the message last, after plan framing, so only
     // what was typed is framed.
     const out = takeBrowserChips(msg, images, route);
-    if (route.via === "steer") bridge?.steer(out.text, out.images);
-    else if (route.via === "prompt") bridge.send(out.text, out.images);
-    else setMessages(prev => [...prev, { kind: "user", time: timeNow(), text: out.text, images: out.images }]);
+    let sent;
+    try {
+      if (route.via === "steer") sent = await bridge?.steer(out.text, out.images, text);
+      else if (route.via === "prompt") sent = await bridge.send(out.text, out.images, text);
+      else { setMessages(prev => [...prev, { kind: "user", time: timeNow(), text: out.text, images: out.images }]); sent = true; }
+    } catch (error) {
+      console.error("[composer] send failed:", error);
+      sent = false;
+    }
+    if (sent === false) {
+      if (openSessionIds.current.includes(planKey)) browser.restoreChips(out.chips, planKey);
+      return false;
+    }
+    if (openSessionIds.current.includes(planKey) && plan.mode && !route.isCmd && (hasAnnotations || !plan.started)) updatePlan(markPlanSent);
+    return true;
   };
 
   const handleAbort      = () => { prAutomation.pause(); bridge?.abort(); setStreaming(false); };
@@ -678,15 +687,19 @@ function App() {
   // whitespace from the raw pasted content. In goal mode the follow-up
   // chord starts the goal too, like Enter (handleSend). The tab's browser
   // annotations ride along as they do with a send.
-  const handleFollowUp = (text, images) => {
+  const handleFollowUp = async (text, images) => {
     const msg = text.trim();
     const route = routeOf(msg, true);
-    if (route.via === "goal") {
-      startGoal(msg, images, route);
-      return;
-    }
+    if (route.via === "goal") return startGoal(msg, images, route);
     const out = takeBrowserChips(msg, images, route);
-    bridge?.followUp(out.text, out.images);
+    try {
+      const sent = await bridge?.followUp(out.text, out.images, text);
+      if (sent !== false) return true;
+    } catch (error) {
+      console.error("[composer] follow-up failed:", error);
+    }
+    if (openSessionIds.current.includes(planKey)) browser.restoreChips(out.chips, planKey);
+    return false;
   };
   // Queue strip actions: resolve `true` once omp edited its queue.
   const handleRemoveQueued  = (text, kind) => bridge?.removeQueuedMessage(text, kind);
@@ -727,7 +740,6 @@ function App() {
     previousDraftTargets.current = sessionIds;
     if (closed.size) setTargetedDraftInserts(items => items.filter(item => !closed.has(item.sessionId)));
   }, [sessionIds]);
-  const handleConversationStarted = ({ sessionId, task }) => enqueueDraftInsert(sessionId, task);
   // `action` (OMP_WIDGETS.insertAction, from widgets.json only): "new-tab"
   // always opens a fresh tab on the project and fills that tab's draft (never
   // sent); a failed open is reported by openSession and inserts nothing.
@@ -759,8 +771,7 @@ function App() {
     runState: activeProject.runState,
     // The chips go back to the tab they were taken from whatever tab is
     // shown; the text only into the composer of that tab still shown.
-    onRestoreDraft: ({ text, images, chips }, { tabId, shown }) => {
-      if (shown) setPromptInsert({ text, images, nonce: Date.now() });
+    onRestoreDraft: ({ chips }, { tabId }) => {
       browser.restoreChips(chips ?? [], tabId);
     },
   });
@@ -773,7 +784,8 @@ function App() {
     featureEnabled: t.showChanges ?? true,
     railVisible,
     connected: !!bridge?.isConnected && !stab.active,
-    blocked: plan.mode || goalUi.mode || !!goalUi.planBlocked ||
+    blocked: !!activeProject.deferredWorkspace || !!activeProject.workspacePreparing || !!activeProject.workspaceConfiguring || !!activeProject.workspaceRestartRequired ||
+      plan.mode || goalUi.mode || !!goalUi.planBlocked ||
       window.OMP_TURN_STATUS.busyElsewhere(sessions, planKey, activeProject.path),
   });
 
@@ -827,6 +839,7 @@ function App() {
   };
 
   const handleApprovePlan = () => {
+    if (activeProject.deferredWorkspace || activeProject.workspacePreparing || activeProject.workspaceConfiguring || activeProject.workspaceRestartRequired) return;
     updatePlan(approvePlan);
     bridge?.followUp(APPROVAL_PROMPT);
     setPlanOpen(true);
@@ -1242,6 +1255,9 @@ function App() {
                     dictationCompleted={dictationCompleted}
                     onAckDictation={ids => bridge?.ackDictation(ids)}
                     onSend={handleSend}
+                    workspace={activeProject}
+                    onConfigureWorkspace={choice => bridge?.configureConversationWorkspace(planKey, choice)}
+                    onCancelWorkspace={() => bridge?.cancelWorkspacePreparation(planKey)}
                     planMode={plan.mode}
                     onTogglePlan={togglePlanMode}
                     planBlocked={goalUi.planBlocked}
@@ -1380,7 +1396,9 @@ function App() {
               tree, browser panel, subagent split) ever narrows it. */}
           <StatusBar ctx={liveCtx} todoDone={todoCounts.done} todoTotal={todoCounts.total} onTodo={() => setPlanOpen(true)} updater={updater}
             branch={activeProject.branch} tabId={activeProject.id} bridge={bridge}
-            branchLocked={window.OMP_TURN_STATUS.busyInRepo(sessions, activeProject.repoRoot)}
+            branchLocked={activeProject.deferredWorkspace || activeProject.workspacePreparing || activeProject.workspaceConfiguring || activeProject.workspaceRestartRequired
+              ? "Choose the base branch in workspace options before the first message."
+              : window.OMP_TURN_STATUS.busyInRepo(sessions, activeProject.repoRoot)}
             keepAwake={keepAwake} keepAwakeSessionId={keepAwakeSessionId}
             onKeepAwakeSettings={() => openSettings("session")} />
         </div>
@@ -1479,7 +1497,7 @@ function App() {
 
       {conversationSetup && setupAvailable && !worktreeCloseConfirm && (
         <NewConversationDialog key={conversationSetup.id} request={conversationSetup} bridge={bridge}
-          suspended={!!closeConfirm} onStarted={handleConversationStarted} />
+          suspended={!!closeConfirm} />
       )}
     </_AL_MdLinkCtx.Provider>
   );

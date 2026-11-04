@@ -74,8 +74,9 @@ fn send_command(
     session_id: String,
     json: String,
     bridge: State<'_, AgentBridge>,
+    manager: State<'_, conversation_workspace::WorkspaceManager>,
 ) -> Result<(), String> {
-    bridge.send(&session_id, &json)
+    bridge.send(&session_id, &json, &manager)
 }
 
 /// Session-start payload from the frontend. A struct rather than four loose
@@ -104,6 +105,9 @@ struct StartSessionArgs {
     profile: Option<String>,
     /// Present only for an explicitly prepared new conversation.
     workspace: Option<conversation_workspace::WorkspaceOptions>,
+    /// Metadata-only plan, or the one first-prompt transition of that plan.
+    deferred_workspace: Option<conversation_workspace::WorkspaceOptions>,
+    first_prompt: Option<conversation_workspace::FirstPrompt>,
     /// Only explicit user opens renew a kept checkout's inactivity lease.
     #[serde(default)]
     user_initiated: bool,
@@ -117,10 +121,123 @@ async fn start_session(
     app: AppHandle,
 ) -> Result<conversation_workspace::StartResponse, String> {
     let keep_awake_epoch = app.state::<Arc<keep_awake::KeepAwake>>().epoch();
-    let ticket = app
-        .state::<conversation_workspace::WorkspaceManager>()
-        .ticket(&args.session_id)?;
+    let manager = app.state::<conversation_workspace::WorkspaceManager>();
+    let ticket = if let Some(first) = &args.first_prompt {
+        manager.first_ticket(&args.session_id, first.attempt)?
+    } else {
+        manager.ticket(&args.session_id)?
+    };
     off_ipc(move || start_session_blocking(args, &app, ticket, keep_awake_epoch)).await?
+}
+
+fn validate_start_session(
+    args: &StartSessionArgs,
+    app: &AppHandle,
+    profile: Option<&str>,
+) -> Result<(), String> {
+    if args.workspace.is_some()
+        && (args.deferred_workspace.is_some() || args.first_prompt.is_some())
+        || args.deferred_workspace.is_some() && args.first_prompt.is_some()
+    {
+        return Err("workspace, deferredWorkspace and firstPrompt are mutually exclusive".into());
+    }
+    if let Some(resume) = args.resume.as_deref() {
+        if args.workspace.is_some()
+            || args.deferred_workspace.is_some()
+            || args.first_prompt.is_some()
+        {
+            return Err("workspace preparation is not allowed when resuming".into());
+        }
+        saved_sessions::validate_resume(app, resume, profile)?;
+    }
+    Ok(())
+}
+
+fn prepare_first_prompt<'a>(
+    mut registry: std::sync::MutexGuard<'a, conversation_workspace::Registry>,
+    args: &StartSessionArgs,
+    first: &conversation_workspace::FirstPrompt,
+    app: &AppHandle,
+    profile: Option<&str>,
+    context: conversation_workspace::StartContext<'a>,
+) -> Result<
+    (
+        std::sync::MutexGuard<'a, conversation_workspace::Registry>,
+        conversation_workspace::Prepared,
+    ),
+    String,
+> {
+    let manager = context.manager;
+    let profile_id = profile.unwrap_or(profiles::DEFAULT_PROFILE_ID);
+    if app.state::<AgentBridge>().is_running(&args.session_id)? {
+        return Err("stop the source session before preparing its first prompt".into());
+    }
+    let (plan, revision) = registry.first_plan(&args.session_id, &args.cwd, profile_id, first)?;
+    app.state::<Arc<terminal::TerminalManager>>()
+        .prepare_workspace_change(&args.session_id)?;
+    let naming = manager.begin_naming(context.ticket)?;
+    // Model latency must not block unrelated tab metadata or lifecycle work.
+    drop(registry);
+    let intent = if let Some(plan) = &plan {
+        conversation_workspace::Registry::first_intent(plan, first, profile, &context)?
+    } else {
+        None
+    };
+    drop(naming);
+    registry = manager.lock();
+    manager.check_ticket(context.ticket)?;
+    if app.state::<AgentBridge>().is_running(&args.session_id)? {
+        return Err("conversation restarted during workspace preparation".into());
+    }
+    let prepared = registry.finish_first(
+        conversation_workspace::FirstRequest {
+            id: &args.session_id,
+            cwd: &args.cwd,
+            profile: profile_id,
+            prompt: first,
+        },
+        (plan, revision),
+        intent,
+        context,
+    )?;
+    Ok((registry, prepared))
+}
+
+fn recover_start_workspace(
+    app: &AppHandle,
+    args: &StartSessionArgs,
+    profile_id: &str,
+    pending: bool,
+) -> Result<Option<worktree_storage::WorkspaceView>, String> {
+    if args.workspace.is_some() || args.deferred_workspace.is_some() || pending {
+        return Ok(None);
+    }
+    worktree_lifecycle::prepare_resume(
+        app,
+        profile_id,
+        args.resume.as_deref(),
+        &args.cwd,
+        args.user_initiated,
+    )
+}
+
+fn retained_worktree_error(prepared: &conversation_workspace::Prepared, error: String) -> String {
+    if prepared
+        .workspace
+        .as_ref()
+        .is_some_and(|binding| binding.worktree)
+    {
+        let branch = conversation_workspace::inspect(&prepared.path)
+            .ok()
+            .and_then(|info| info.current_branch)
+            .map_or_else(String::new, |branch| format!(" and branch {branch}"));
+        format!(
+            "{error}. The created worktree was retained at {}{branch}",
+            prepared.path
+        )
+    } else {
+        error
+    }
 }
 
 fn start_session_blocking(
@@ -130,86 +247,102 @@ fn start_session_blocking(
     keep_awake_epoch: u64,
 ) -> Result<conversation_workspace::StartResponse, String> {
     let manager = app.state::<conversation_workspace::WorkspaceManager>();
-    let mut registry = manager.lock();
-    manager.check_ticket(&ticket)?;
     let store = app.state::<Arc<profiles::ProfileStore>>();
     let profile = store.resolve(args.profile.as_deref())?;
-    if let Some(resume) = args.resume.as_deref() {
-        if args.workspace.is_some() {
-            return Err("workspace preparation is not allowed when resuming".to_string());
-        }
-        saved_sessions::validate_resume(app, resume, profile)?;
-    }
     let profile_id = profile.unwrap_or(profiles::DEFAULT_PROFILE_ID);
-    // Explicit new-conversation choices must be validated on the selected
-    // folder, not restore an old checkout before that validation can refuse.
-    let recovery = if args.workspace.is_some() {
-        None
-    } else {
-        worktree_lifecycle::prepare_resume(
-            app,
-            profile_id,
-            args.resume.as_deref(),
-            &args.cwd,
-            args.user_initiated,
-        )?
-    };
-    let requested_cwd = recovery
-        .as_ref()
-        .map_or(args.cwd.as_str(), |workspace| workspace.path.as_str());
+    validate_start_session(&args, app, profile)?;
     let data = app
         .path()
         .app_data_dir()
         .ok()
         .filter(|path| path.is_absolute());
-    let prepared = registry.prepare_for_start(
-        &args.session_id,
-        requested_cwd,
-        args.workspace,
-        conversation_workspace::StartContext {
+    let mut registry = manager.lock();
+    manager.check_ticket(&ticket)?;
+    let prepared = if let Some(first) = args.first_prompt.as_ref() {
+        let context = conversation_workspace::StartContext {
             data: data.as_deref(),
             manager: &manager,
             ticket: &ticket,
-        },
-    )?;
-    if let Err(error) = manager.check_ticket(&ticket) {
-        return Err(
-            if prepared
-                .workspace
-                .as_ref()
-                .is_some_and(|binding| binding.worktree)
-            {
-                format!(
-                    "{error}. The created worktree was retained at {}",
-                    prepared.path
-                )
-            } else {
-                error
-            },
-        );
-    }
+        };
+        let (guard, prepared) =
+            prepare_first_prompt(registry, &args, first, app, profile, context)?;
+        registry = guard;
+        prepared
+    } else {
+        registry.can_respawn(&args.session_id)?;
+        let pending = registry
+            .get(&args.session_id)
+            .is_some_and(|tab| tab.deferred_workspace.is_some());
+        if args.resume.is_some() && manager.has_unstarted_choice(&args.session_id) {
+            return Err("an unsent workspace cannot resume a conversation".into());
+        }
+        let recovery = recover_start_workspace(app, &args, profile_id, pending)?;
+        let requested_cwd = recovery
+            .as_ref()
+            .map_or(args.cwd.as_str(), |workspace| workspace.path.as_str());
+        let context = conversation_workspace::StartContext {
+            data: data.as_deref(),
+            manager: &manager,
+            ticket: &ticket,
+        };
+        if let Some(plan) = args.deferred_workspace {
+            registry.prepare_deferred(&args.session_id, requested_cwd, plan, context)?
+        } else {
+            registry.prepare_for_start(&args.session_id, requested_cwd, args.workspace, context)?
+        }
+    };
+    let retained = |error| retained_worktree_error(&prepared, error);
+    manager.check_ticket(&ticket).map_err(retained)?;
     registry.set_profile(&args.session_id, profile_id)?;
-    let stored = worktree_lifecycle::register(app, &prepared, profile_id, args.resume.as_deref())?;
-    registry.set_storage_id(
-        &args.session_id,
-        stored.as_ref().map(|workspace| workspace.id.as_str()),
-    )?;
-    manager.check_ticket(&ticket)?;
+    let stored = worktree_lifecycle::register(app, &prepared, profile_id, args.resume.as_deref())
+        .map_err(retained)?;
+    if args.first_prompt.is_some()
+        && prepared
+            .workspace
+            .as_ref()
+            .is_some_and(|binding| binding.worktree)
+        && stored.is_none()
+    {
+        return Err(retained(
+            "the created checkout could not be verified as a managed worktree".into(),
+        ));
+    }
+    registry
+        .set_storage_id(
+            &args.session_id,
+            stored.as_ref().map(|workspace| workspace.id.as_str()),
+        )
+        .map_err(retained)?;
+    manager.check_ticket(&ticket).map_err(retained)?;
     let workspace = prepared
         .workspace
+        .clone()
         .or_else(|| stored.map(worktree_lifecycle::binding));
     let started = spawn_registered_session(
         app,
         &args.session_id,
         profile,
         args.resume.as_deref(),
-        prepared.path,
+        &prepared,
         workspace,
         keep_awake_epoch,
     );
-    // Keep ownership serialized through registration and the actual spawn.
+    if let (Ok(_), Some(first)) = (&started, &args.first_prompt) {
+        let committed = manager.commit_first(&args.session_id, first.attempt, &ticket, || {
+            registry.first_spawned(&args.session_id, &manager)
+        });
+        if let Err(error) = committed {
+            app.state::<Arc<evidence::EvidenceHost>>()
+                .forget_run(&args.session_id, None);
+            app.state::<AgentBridge>()
+                .stop_session(&args.session_id, &app.state::<Arc<RuleBook>>());
+            app.state::<Arc<widgets::WidgetHost>>()
+                .session_closed(&args.session_id);
+            return Err(retained(error));
+        }
+    }
     drop(registry);
-    started
+    started.map_err(retained)
 }
 
 fn spawn_registered_session(
@@ -217,56 +350,57 @@ fn spawn_registered_session(
     session_id: &str,
     profile: Option<&str>,
     resume: Option<&str>,
-    path: String,
+    prepared: &conversation_workspace::Prepared,
     workspace: Option<conversation_workspace::WorkspaceBinding>,
     keep_awake_epoch: u64,
 ) -> Result<conversation_workspace::StartResponse, String> {
-    let cwd = (!path.is_empty()).then_some(path.as_str());
+    let cwd = (!prepared.path.is_empty()).then_some(prepared.path.as_str());
+    let deferred_origin = prepared
+        .deferred_workspace
+        .as_ref()
+        .map(|_| conversation_workspace::inspect(&prepared.path).map(|info| info.project_path))
+        .transpose()?;
+    let source_project = workspace
+        .as_ref()
+        .map(|binding| binding.project_path.as_str())
+        .or(deferred_origin.as_deref());
     let mode = app
         .state::<Arc<ApprovalModeStore>>()
-        .resolve(cwd.map(Path::new));
+        .resolve_workspace(cwd.map(Path::new), source_project.map(Path::new));
     app.state::<Arc<terminal::TerminalManager>>()
         .register_tab(session_id, cwd.map(Path::new));
-    let retained = |error: String| {
-        if workspace.as_ref().is_some_and(|binding| binding.worktree) {
-            format!("{error}. The created worktree was retained at {path}")
-        } else {
-            error
-        }
-    };
     // The tab owns its browser and shell across profile/approval respawns.
     let overlay = app
         .state::<browser::BrowserManager>()
         .allocate_if_available(session_id)
-        .map_err(|e| retained(format!("browser: {e}")))?;
+        .map_err(|e| format!("browser: {e}"))?;
     app.state::<Arc<keep_awake::KeepAwake>>()
-        .register(session_id, keep_awake_epoch)
-        .map_err(retained)?;
+        .register(session_id, keep_awake_epoch)?;
     let rule_book = app.state::<Arc<RuleBook>>();
-    app.state::<AgentBridge>()
-        .start_session(
-            // The bridge owns this id; the widget hook below still borrows it.
-            session_id.to_owned(),
-            agent::Launch {
-                cwd,
-                source_project: workspace
-                    .as_ref()
-                    .map(|binding| binding.project_path.as_str()),
-                resume,
-                profile,
-                mode,
-                config: overlay.as_deref(),
-            },
-            app.clone(), // the bridge's readers own an app handle
-            Arc::clone(rule_book.inner()),
-        )
-        .map_err(retained)?;
+    app.state::<AgentBridge>().start_session(
+        // The bridge owns this id; the widget hook below still borrows it.
+        session_id.to_owned(),
+        agent::Launch {
+            cwd,
+            source_project,
+            resume,
+            profile,
+            mode,
+            metadata_only: prepared.deferred_workspace.is_some(),
+            // Native binding (prepared or catalogued), never a renderer flag.
+            managed_worktree: workspace.as_ref().is_some_and(|binding| binding.worktree),
+            config: overlay.as_deref(),
+        },
+        app.clone(), // the bridge's readers own an app handle
+        Arc::clone(rule_book.inner()),
+    )?;
     app.state::<Arc<widgets::WidgetHost>>()
         .session_started(session_id, cwd.map(Path::new));
     Ok(conversation_workspace::StartResponse {
         approval_mode: mode.as_str().to_string(),
-        path,
+        path: prepared.path.clone(),
         workspace,
+        deferred_workspace: prepared.deferred_workspace.clone(),
     })
 }
 
@@ -291,11 +425,43 @@ async fn conversation_workspace_inspect(
 #[tauri::command]
 async fn conversation_workspace_status(
     path: String,
+    session_id: Option<String>,
     app: AppHandle,
 ) -> Result<conversation_workspace::WorkspaceStatus, String> {
     off_ipc(move || {
         let manager = app.state::<conversation_workspace::WorkspaceManager>();
-        conversation_workspace::status(&manager, &path)
+        conversation_workspace::status(&manager, &path, session_id.as_deref())
+    })
+    .await?
+}
+
+/// Cancel an in-flight first-prompt preparation without tearing down the tab.
+#[tauri::command]
+fn conversation_workspace_cancel(
+    session_id: String,
+    attempt: u32,
+    manager: State<'_, conversation_workspace::WorkspaceManager>,
+) -> Result<bool, String> {
+    manager.cancel_first(&session_id, attempt)
+}
+
+#[tauri::command]
+async fn conversation_workspace_set_deferred(
+    session_id: String,
+    workspace: conversation_workspace::WorkspaceOptions,
+    app: AppHandle,
+) -> Result<conversation_workspace::DeferredResponse, String> {
+    let ticket = app
+        .state::<conversation_workspace::WorkspaceManager>()
+        .ticket(&session_id)?;
+    off_ipc(move || {
+        let manager = app.state::<conversation_workspace::WorkspaceManager>();
+        let mut registry = manager.lock();
+        manager.check_ticket(&ticket)?;
+        let terminal = app.state::<Arc<terminal::TerminalManager>>();
+        registry.set_deferred(&session_id, workspace, &manager, || {
+            terminal.prepare_workspace_change(&session_id)
+        })
     })
     .await?
 }
@@ -561,6 +727,8 @@ fn end_tabs_locked<S: AsRef<str> + Sync>(
             .close_tabs(ids);
     });
     registry.release(ids);
+    app.state::<conversation_workspace::WorkspaceManager>()
+        .release_task_admission(ids);
 }
 
 /// Close a tab (the frontend's `closeSession`) — see [`end_tabs`]. `async` +
@@ -618,9 +786,12 @@ async fn terminal_open(
         // A pending shell spawn must settle before final tab teardown releases
         // its checkout for another conversation's branch switch.
         let manager = app.state::<conversation_workspace::WorkspaceManager>();
-        let _registry = manager.lock();
+        let registry = manager.lock();
         manager.check_ticket(&ticket)?;
-        t.open(terminal::TauriEmit(app.clone()), &session_id, cols, rows) // shell threads own their app handle
+        registry.admit_terminal(&session_id)?;
+        let result = t.open(terminal::TauriEmit(app.clone()), &session_id, cols, rows);
+        drop(registry);
+        result
     })
     .await
 }
@@ -916,6 +1087,8 @@ async fn approval_approve_and_grant(
 ) -> Result<Option<String>, String> {
     let scope = parse_rule_scope(&scope)?;
     off_ipc(move || {
+        let manager = app.state::<conversation_workspace::WorkspaceManager>();
+        manager.admit_command(&session_id, true)?;
         let rule_book = app.state::<Arc<RuleBook>>();
         app.state::<AgentBridge>()
             .approve_and_grant(&rule_book, &session_id, &request_id, scope)
@@ -1860,6 +2033,8 @@ pub fn run() {
             start_session,
             conversation_workspace_inspect,
             conversation_workspace_status,
+            conversation_workspace_set_deferred,
+            conversation_workspace_cancel,
             conversation_workspace_defaults_set,
             worktree_lifecycle::commands::worktree_storage_view,
             worktree_lifecycle::commands::worktree_storage_set_policy,
@@ -2052,7 +2227,7 @@ fn announce_held_close(app: &AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{config_dir, conversation_workspace, holds_close, StartSessionArgs};
+    use super::{config_dir, holds_close, StartSessionArgs};
     use std::path::PathBuf;
 
     #[test]
@@ -2085,72 +2260,10 @@ mod tests {
         assert!(!holds_close("other", true));
     }
 
-    /// The exact payload `live.js::_spawnSession` sends. Tauri hands the
-    /// `args` object straight to serde, so a field-name or casing change on
-    /// either side silently breaks session start — this pins the contract.
-    #[test]
-    fn start_session_payload_deserializes_from_the_frontend_shape() {
-        let payload = serde_json::json!({
-            "sessionId": "session-1",
-            "cwd": "/home/dev/project",
-            "resume": null,
-            "profile": "work",
-        });
-        let args: StartSessionArgs = serde_json::from_value(payload).expect("deserialize");
-        assert_eq!(args.session_id, "session-1");
-        assert_eq!(args.cwd, "/home/dev/project");
-        assert_eq!(args.resume, None);
-        assert_eq!(args.profile.as_deref(), Some("work"));
-    }
-    #[test]
-    fn workspace_start_payload_and_response_use_the_shared_camel_case_contract() {
-        let payload = serde_json::json!({
-            "sessionId": "session-2",
-            "cwd": "/project",
-            "resume": null,
-            "profile": null,
-            "workspace": {
-                "baseRef": "refs/heads/main",
-                "baseCommit": "0123456789012345678901234567890123456789",
-                "worktree": true,
-                "acknowledgeShared": false
-            }
-        });
-        let args: StartSessionArgs = serde_json::from_value(payload).unwrap();
-        let options = args.workspace.unwrap();
-        assert_eq!(options.base_ref.as_deref(), Some("refs/heads/main"));
-        assert!(options.worktree);
-        let response = conversation_workspace::StartResponse {
-            approval_mode: "write".into(),
-            path: "/actual/sub".into(),
-            workspace: Some(conversation_workspace::WorkspaceBinding {
-                project_path: "/project/sub".into(),
-                base_ref: options.base_ref,
-                base_commit: options.base_commit,
-                worktree: true,
-            }),
-        };
-        assert_eq!(
-            serde_json::to_value(response).unwrap(),
-            serde_json::json!({
-                "approvalMode": "write",
-                "path": "/actual/sub",
-                "workspace": {
-                    "projectPath": "/project/sub",
-                    "baseRef": "refs/heads/main",
-                    "baseCommit": "0123456789012345678901234567890123456789",
-                    "worktree": true
-                }
-            })
-        );
-    }
-
     /// The contract `deny_unknown_fields` exists for (see the attribute's
     /// doc comment above `StartSessionArgs`): a renamed/misspelled key must
     /// fail loudly, not deserialize with `profile: None` and silently write
     /// a named profile's conversation into the shared `~/.omp/agent` tree.
-    /// The happy-path test above would still pass with the attribute
-    /// deleted, so it alone doesn't pin this.
     #[test]
     fn start_session_payload_rejects_an_unknown_field_instead_of_silently_dropping_it() {
         let payload = serde_json::json!({
